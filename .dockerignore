@@ -1,5 +1,6 @@
 .git
 .github
+/docs-site
 /recon
 /data
 /dist

@@ -134,7 +134,7 @@ jobs:
           merge-multiple: true
           path: assets
 
-      - name: Validate inputs
+      - name: Validate inputs and compute SHA256SUMS
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
@@ -144,6 +144,8 @@ jobs:
             exit 1
           fi
           test -n "$(ls -A assets)" || { echo "::error::no assets built"; exit 1; }
+          (cd assets && sha256sum bohrium-club-auto-* > SHA256SUMS.txt)
+          cat assets/SHA256SUMS.txt
           ls -lh assets
 
       - name: Generate release body
@@ -165,12 +167,14 @@ jobs:
           | Linux arm64 (static) | [bohrium-club-auto-linux-arm64.tar.gz](${BASE}/bohrium-club-auto-linux-arm64.tar.gz) |
           | macOS Intel | [bohrium-club-auto-darwin-x64.tar.gz](${BASE}/bohrium-club-auto-darwin-x64.tar.gz) |
           | macOS Apple Silicon | [bohrium-club-auto-darwin-arm64.tar.gz](${BASE}/bohrium-club-auto-darwin-arm64.tar.gz) |
+          | Checksums | [SHA256SUMS.txt](${BASE}/SHA256SUMS.txt) |
 
           ## Quick start
 
           - Set \`BOHRIUM_ADMIN_PASSWORD\` or read the auto-generated first-boot password from logs / \`data/config.json\`.
           - Open \`http://127.0.0.1:8788/\` and use WeChat QR scan for remote server login.
           - Docker is recommended for servers — see \`docker-compose.yml\` & \`docker-compose.ghcr.yml\`.
+          - Build & verification details: [docs/BINARY-BUILDS.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/docs/BINARY-BUILDS.md)
           EOF
 
       - name: Create or update release

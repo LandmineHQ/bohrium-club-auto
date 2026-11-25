@@ -79,11 +79,12 @@ CGO_ENABLED=0 go build -o bohrium-club-auto ./cmd/bohrium-club-auto
 ./bohrium-club-auto recon diff
 ```
 
-## GitHub Actions 流水线
+## GitHub Actions 流水线与文档站
 
 - `.github/workflows/ci.yml`：Push/PR 自动执行 `go vet`、`go test -race` 与静态编译校验。
 - `.github/workflows/build-binaries.yml`：手动触发构建 5 平台静态单文件二进制（Windows x64 / Linux x64 & arm64 / macOS Intel & Apple Silicon）并执行原生 HTTP `/healthz` + 管理员鉴权冒烟测试。
-- `.github/workflows/publish-binaries.yml`：手动触发构建并发布多平台归档至 GitHub Release。
+- `.github/workflows/publish-binaries.yml`：手动触发构建并发布多平台归档与 `SHA256SUMS.txt` 至 GitHub Release（详见 [docs/BINARY-BUILDS.md](docs/BINARY-BUILDS.md)）。
 - `.github/workflows/build-docker-image.yml`：手动构建极简 Alpine 镜像、统计体积并运行容器级 HTTP 冒烟测试。
 - `.github/workflows/publish-docker-image.yml`：手动构建多架构（`linux/amd64,linux/arm64`）镜像并推送至 GHCR。
 - `.github/workflows/recon-check.yml`：手动触发线上 Bohrium 前端静态源码 Recon 巡检与契约标记验证。
+- `.github/workflows/deploy-docs.yml`：自动构建并发布 `docs-site/` VitePress 文档站至 GitHub Pages（本地预览：`npm ci --prefix docs-site && npm run dev --prefix docs-site`）。

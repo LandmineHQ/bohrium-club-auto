@@ -1,0 +1,15 @@
+{
+  "name": "bohrium-club-auto-docs",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Bohrium Club Auto documentation site (VitePress)",
+  "scripts": {
+    "dev": "vitepress dev --host 0.0.0.0",
+    "build": "vitepress build",
+    "preview": "vitepress preview --host 0.0.0.0"
+  },
+  "devDependencies": {
+    "vitepress": "1.6.4"
+  }
+}

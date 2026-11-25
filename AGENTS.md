@@ -50,8 +50,10 @@ internal/scheduler/               Daily timezone-aware scheduler (Asia/Shanghai)
 internal/recon/                   Frontend snapshot/diff engine + contract marker scanner + tests
 internal/server/                  Admin cookie/header auth, rate limiter, REST API, embedded SPA router + tests
 web/                              go:embed static Dashboard (index.html, styles.css, app.js)
+docs/BINARY-BUILDS.md             Multi-platform static binary & Docker build/release guide
 docs/RECON-SNAPSHOT.md            Recon snapshot & drift check guide
-.github/workflows/                CI, multi-platform binary build/release, Docker build/GHCR push, recon check
+docs-site/                        VitePress documentation site (independent npm package)
+.github/workflows/                CI, multi-platform binary build/release, Docker build/GHCR push, recon check, VitePress Pages deploy
 ```
 
 ## 4. Upstream API Contract Notes

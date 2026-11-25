@@ -1,0 +1,65 @@
+/**
+ * Bohrium Club Auto docs theme.
+ * Palette matches the embedded admin console (`web/static/styles.css`):
+ * scientific blue (#3b82f6) and emerald (#10b981) accents over clean slate surfaces.
+ */
+
+:root {
+  --vp-c-brand-1: #2563eb;
+  --vp-c-brand-2: #3b82f6;
+  --vp-c-brand-3: #1d4ed8;
+  --vp-c-brand-soft: rgba(59, 130, 246, 0.14);
+  --vp-c-brand-softer: rgba(59, 130, 246, 0.07);
+
+  --vp-home-hero-name-color: transparent;
+  --vp-home-hero-name-background: linear-gradient(120deg, #2563eb 10%, #3b82f6 50%, #10b981 90%);
+  --vp-home-hero-image-background-image: radial-gradient(circle at 35% 35%, rgba(59, 130, 246, 0.28), rgba(16, 185, 129, 0.14) 55%, transparent 72%);
+  --vp-home-hero-image-filter: blur(44px);
+
+  --vp-font-family-base: "Inter", "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --vp-font-family-mono: "JetBrains Mono", "SFMono-Regular", ui-monospace, Consolas, monospace;
+}
+
+.dark {
+  --vp-c-brand-1: #60a5fa;
+  --vp-c-brand-2: #3b82f6;
+  --vp-c-brand-3: #2563eb;
+  --vp-c-brand-soft: rgba(96, 165, 250, 0.16);
+  --vp-c-brand-softer: rgba(96, 165, 250, 0.08);
+  --vp-c-bg: #0b1020;
+  --vp-c-bg-alt: #0f162b;
+  --vp-c-bg-soft: #121931;
+  --vp-c-bg-elv: #182242;
+}
+
+.VPNav {
+  backdrop-filter: blur(12px);
+}
+
+.VPFeature {
+  border-radius: 14px;
+  transition: border-color 0.2s ease, transform 0.2s ease;
+}
+
+.VPFeature:hover {
+  border-color: var(--vp-c-brand-soft);
+  transform: translateY(-2px);
+}
+
+.api-method {
+  display: inline-block;
+  min-width: 52px;
+  padding: 1px 7px;
+  border-radius: 6px;
+  font-family: var(--vp-font-family-mono);
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-align: center;
+}
+
+.api-method.get { color: #0369a1; background: #e0f2fe; }
+.api-method.post { color: #15803d; background: #dcfce7; }
+.api-method.put { color: #b45309; background: #fef3c7; }
+.dark .api-method.get { color: #7dd3fc; background: rgba(3, 105, 161, 0.25); }
+.dark .api-method.post { color: #86efac; background: rgba(21, 128, 61, 0.25); }
+.dark .api-method.put { color: #fcd34d; background: rgba(180, 83, 9, 0.28); }
