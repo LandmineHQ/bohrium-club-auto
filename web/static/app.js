@@ -2,9 +2,17 @@
   "use strict";
 
   const $ = (id) => document.getElementById(id);
+  const TAB_TITLES = {
+    overview: "任务与总览",
+    assets: "积分与容量",
+    logs: "执行日志",
+    recon: "前端 Recon",
+    settings: "定时与设置",
+  };
+
   let qrPollTimer = null;
   let currentSceneId = "";
-  let cachedOverview = null;
+  let selectedOAuthProvider = "google";
 
   function escapeHTML(str) {
     return String(str ?? "")
@@ -36,7 +44,7 @@
       throw new Error(data.error || "会话已过期，请重新登录控制台");
     }
     if (!res.ok || data.ok === false) {
-      throw new Error(data.error || data.message || `HTTP ${res.status}`);
+      throw new Error(data.error || data.message || data.data?.message || `HTTP ${res.status}`);
     }
     return data;
   }
@@ -57,6 +65,24 @@
     const d = new Date(iso);
     if (Number.isNaN(d.getTime())) return String(iso);
     return d.toLocaleString("zh-CN", { hour12: false });
+  }
+
+  function applyTheme(theme) {
+    const root = document.documentElement;
+    if (theme === "dark") {
+      root.setAttribute("data-theme", "dark");
+      if ($("btn-theme-toggle")) $("btn-theme-toggle").textContent = "浅色";
+    } else {
+      root.removeAttribute("data-theme");
+      if ($("btn-theme-toggle")) $("btn-theme-toggle").textContent = "暗色";
+    }
+    try { localStorage.setItem("brm_console_theme", theme); } catch {}
+  }
+
+  function initTheme() {
+    let saved = "light";
+    try { saved = localStorage.getItem("brm_console_theme") || "light"; } catch {}
+    applyTheme(saved);
   }
 
   function showLoginGate() {
@@ -88,7 +114,6 @@
   async function loadOverview() {
     try {
       const data = await api("/api/overview");
-      cachedOverview = data;
       renderOverview(data);
       renderAssetsDetail(data.assets);
       renderLogs(data.logs || []);
@@ -99,73 +124,76 @@
 
   function renderOverview(data) {
     if (data.version) $("app-version").textContent = data.version;
+
     const sess = data.session || {};
     const auth = sess.auth || {};
     const pill = $("bohrium-account-pill");
     const pillText = $("bohrium-account-text");
+    const pillMeta = $("bohrium-account-meta");
     const banner = $("not-logged-in-banner");
     const refreshBtn = $("btn-refresh-token");
 
     if (sess.hasToken && sess.valid) {
-      pill.className = "account-pill online";
-      const days = sess.expiresInSec > 0 ? ` · 剩余 ${Math.floor(sess.expiresInSec / 86400)} 天` : "";
-      pillText.textContent = `${auth.nickname || "UID " + auth.userId}${days}`;
+      pill.className = "account-box online";
+      pillText.textContent = auth.nickname || auth.email || `UID ${auth.userId}`;
+      const days = sess.expiresInSec > 0 ? `剩余 ${Math.floor(sess.expiresInSec / 86400)} 天` : "有效";
+      pillMeta.textContent = `UID ${auth.userId} · ${days}`;
       banner.classList.add("hidden");
       refreshBtn.classList.remove("hidden");
     } else if (sess.hasToken) {
-      pill.className = "account-pill offline";
-      pillText.textContent = `Token 已失效（请重新扫码）`;
+      pill.className = "account-box offline";
+      pillText.textContent = "登录已失效";
+      pillMeta.textContent = "请重新扫码或导入 Token";
       banner.classList.remove("hidden");
       refreshBtn.classList.remove("hidden");
     } else {
-      pill.className = "account-pill offline";
-      pillText.textContent = "未登录玻尔账号";
+      pill.className = "account-box offline";
+      pillText.textContent = "未绑定玻尔账号";
+      pillMeta.textContent = "需远程扫码或导入 brmToken";
       banner.classList.remove("hidden");
       refreshBtn.classList.add("hidden");
     }
 
-    // KPI 1: Photons
+    // KPIs
     const assets = data.assets;
     if (assets) {
-      $("kpi-photons").textContent = `${formatNum(assets.photonBalance)} 光子`;
+      $("kpi-photons").textContent = `${formatNum(assets.photonBalance)}`;
       const exp7 = assets.expiring7DayPhotons > 0 ? ` · 7日过期 ${formatNum(assets.expiring7DayPhotons)}` : "";
       $("kpi-photons-sub").textContent = `组织 ${formatNum(assets.orgBalance)} · 钱包 ¥${formatNum(assets.walletBalance)}${exp7}`;
 
-      // KPI 2: Storage
       const st = assets.storage || {};
       $("kpi-storage").textContent = st.remainingHuman || "--";
       const pct = Math.min(100, Math.max(0, Number(st.usedPercent || 0)));
       $("kpi-storage-bar").style.width = `${pct.toFixed(1)}%`;
-      $("kpi-storage-sub").textContent = `已用 ${st.usedHuman || "--"} / 总计 ${st.totalHuman || "--"} (${pct.toFixed(1)}%)`;
+      $("kpi-storage-sub").textContent = `已用 ${st.usedHuman || "--"} / ${st.totalHuman || "--"} (${pct.toFixed(1)}%)`;
 
-      // KPI 3: Membership & Quotas
-      const lvl = assets.membershipLevel !== null && assets.membershipLevel !== undefined ? `Lv.${assets.membershipLevel}` : "普通用户";
+      const lvl = assets.membershipLevel !== null && assets.membershipLevel !== undefined ? `Lv.${assets.membershipLevel}` : "标准";
       $("kpi-membership").textContent = lvl;
-      $("kpi-membership-sub").textContent = `文献 ${formatQuota(assets.paperQuota)} · 知识库对话 ${formatQuota(assets.knowledgeChat)} · 深度研究 ${formatQuota(assets.deepResearch)}`;
+      $("kpi-membership-sub").textContent = `文献 ${formatQuota(assets.paperQuota)} · 对话 ${formatQuota(assets.knowledgeChat)} · 深度研究 ${formatQuota(assets.deepResearch)}`;
     } else {
       $("kpi-photons").textContent = "--";
-      $("kpi-photons-sub").textContent = data.assetsError || "登录后自动显示";
+      $("kpi-photons-sub").textContent = data.assetsError || "登录后显示";
       $("kpi-storage").textContent = "--";
       $("kpi-storage-bar").style.width = "0%";
-      $("kpi-storage-sub").textContent = "登录后自动显示";
+      $("kpi-storage-sub").textContent = "登录后显示";
       $("kpi-membership").textContent = "--";
-      $("kpi-membership-sub").textContent = "登录后自动显示";
+      $("kpi-membership-sub").textContent = "登录后显示";
     }
 
-    // KPI 4: Tasks & Scheduler
     const tasks = data.tasks;
     const sched = data.scheduler || {};
     if (tasks) {
       const webTotal = Math.max(0, tasks.totalCount - tasks.skippedCount);
-      $("kpi-tasks").textContent = `${tasks.completedCount} / ${webTotal} Web任务`;
-      $("kpi-tasks-sub").textContent = `今日已获 +${formatNum(tasks.earnedPhotons)} 光子 · 下次定时 ${sched.nextRunAt || "已关闭"}`;
+      $("kpi-tasks").textContent = `${tasks.completedCount} / ${webTotal}`;
+      $("kpi-tasks-sub").textContent = `今日 +${formatNum(tasks.earnedPhotons)} 光子 · 下次 ${sched.nextRunAt || "已暂停"}`;
       $("task-date-badge").textContent = tasks.taskDate || "今日";
+      $("tasks-summary-pill").textContent = `${tasks.completedCount}/${webTotal} 已完成 · 跳过 ${tasks.skippedCount}`;
     } else {
       $("kpi-tasks").textContent = "--";
-      $("kpi-tasks-sub").textContent = `下次定时：${sched.nextRunAt || "已关闭"}`;
+      $("kpi-tasks-sub").textContent = `下次定时：${sched.nextRunAt || "已暂停"}`;
+      $("tasks-summary-pill").textContent = "未连接";
     }
 
-    // Render Tasks Grid
     const errEl = $("tasks-error");
     if (data.tasksError) {
       errEl.textContent = data.tasksError;
@@ -173,76 +201,83 @@
     } else {
       errEl.classList.add("hidden");
     }
-    renderTasksGrid(tasks);
+    renderTasksList(tasks);
 
-    // Corpus & Runtime Stats
+    // Corpus & Runtime
     const ps = data.promptStats || {};
     const pdfs = data.pdfStats || {};
     $("stat-scispace").textContent = `${ps.scienceSpacePrompts || 0} 条`;
     $("stat-writing").textContent = `${ps.academicWritingPrompts || 0} 条`;
     $("stat-reading").textContent = `${ps.literatureReadingPrompts || 0} 条`;
     $("stat-papers").textContent = `${ps.paperCatalogCount || 0} 篇`;
-    $("stat-pdf-cache").textContent = `${pdfs.cached || 0} 篇缓存 / ${pdfs.custom || 0} 篇自定义`;
+    $("stat-pdf-cache").textContent = `${pdfs.cached || 0} 缓存 / ${pdfs.custom || 0} 自定义`;
     $("stat-sched-state").textContent = sched.running
       ? `执行中 (${sched.currentJob})`
       : sched.enabled
-        ? `已开启（每日 ${sched.timeHHMM} ${sched.timezone} +0~${sched.jitterMinutes}m）`
+        ? `已启用 · 每日 ${sched.timeHHMM} (+0~${sched.jitterMinutes}m)`
         : "已暂停";
+    if ($("header-sched-pill")) {
+      $("header-sched-pill").textContent = sched.running
+        ? `RUN: ${sched.currentJob}`
+        : sched.enabled
+          ? `NEXT: ${sched.timeHHMM} ${sched.timezone}`
+          : "SCHED: OFF";
+    }
     $("stat-last-day").textContent = sched.lastScheduledDay
-      ? `${sched.lastScheduledDay} (${sched.lastRunSummary || "完成"})`
+      ? `${sched.lastScheduledDay} · ${sched.lastRunSummary || "完成"}`
       : "尚无记录";
     $("stat-ua").textContent = data.userAgent || "--";
   }
 
-  function renderTasksGrid(tasksResp) {
-    const grid = $("tasks-grid");
+  function renderTasksList(tasksResp) {
+    const list = $("tasks-list");
     if (!tasksResp || !Array.isArray(tasksResp.tasks) || tasksResp.tasks.length === 0) {
-      grid.innerHTML = `<div class="empty-state">请先远程登录玻尔账号，登录后即可查看并触发每日任务。</div>`;
+      list.innerHTML = `<div class="empty-row">请先远程登录玻尔账号，登录后此处将列出全部每日任务并支持一键或单项触发。</div>`;
       return;
     }
-    grid.innerHTML = tasksResp.tasks.map((t) => {
-      let badge = `<span class="pill pill-muted">${escapeHTML(t.statusLabel)}</span>`;
-      if (t.skipped) badge = `<span class="pill pill-muted">已跳过</span>`;
-      else if (t.status === 1) badge = `<span class="pill pill-ok">已完成</span>`;
-      else if (t.status === 0) badge = `<span class="pill pill-info">待完成</span>`;
-      else if (t.status === -1) badge = `<span class="pill pill-warn">未领取</span>`;
+    list.innerHTML = tasksResp.tasks.map((t, idx) => {
+      const num = String(idx + 1).padStart(2, "0");
+      let statusHTML = `<span class="status-badge status-muted">${escapeHTML(t.statusLabel)}</span>`;
+      if (t.skipped) statusHTML = `<span class="status-badge status-muted">已跳过</span>`;
+      else if (t.status === 1) statusHTML = `<span class="status-badge status-ok">已完成</span>`;
+      else if (t.status === 0) statusHTML = `<span class="status-badge status-info">待完成</span>`;
+      else if (t.status === -1) statusHTML = `<span class="status-badge status-warn">未领取</span>`;
 
-      const cardCls = t.skipped ? "task-card skipped" : t.status === 1 ? "task-card done" : "task-card";
-      let buttons = "";
+      let opsHTML = "";
       if (t.skipped) {
-        buttons = `<button class="btn btn-ghost btn-sm" disabled>${escapeHTML(t.skipReason || "客户端任务自动跳过")}</button>`;
+        opsHTML = `<span class="skip-label">客户端跳过</span>`;
       } else {
         if (t.status === -1) {
-          buttons += `<button class="btn btn-secondary btn-sm" data-claim-one="${escapeHTML(t.taskKey)}">领取任务</button>`;
+          opsHTML += `<button class="btn btn-outline btn-xs" data-claim-one="${escapeHTML(t.taskKey)}">领取</button>`;
         }
-        const runLabel = t.status === 1 ? "再次手动触发" : "手动完成任务";
-        buttons += `<button class="btn btn-primary btn-sm" data-run-one="${escapeHTML(t.taskKey)}">${runLabel}</button>`;
+        const runCls = t.status === 1 ? "btn btn-outline btn-xs" : "btn btn-primary btn-xs";
+        const runLabel = t.status === 1 ? "重新执行" : "手动执行";
+        opsHTML += `<button class="${runCls}" data-run-one="${escapeHTML(t.taskKey)}">${runLabel}</button>`;
       }
 
       return `
-        <div class="${cardCls}">
-          <div>
-            <div class="task-top">
-              <div class="task-title">${escapeHTML(t.titleZh || t.taskKey)}</div>
-              ${badge}
+        <div class="task-row ${t.skipped ? "is-skipped" : ""}">
+          <div class="task-main">
+            <span class="task-num">${num}</span>
+            <div class="task-info">
+              <div class="task-name-line">
+                <span class="task-name">${escapeHTML(t.titleZh || t.taskKey)}</span>
+                <span class="task-key">${escapeHTML(t.actionKey || t.taskKey)}</span>
+              </div>
+              <div class="task-sub">${escapeHTML(t.descriptionZh || (t.skipped ? t.skipReason : ""))}</div>
             </div>
-            <div class="task-desc">${escapeHTML(t.descriptionZh || "")}</div>
           </div>
-          <div>
-            <div class="task-meta">
-              <span class="reward-badge">+${formatNum(t.rewardAmount)} 光子</span>
-              <code>${escapeHTML(t.actionKey || t.taskKey)}</code>
-            </div>
-            <div class="task-actions">${buttons}</div>
-          </div>
+          <div class="task-reward">+${formatNum(t.rewardAmount)} 光子</div>
+          <div>${statusHTML}</div>
+          <div class="task-ops">${opsHTML}</div>
         </div>
       `;
     }).join("");
 
-    grid.querySelectorAll("[data-claim-one]").forEach((btn) => {
+    list.querySelectorAll("[data-claim-one]").forEach((btn) => {
       btn.addEventListener("click", () => handleClaimOne(btn.getAttribute("data-claim-one"), btn));
     });
-    grid.querySelectorAll("[data-run-one]").forEach((btn) => {
+    list.querySelectorAll("[data-run-one]").forEach((btn) => {
       btn.addEventListener("click", () => handleRunOne(btn.getAttribute("data-run-one"), btn));
     });
   }
@@ -255,7 +290,7 @@
 
     if (!assets) {
       warnEl.classList.add("hidden");
-      grid.innerHTML = `<div class="empty-state">请先登录玻尔账号以获取实时积分与容量数据。</div>`;
+      grid.innerHTML = `<div class="empty-row" style="grid-column:1/-1;">请先登录玻尔账号以查看实时积分与容量明细。</div>`;
       lotsBody.innerHTML = `<tr><td colspan="4" class="empty-cell">暂无数据</td></tr>`;
       histBody.innerHTML = `<tr><td colspan="3" class="empty-cell">暂无数据</td></tr>`;
       return;
@@ -270,17 +305,17 @@
 
     const st = assets.storage || {};
     const items = [
-      ["个人可用光子", `${formatNum(assets.photonBalance)} 光子`],
-      ["组织光子余额 / 上限", `${formatNum(assets.orgBalance)} / ${formatNum(assets.orgBalanceLimit)}`],
+      ["个人可用光子", `${formatNum(assets.photonBalance)}`],
+      ["组织余额 / 上限", `${formatNum(assets.orgBalance)} / ${formatNum(assets.orgBalanceLimit)}`],
       ["钱包现金余额", `¥ ${formatNum(assets.walletBalance)}`],
-      ["7 日内过期光子", `${formatNum(assets.expiring7DayPhotons)} 光子`],
-      ["知识库剩余存储", `${st.remainingHuman || "--"}（总 ${st.totalHuman || "--"}）`],
-      ["文献检索剩余配额", formatQuota(assets.paperQuota)],
-      ["知识库对话剩余配额", formatQuota(assets.knowledgeChat)],
-      ["深度研究剩余配额", formatQuota(assets.deepResearch)],
+      ["7 日内过期光子", `${formatNum(assets.expiring7DayPhotons)}`],
+      ["知识库剩余存储", `${st.remainingHuman || "--"} / ${st.totalHuman || "--"}`],
+      ["文献检索配额", formatQuota(assets.paperQuota)],
+      ["知识库对话配额", formatQuota(assets.knowledgeChat)],
+      ["深度研究配额", formatQuota(assets.deepResearch)],
     ];
     grid.innerHTML = items.map(([label, val]) => `
-      <div class="quota-item"><div class="label">${escapeHTML(label)}</div><div class="val">${escapeHTML(val)}</div></div>
+      <div class="quota-cell"><div class="q-label">${escapeHTML(label)}</div><div class="q-val">${escapeHTML(val)}</div></div>
     `).join("");
 
     const lots = assets.expiringLots || [];
@@ -288,10 +323,10 @@
       ? `<tr><td colspan="4" class="empty-cell">暂无即将过期光子批次</td></tr>`
       : lots.map((l) => `
           <tr>
-            <td><strong>${formatNum(l.remaining)}</strong></td>
+            <td class="tabular"><strong>${formatNum(l.remaining)}</strong></td>
             <td>${escapeHTML(l.description || l.sourceType || "--")}</td>
-            <td>${escapeHTML(l.createdTime || "--")}</td>
-            <td>${escapeHTML(l.expireTime || "--")}</td>
+            <td class="tabular">${escapeHTML(l.createdTime || "--")}</td>
+            <td class="tabular">${escapeHTML(l.expireTime || "--")}</td>
           </tr>
         `).join("");
 
@@ -300,12 +335,13 @@
       ? `<tr><td colspan="3" class="empty-cell">暂无近期光子流水</td></tr>`
       : hist.map((r) => {
           const sign = r.amount > 0 ? `+${formatNum(r.amount)}` : formatNum(r.amount);
-          const cls = r.amount >= 0 ? "text-ok" : "text-danger";
+          const cls = r.amount >= 0 ? "ink-ok" : "ink-err";
+          const expNote = r.expireAt ? `<div class="log-sub">有效期至 ${escapeHTML(r.expireAt)}</div>` : "";
           return `
             <tr>
-              <td class="${cls}"><strong>${escapeHTML(sign)}</strong></td>
-              <td>${escapeHTML(r.description || r.type || "--")}</td>
-              <td>${escapeHTML(r.createdAt || "--")}</td>
+              <td class="tabular ${cls}"><strong>${escapeHTML(sign)}</strong></td>
+              <td>${escapeHTML(r.description || r.type || "--")}${expNote}</td>
+              <td class="tabular" style="white-space:nowrap;">${escapeHTML(formatTime(r.createdAt))}</td>
             </tr>
           `;
         }).join("");
@@ -319,27 +355,26 @@
     }
     body.innerHTML = logs.map((l) => {
       const badge = l.skipped
-        ? `<span class="pill pill-muted">跳过</span>`
+        ? `<span class="status-badge status-muted">跳过</span>`
         : l.success
-          ? `<span class="pill pill-ok">成功</span>`
-          : `<span class="pill pill-danger">失败</span>`;
+          ? `<span class="status-badge status-ok">成功</span>`
+          : `<span class="status-badge status-err">失败</span>`;
       const extra = l.meta && l.meta.promptPreview
-        ? `<div class="muted small">提问：${escapeHTML(l.meta.promptPreview)}</div>`
+        ? `<div class="log-sub">提问：${escapeHTML(l.meta.promptPreview)}</div>`
         : "";
       return `
         <tr>
-          <td>${escapeHTML(formatTime(l.timestamp))}</td>
+          <td class="tabular" style="white-space:nowrap;">${escapeHTML(formatTime(l.timestamp))}</td>
           <td><code>${escapeHTML(l.trigger || "manual")}</code></td>
           <td>${escapeHTML(l.taskTitle || l.action || "--")}</td>
           <td>${badge}</td>
-          <td>${l.durationMs ? `${l.durationMs} ms` : "--"}</td>
+          <td class="tabular" style="white-space:nowrap;">${l.durationMs ? `${l.durationMs} ms` : "--"}</td>
           <td>${escapeHTML(l.message || "")}${extra}</td>
         </tr>
       `;
     }).join("");
   }
 
-  // Task actions
   async function handleClaimAll() {
     const btn = $("btn-claim-all");
     btn.disabled = true;
@@ -380,6 +415,7 @@
       await loadOverview();
     } catch (e) {
       toast("执行失败: " + e.message, "err");
+      await loadOverview();
     } finally {
       btn.disabled = false;
       btn.textContent = orig;
@@ -390,7 +426,7 @@
     const btn = $("btn-run-all");
     btn.disabled = true;
     const orig = btn.textContent;
-    btn.textContent = "正在依次执行 3 项 Web 任务...";
+    btn.textContent = "执行中...";
     try {
       const res = await api("/api/tasks/run-all", { method: "POST" });
       toast(res.data?.summary || "全部 Web 任务已执行", "ok");
@@ -403,7 +439,6 @@
     }
   }
 
-  // Settings
   async function loadSettings() {
     try {
       const res = await api("/api/settings");
@@ -456,21 +491,20 @@
     }
   }
 
-  // Recon
   async function loadReconStatus() {
     try {
       const res = await api("/api/recon/status");
       const box = $("recon-status-box");
       if (!res.baselineExists) {
-        box.innerHTML = `<strong>尚无本地基线快照</strong>（路径：<code>${escapeHTML(res.manifestPath)}</code>）。请点击右上角「拉取 / 更新基线」建立首次快照。`;
+        box.innerHTML = `<strong>尚无本地基线快照</strong>（路径：<code>${escapeHTML(res.manifestPath)}</code>）。请点击「更新基线 (Pull)」建立首次快照。`;
         return;
       }
       const m = res.markers || {};
-      const badge = (ok, label) => `<span class="pill ${ok ? "pill-ok" : "pill-warn"}">${ok ? "✓" : "?"} ${label}</span>`;
+      const badge = (ok, label) => `<span class="status-badge ${ok ? "status-ok" : "status-warn"}">${escapeHTML(label)}</span>`;
       box.innerHTML = `
-        <div><strong>本地基线时间：</strong>${escapeHTML(formatTime(res.fetchedAt))} · 资源数：<strong>${res.assetCount}</strong> · 总计 ${(Number(res.totalBytes || 0) / 1024).toFixed(1)} KB</div>
-        <div class="muted small">基线文件：<code>${escapeHTML(res.manifestPath)}</code></div>
-        <div class="marker-row">
+        <div class="tabular"><strong>本地基线时间：</strong>${escapeHTML(formatTime(res.fetchedAt))} · 资源数：<strong>${res.assetCount}</strong> · ${(Number(res.totalBytes || 0) / 1024).toFixed(1)} KB</div>
+        <div class="panel-desc">基线路径：<code>${escapeHTML(res.manifestPath)}</code></div>
+        <div class="marker-strip">
           ${badge(m.plazaTasksEndpoint, "/api/plaza/tasks")}
           ${badge(m.plazaClaimEndpoint, "/api/plaza/tasks/claim")}
           ${badge(m.gatewayHeader, "X-Plaza-Daily-Task-Gateway")}
@@ -486,10 +520,10 @@
     const btn = $("btn-recon-pull");
     btn.disabled = true;
     const orig = btn.textContent;
-    btn.textContent = "抓取线上快照中...";
+    btn.textContent = "拉取中...";
     try {
       const res = await api("/api/recon/pull", { method: "POST" });
-      toast(`已更新前端基线（共 ${res.data?.assets?.length || 0} 个静态资源）`, "ok");
+      toast(`基线已更新（共 ${res.data?.assets?.length || 0} 个静态资源）`, "ok");
       await loadReconStatus();
     } catch (e) {
       toast("Recon Pull 失败: " + e.message, "err");
@@ -503,26 +537,26 @@
     const btn = $("btn-recon-diff");
     btn.disabled = true;
     const orig = btn.textContent;
-    btn.textContent = "比对线上源码中...";
+    btn.textContent = "比对中...";
     try {
       const res = await api("/api/recon/diff", { method: "POST" });
       const d = res.data || {};
       const box = $("recon-diff-result");
       box.classList.remove("hidden");
-      const statusCls = d.same ? "pill-ok" : "pill-warn";
+      const statusCls = d.same ? "status-ok" : "status-warn";
       const rows = [
-        ...(d.markerChanges || []).map((x) => `<tr><td><span class="pill pill-danger">契约变更</span></td><td>${escapeHTML(x)}</td></tr>`),
-        ...(d.added || []).map((x) => `<tr><td><span class="pill pill-info">新增</span></td><td><code>${escapeHTML(x.url)}</code></td></tr>`),
-        ...(d.changed || []).map((x) => `<tr><td><span class="pill pill-warn">变更</span></td><td><code>${escapeHTML(x.url)}</code></td></tr>`),
-        ...(d.removed || []).map((x) => `<tr><td><span class="pill pill-muted">移除</span></td><td><code>${escapeHTML(x.url)}</code></td></tr>`),
+        ...(d.markerChanges || []).map((x) => `<tr><td><span class="status-badge status-err">契约变更</span></td><td>${escapeHTML(x)}</td></tr>`),
+        ...(d.added || []).map((x) => `<tr><td><span class="status-badge status-info">新增</span></td><td><code>${escapeHTML(x.url)}</code></td></tr>`),
+        ...(d.changed || []).map((x) => `<tr><td><span class="status-badge status-warn">变更</span></td><td><code>${escapeHTML(x.url)}</code></td></tr>`),
+        ...(d.removed || []).map((x) => `<tr><td><span class="status-badge status-muted">移除</span></td><td><code>${escapeHTML(x.url)}</code></td></tr>`),
       ];
       box.innerHTML = `
-        <div class="recon-box">
-          <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
-            <span class="pill ${statusCls}">${d.same ? "无变化" : "发现上游更新"}</span>
+        <div class="recon-summary">
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:${rows.length ? "12px" : "0"};">
+            <span class="status-badge ${statusCls}">${d.same ? "无变化" : "发现上游更新"}</span>
             <strong>${escapeHTML(d.summary || "")}</strong>
           </div>
-          ${rows.length ? `<div class="table-wrap"><table><thead><tr><th>类型</th><th>详情</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>` : ""}
+          ${rows.length ? `<div class="table-scroll"><table class="data-table"><thead><tr><th>类型</th><th>路径 / 详情</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>` : ""}
         </div>
       `;
       toast(d.summary || "比对完成", d.same ? "ok" : "warn");
@@ -534,7 +568,7 @@
     }
   }
 
-  // Remote Login Modal & WeChat QR Polling
+  // Modal & WeChat QR
   function stopQRPoll() {
     if (qrPollTimer) {
       clearInterval(qrPollTimer);
@@ -542,15 +576,8 @@
     }
     currentSceneId = "";
   }
-
-  function openLoginModal() {
-    $("login-modal").classList.remove("hidden");
-  }
-
-  function closeLoginModal() {
-    stopQRPoll();
-    $("login-modal").classList.add("hidden");
-  }
+  function openLoginModal() { $("login-modal").classList.remove("hidden"); }
+  function closeLoginModal() { stopQRPoll(); $("login-modal").classList.add("hidden"); }
 
   async function startWeChatQR() {
     stopQRPoll();
@@ -565,7 +592,7 @@
       img.src = qrCodeUrl;
       img.classList.remove("hidden");
       $("wechat-qr-placeholder").classList.add("hidden");
-      $("wechat-qr-status").textContent = "请使用微信扫一扫关注/确认登录（自动轮询中...）";
+      $("wechat-qr-status").textContent = "请使用微信扫一扫并确认登录（轮询中...）";
 
       qrPollTimer = setInterval(async () => {
         if (!currentSceneId) return;
@@ -574,19 +601,17 @@
           const p = poll.data || {};
           if (p.loggedIn) {
             stopQRPoll();
-            $("wechat-qr-status").textContent = "扫码登录成功！";
-            toast("微信远程登录成功！", "ok");
+            $("wechat-qr-status").textContent = "扫码登录成功";
+            toast("微信远程登录成功", "ok");
             closeLoginModal();
             await loadOverview();
           } else if (p.status === "expired") {
             stopQRPoll();
-            $("wechat-qr-status").textContent = "二维码已过期，请点击刷新重新获取";
+            $("wechat-qr-status").textContent = "二维码已过期，请重新获取";
           } else if (p.status === "scanned") {
-            $("wechat-qr-status").textContent = "已扫码，请在手机微信上点击确认登录...";
+            $("wechat-qr-status").textContent = "已扫码，请在手机微信上点击确认...";
           }
-        } catch (err) {
-          // Transient poll errors are tolerated while polling
-        }
+        } catch {}
       }, 2200);
     } catch (e) {
       $("wechat-qr-status").textContent = "获取二维码失败: " + e.message;
@@ -603,12 +628,108 @@
     btn.disabled = true;
     try {
       await api("/api/bohrium/login/token", { method: "POST", body: JSON.stringify({ token: raw }) });
-      toast("brmToken 验证并保存成功！", "ok");
+      toast("brmToken 验证并保存成功", "ok");
       $("import-token-input").value = "";
       closeLoginModal();
       await loadOverview();
     } catch (e) {
       toast("导入失败: " + e.message, "err");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function handleOAuthStart(provider, btn) {
+    selectedOAuthProvider = provider;
+    document.querySelectorAll("[data-oauth-provider]").forEach((b) => b.classList.remove("active-provider"));
+    btn.classList.add("active-provider");
+    btn.disabled = true;
+    try {
+      const res = await api("/api/bohrium/oauth/url", { method: "POST", body: JSON.stringify({ provider }) });
+      const authUrl = res.data?.authUrl;
+      if (!authUrl) throw new Error("未获取到授权链接");
+      $("oauth-active-label").textContent = `${provider.toUpperCase()} 授权链接（已尝试在新标签打开）`;
+      const link = $("oauth-open-link");
+      link.href = authUrl;
+      link.textContent = authUrl;
+      $("oauth-url-box").classList.remove("hidden");
+      window.open(authUrl, "_blank", "noopener,noreferrer");
+      toast(`已获取 ${provider.toUpperCase()} 官方授权链接，请在新页面完成后粘贴回调 URL`, "ok");
+    } catch (e) {
+      toast("获取 OAuth 链接失败: " + e.message, "err");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function handleOAuthVerify() {
+    const input = $("oauth-callback-input").value.trim();
+    if (!input) return toast("请先粘贴授权跳转后的完整 URL 或 code", "warn");
+    const btn = $("btn-oauth-verify");
+    btn.disabled = true;
+    try {
+      await api("/api/bohrium/oauth/verify", {
+        method: "POST",
+        body: JSON.stringify({ provider: selectedOAuthProvider, callbackInput: input }),
+      });
+      toast(`${selectedOAuthProvider.toUpperCase()} OAuth 登录成功`, "ok");
+      $("oauth-callback-input").value = "";
+      closeLoginModal();
+      await loadOverview();
+    } catch (e) {
+      toast(e.message, "err");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function currentOTPKind() {
+    const checked = document.querySelector('input[name="otp-kind"]:checked');
+    return checked ? checked.value : "phone";
+  }
+
+  async function handleSendOTP() {
+    const kind = currentOTPKind();
+    const target = $("otp-target").value.trim();
+    const countryCode = $("otp-cc").value.trim() || "86";
+    if (!target) return toast(kind === "phone" ? "请输入手机号" : "请输入邮箱", "warn");
+    const btn = $("btn-send-otp");
+    btn.disabled = true;
+    const orig = btn.textContent;
+    btn.textContent = "发送中...";
+    try {
+      const res = await api("/api/bohrium/code/send", {
+        method: "POST",
+        body: JSON.stringify({ kind, target, countryCode }),
+      });
+      toast(res.message || "验证码已发送", "ok");
+    } catch (e) {
+      toast(e.message, "warn");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = orig;
+    }
+  }
+
+  async function handleOTPLogin() {
+    const kind = currentOTPKind();
+    const target = $("otp-target").value.trim();
+    const countryCode = $("otp-cc").value.trim() || "86";
+    const code = $("otp-code").value.trim();
+    if (!target || !code) return toast("请填写账号和验证码", "warn");
+    const btn = $("btn-otp-login");
+    btn.disabled = true;
+    try {
+      await api("/api/bohrium/login/code", {
+        method: "POST",
+        body: JSON.stringify({ kind, target, countryCode, code }),
+      });
+      toast("验证码登录成功", "ok");
+      $("otp-code").value = "";
+      closeLoginModal();
+      await loadOverview();
+    } catch (e) {
+      toast(e.message, "err");
     } finally {
       btn.disabled = false;
     }
@@ -622,7 +743,7 @@
     btn.disabled = true;
     try {
       await api("/api/bohrium/login/password", { method: "POST", body: JSON.stringify({ account, password }) });
-      toast("密码登录成功！", "ok");
+      toast("密码登录成功", "ok");
       $("pw-secret").value = "";
       closeLoginModal();
       await loadOverview();
@@ -633,9 +754,14 @@
     }
   }
 
-  // Event wiring
   document.addEventListener("DOMContentLoaded", () => {
-    // Admin login form
+    initTheme();
+
+    $("btn-theme-toggle").addEventListener("click", () => {
+      const isDark = document.documentElement.getAttribute("data-theme") === "dark";
+      applyTheme(isDark ? "light" : "dark");
+    });
+
     $("admin-login-form").addEventListener("submit", async (e) => {
       e.preventDefault();
       const errBox = $("admin-login-error");
@@ -658,21 +784,20 @@
       }
     });
 
-    // Main tabs
-    document.querySelectorAll(".tab").forEach((tab) => {
-      tab.addEventListener("click", () => {
-        document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+    document.querySelectorAll(".nav-item").forEach((item) => {
+      item.addEventListener("click", () => {
+        document.querySelectorAll(".nav-item").forEach((n) => n.classList.remove("active"));
         document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
-        tab.classList.add("active");
-        const target = tab.getAttribute("data-tab");
+        item.classList.add("active");
+        const target = item.getAttribute("data-tab");
         $("tab-" + target)?.classList.add("active");
+        $("page-title").textContent = TAB_TITLES[target] || target;
         if (target === "logs") {
           api("/api/logs?limit=100").then((r) => renderLogs(r.data || [])).catch(() => {});
         }
       });
     });
 
-    // Modal tabs & close
     document.querySelectorAll(".modal-tab").forEach((mt) => {
       mt.addEventListener("click", () => {
         document.querySelectorAll(".modal-tab").forEach((x) => x.classList.remove("active"));
@@ -685,10 +810,23 @@
       el.addEventListener("click", closeLoginModal);
     });
 
-    // Buttons
     $("btn-open-login").addEventListener("click", openLoginModal);
     $("btn-banner-login").addEventListener("click", openLoginModal);
     $("btn-gen-qr").addEventListener("click", startWeChatQR);
+    document.querySelectorAll("[data-oauth-provider]").forEach((btn) => {
+      btn.addEventListener("click", () => handleOAuthStart(btn.getAttribute("data-oauth-provider"), btn));
+    });
+    $("btn-oauth-verify").addEventListener("click", handleOAuthVerify);
+    document.querySelectorAll('input[name="otp-kind"]').forEach((radio) => {
+      radio.addEventListener("change", () => {
+        const isPhone = currentOTPKind() === "phone";
+        $("otp-cc-wrap").classList.toggle("hidden", !isPhone);
+        $("otp-target-label").textContent = isPhone ? "手机号" : "邮箱地址";
+        $("otp-target").placeholder = isPhone ? "13800138000" : "name@example.com";
+      });
+    });
+    $("btn-send-otp").addEventListener("click", handleSendOTP);
+    $("btn-otp-login").addEventListener("click", handleOTPLogin);
     $("btn-import-token").addEventListener("click", handleImportToken);
     $("btn-pw-login").addEventListener("click", handlePasswordLogin);
     $("btn-claim-all").addEventListener("click", handleClaimAll);
@@ -699,7 +837,7 @@
     $("btn-refresh-token").addEventListener("click", async () => {
       try {
         await api("/api/bohrium/refresh-token", { method: "POST" });
-        toast("Token 续期成功！", "ok");
+        toast("Token 续期成功", "ok");
         await loadOverview();
       } catch (e) {
         toast("Token 续期失败: " + e.message, "err");

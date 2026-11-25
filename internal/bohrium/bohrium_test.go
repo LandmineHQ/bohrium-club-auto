@@ -183,9 +183,13 @@ func TestRunAllWebTasksSkipsClientAndCancelsImmediately(t *testing.T) {
 		case "/bohrapi/v1/literature-sage/api/v1/file/submit":
 			_, _ = w.Write([]byte(`{"code":0,"data":{"userResourceId":"res-888"}}`))
 		case "/api/v1/scix/reader/entries":
-			_, _ = w.Write([]byte(`{"results":[{"code":0,"entry":{"id":"entry-777"}}]}`))
+			_, _ = w.Write([]byte(`{"code":0,"data":{"results":[{"index":0,"code":0,"entry":{"id":"entry-777","preparation":{"status":"ready"}}}]}}`))
 		case "/api/v1/scix/reader/entries/entry-777/document":
-			_, _ = w.Write([]byte(`{"kind":"ready"}`))
+			if r.Method == http.MethodPost {
+				_, _ = w.Write([]byte(`{"code":0,"data":{"kind":"ready"}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"code":0,"data":{"kind":"upgrade_required"}}`))
 		case "/api/v1/chat":
 			chatCalls++
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -274,7 +278,7 @@ func TestGetPointsAndCapacity(t *testing.T) {
 		case "/platform-gateway/v1/benefits/quota/expire_page":
 			_, _ = w.Write([]byte(`{"code":0,"data":{"items":[{"id":1,"remaining":300,"expireTime":"2026-12-01"}]}}`))
 		case "/bohrapi/v1/account/user/integral_page":
-			_, _ = w.Write([]byte(`{"code":0,"data":{"items":[{"id":9,"amount":500,"remark":"每日任务奖励","createTime":"2026-11-25"}]}}`))
+			_, _ = w.Write([]byte(`{"code":0,"data":{"items":[{"id":9,"changeNum":1000,"eventType":1,"expireAt":"2026-12-25","remark":"玻尔社区每日任务","createTime":"2026-11-25T19:03:53+08:00"},{"id":10,"changeNum":50,"eventType":2,"remark":"科学空间提问消费","createTime":"2026-11-25T18:50:00+08:00"}]}}`))
 		case "/bohrapi/v1/literature-sage/api/v1/file/capacity":
 			_, _ = w.Write([]byte(`{"code":0,"data":{"remainingCapacity":8589934592,"usedCapacity":2147483648,"totalCapacity":10737418240}}`))
 		case "/platform-gateway/v1/membership/info":
@@ -303,5 +307,60 @@ func TestGetPointsAndCapacity(t *testing.T) {
 	}
 	if assets.PaperQuota.Remaining == nil || *assets.PaperQuota.Remaining != 45 {
 		t.Fatalf("unexpected paper quota: %+v", assets.PaperQuota)
+	}
+	if len(assets.RecentIntegralHistory) != 2 || assets.RecentIntegralHistory[0].Amount != 1000 || assets.RecentIntegralHistory[1].Amount != -50 {
+		t.Fatalf("unexpected integral ledger parsing: %+v", assets.RecentIntegralHistory)
+	}
+}
+
+func TestOAuthURLAndVerifyCallback(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("BOHRIUM_DATA_DIR", tmp)
+	cfgMgr, _ := config.Load()
+	st, _ := store.Open(tmp)
+	tok := makeTestJWT(777, 888, time.Now().Add(24*time.Hour))
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/account/oauth_url":
+			if r.URL.Query().Get("type") != "4" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_, _ = w.Write([]byte(`{"code":0,"data":{"url":"https://accounts.google.com/o/oauth2/auth?client_id=abc&state=st1"}}`))
+		case "/api/oauth/verify":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if asString(body["code"]) != "4/0A_test_code" || int(asInt64(body["type"])) != 4 {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"token": tok}})
+		case "/bohrapi/v1/account/info":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"userId":777,"orgId":888,"name":"GoogleTester"}}`))
+		case "/api/platform/session":
+			_, _ = w.Write([]byte(`{"logged_in":true,"binding":{"nickname":"GoogleTester"}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	httpCli, _ := chromehttp.New(chromehttp.Options{})
+	cli := NewClient(httpCli, cfgMgr, st)
+	cli.SetEndpoints(Endpoints{ClubBase: srv.URL, PlatformBase: srv.URL, WWWBase: srv.URL})
+
+	urlRes, err := cli.GetOAuthURL(context.Background(), "google")
+	if err != nil || !strings.Contains(urlRes.AuthURL, "accounts.google.com") {
+		t.Fatalf("GetOAuthURL(google): %v %+v", err, urlRes)
+	}
+
+	auth, err := cli.VerifyOAuthCallback(context.Background(), "google", "https://login.bohrium.com/?code=4%2F0A_test_code&state=st1")
+	if err != nil {
+		t.Fatalf("VerifyOAuthCallback: %v", err)
+	}
+	if auth.UserID != 777 || auth.LoginMethod != "oauth_google" {
+		t.Fatalf("unexpected oauth auth state: %+v", auth)
 	}
 }

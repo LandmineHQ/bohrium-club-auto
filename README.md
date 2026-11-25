@@ -29,8 +29,10 @@ Instead of keeping a local desktop browser open or running heavy headless Chromi
 ### Remote Authentication & Session Lifecycle
 
 - **Server-side WeChat QR login (recommended)**: Requests official QR codes from `platform.bohrium.com/api/account/wechat/login_qrcode` and polls login status right inside the Dashboard — zero CAPTCHA, zero local machine dependency.
+- **Third-party OAuth (Google / Apple / CARSI / Feishu / PKU IAAA)**: Generates official authorization URLs via `/api/account/oauth_url`, opens them in your browser, and exchanges the pasted callback URL (`code=` / `token=`) server-side via `POST /api/oauth/verify`.
+- **Phone / Email OTP login**: Sends verification codes via `send_by_phone_v3` / `send_by_email_v3` and logs in via `/api/account/v2/login/{phone_code,email_code}` (without bypassing CAPTCHA if upstream requires it).
+- **Optional password login**: Supports phone / email / Account ID (`学术码`) + AES-128-CBC login when `/api/captcha/check_user` returns `skip: true`.
 - **Manual `brmToken` import**: Paste raw JWT or cookie strings directly in the login modal; validates against `www.bohrium.com/bohrapi/v1/account/info` and auto-enrolls `club.bohrium.com` binding (`/api/enroll`) if needed.
-- **Optional password login**: Supports `platform.bohrium.com` AES-128-CBC login when `/api/captcha/check_user` returns `skip: true` (never attempts CAPTCHA bypass; guides to WeChat QR when CAPTCHA is required).
 - **Automatic JWT renewal**: Periodically calls `/platform-gateway/v1/account/refresh_token` in the background before expiration so long-running server deployments stay signed in.
 
 ### Points, Quotas & Capacity Dashboard
@@ -276,6 +278,9 @@ All `/api/*` operational endpoints require either an authenticated admin cookie 
 | `GET` | `/api/overview` | Aggregated session, points/capacity, daily tasks, scheduler status, logs |
 | `POST` | `/api/bohrium/wechat/qr` | Request official WeChat QR code for remote login |
 | `GET` | `/api/bohrium/wechat/poll` | Poll WeChat QR login status and persist `brmToken` |
+| `POST` | `/api/bohrium/oauth/url` | Fetch official OAuth URL (`google` / `apple` / `carsi` / `feishu` / `pku`) |
+| `POST` | `/api/bohrium/oauth/verify` | Exchange OAuth callback URL/code via `/api/oauth/verify` |
+| `POST` | `/api/bohrium/code/send` / `login/code` | Send phone/email OTP and log in with verification code |
 | `POST` | `/api/bohrium/login/token` | Import and validate manual `brmToken` |
 | `POST` | `/api/bohrium/refresh-token` | Trigger immediate JWT refresh |
 | `GET` | `/api/tasks` | Fetch current daily tasks list |

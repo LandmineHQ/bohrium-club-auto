@@ -16,6 +16,10 @@
 | <span class="api-method get">GET</span> | `/api/bohrium/session` | 管理员 | 实时检测当前 `brmToken` 登录与社区绑定状态 |
 | <span class="api-method post">POST</span> | `/api/bohrium/wechat/qr` | 管理员 | 申请官方微信扫码二维码（返回 `sceneId`、`qrCodeUrl`） |
 | <span class="api-method get">GET</span> | `/api/bohrium/wechat/poll?sceneId=...` | 管理员 | 轮询扫码结果，登录成功后自动保存并绑定社区 |
+| <span class="api-method post">POST</span> | `/api/bohrium/oauth/url` | 管理员 | 获取官方第三方 OAuth 授权 URL（Body: `{"provider":"google|apple|carsi|feishu|pku"}`） |
+| <span class="api-method post">POST</span> | `/api/bohrium/oauth/verify` | 管理员 | 提交回调 URL 或 `code` 完成第三方 OAuth 换票登录（Body: `{"provider":"...","callbackInput":"..."}`） |
+| <span class="api-method post">POST</span> | `/api/bohrium/code/send` | 管理员 | 发送手机/邮箱验证码（Body: `{"kind":"phone|email","target":"...","countryCode":"86"}`） |
+| <span class="api-method post">POST</span> | `/api/bohrium/login/code` | 管理员 | 使用手机/邮箱验证码登录（Body: `{"kind":"phone|email","target":"...","countryCode":"86","code":"..."}`） |
 | <span class="api-method post">POST</span> | `/api/bohrium/login/token` | 管理员 | 手动导入 `brmToken`（Body: `{"token":"..."}`） |
 | <span class="api-method post">POST</span> | `/api/bohrium/login/password` | 管理员 | 无图形验证码时的密码登录（Body: `{"account":"...","password":"..."}`） |
 | <span class="api-method post">POST</span> | `/api/bohrium/refresh-token` | 管理员 | 手动触发 `/platform-gateway/v1/account/refresh_token` 续期 |

@@ -66,6 +66,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/bohrium/session", s.requireAdmin(s.handleBohriumSession))
 	s.mux.HandleFunc("POST /api/bohrium/wechat/qr", s.requireAdmin(s.handleWeChatQR))
 	s.mux.HandleFunc("GET /api/bohrium/wechat/poll", s.requireAdmin(s.handleWeChatPoll))
+	s.mux.HandleFunc("POST /api/bohrium/oauth/url", s.requireAdmin(s.handleOAuthURL))
+	s.mux.HandleFunc("POST /api/bohrium/oauth/verify", s.requireAdmin(s.handleOAuthVerify))
+	s.mux.HandleFunc("POST /api/bohrium/code/send", s.requireAdmin(s.handleSendCode))
+	s.mux.HandleFunc("POST /api/bohrium/login/code", s.requireAdmin(s.handleCodeLogin))
 	s.mux.HandleFunc("POST /api/bohrium/login/token", s.requireAdmin(s.handleImportToken))
 	s.mux.HandleFunc("POST /api/bohrium/login/password", s.requireAdmin(s.handlePasswordLogin))
 	s.mux.HandleFunc("POST /api/bohrium/refresh-token", s.requireAdmin(s.handleRefreshToken))
@@ -277,6 +281,87 @@ func (s *Server) handleWeChatPoll(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "data": res})
 }
 
+func (s *Server) handleOAuthURL(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Provider string `json:"provider"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "无效请求体"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	res, err := s.client.GetOAuthURL(ctx, body.Provider)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "data": res})
+}
+
+func (s *Server) handleOAuthVerify(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Provider      string `json:"provider"`
+		CallbackInput string `json:"callbackInput"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "无效请求体"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	if _, err := s.client.VerifyOAuthCallback(ctx, body.Provider, body.CallbackInput); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"session": s.client.CheckSession(ctx),
+	})
+}
+
+func (s *Server) handleSendCode(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Kind        string `json:"kind"`
+		Target      string `json:"target"`
+		CountryCode string `json:"countryCode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "无效请求体"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	if err := s.client.SendVerifyCode(ctx, body.Kind, body.Target, body.CountryCode); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "验证码已发送"})
+}
+
+func (s *Server) handleCodeLogin(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Kind        string `json:"kind"`
+		Target      string `json:"target"`
+		CountryCode string `json:"countryCode"`
+		Code        string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "无效请求体"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	if _, err := s.client.LoginWithCode(ctx, body.Kind, body.Target, body.CountryCode, body.Code); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"session": s.client.CheckSession(ctx),
+	})
+}
+
 func (s *Server) handleImportToken(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Token string `json:"token"`
@@ -401,11 +486,15 @@ func (s *Server) handleRunOne(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	after, _ := s.client.ListDailyTasks(ctx)
-	writeJSON(w, http.StatusOK, map[string]any{
+	respBody := map[string]any{
 		"ok":         res.Success,
 		"data":       res,
 		"tasksAfter": after,
-	})
+	}
+	if !res.Success {
+		respBody["error"] = res.Message
+	}
+	writeJSON(w, http.StatusOK, respBody)
 }
 
 func (s *Server) handleRunAll(w http.ResponseWriter, r *http.Request) {

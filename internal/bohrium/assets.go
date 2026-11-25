@@ -24,8 +24,10 @@ type IntegralRecord struct {
 	ID          any     `json:"id"`
 	Amount      float64 `json:"amount"`
 	Balance     float64 `json:"balance,omitempty"`
+	EventType   int     `json:"eventType,omitempty"`
 	Type        any     `json:"type,omitempty"`
 	Description string  `json:"description"`
+	ExpireAt    string  `json:"expireAt,omitempty"`
 	CreatedAt   string  `json:"createdAt"`
 }
 
@@ -200,19 +202,29 @@ func (c *Client) GetPointsAndCapacity(ctx context.Context) (*PointsAndCapacity, 
 			if m == nil {
 				continue
 			}
-			amt := asFloat64(m["amount"])
+			amt := asFloat64(m["changeNum"])
+			if amt == 0 {
+				amt = asFloat64(m["amount"])
+			}
 			if amt == 0 {
 				amt = asFloat64(m["changeAmount"])
 			}
 			if amt == 0 {
 				amt = asFloat64(m["integral"])
 			}
+			eventType := int(asInt64(m["eventType"]))
+			// eventType == 2 represents consumption/deduction on Bohrium ledger
+			if eventType == 2 && amt > 0 {
+				amt = -amt
+			}
 			records = append(records, IntegralRecord{
 				ID:          m["id"],
 				Amount:      amt,
 				Balance:     asFloat64(m["balance"]),
+				EventType:   eventType,
 				Type:        m["type"],
-				Description: firstNonEmptyStr(m, "remark", "description", "reason", "title", "scene"),
+				Description: firstNonEmptyStr(m, "remark", "remarkEn", "description", "reason", "title", "scene"),
+				ExpireAt:    firstNonEmptyStr(m, "expireAt", "expireTime"),
 				CreatedAt:   firstNonEmptyStr(m, "createTime", "createdTime", "createdAt", "created_at"),
 			})
 		}

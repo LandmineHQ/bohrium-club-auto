@@ -379,14 +379,17 @@ func (c *Client) runLiteratureReadingTask(ctx context.Context, task DailyTask) T
 	}
 
 	// Step 2: Register knowledge_base resource in SciX Reader -> readerEntryId.
-	entryID, err := c.registerReaderEntry(ctx, userResourceID)
+	entryID, sourceRev, err := c.registerReaderEntry(ctx, userResourceID)
 	if err != nil {
 		res.Message = fmt.Sprintf("登记文献阅读条目失败 (resource=%s): %v", userResourceID, err)
 		return res
 	}
 
-	// Step 3: Trigger/briefly poll document preparation so Reader knows the entry is active.
-	c.brieflyPrepareReaderDocument(ctx, entryID)
+	// Step 3: Trigger document preparation/upgrade (POST .../document) and wait until kind=="ready".
+	if err := c.waitForReaderDocumentReady(ctx, entryID, sourceRev); err != nil {
+		res.Message = fmt.Sprintf("等待文献解析就绪失败 (entry=%s): %v", entryID, err)
+		return res
+	}
 
 	// Step 4: Submit PDF reading question & immediately cancel workflow + report query-events.
 	queryID := newUUIDv4()
@@ -450,12 +453,16 @@ func (c *Client) uploadReaderPDF(ctx context.Context, fileName string, data []by
 	// Branch A: File already exists in folder -> reuse sourceUserResourceId directly.
 	if asBool(initData["alreadyInFolder"]) {
 		if existingID := firstStringField(initData, "userResourceId", "resourceId"); existingID != "" {
+			var srcID any = existingID
+			if n, err := strconv.ParseInt(existingID, 10, 64); err == nil {
+				srcID = n
+			}
 			submitData, err := c.fetchBohriumData(ctx, http.MethodPost,
 				c.endpoints.WWWBase+"/bohrapi/v1/literature-sage/api/v1/file/submit",
 				map[string]any{
 					"scene":                "reader",
 					"parentId":             folderID,
-					"sourceUserResourceId": existingID,
+					"sourceUserResourceId": srcID,
 				}, headers)
 			if err == nil {
 				if id := firstStringField(submitData, "userResourceId", "resourceId"); id != "" {
@@ -520,10 +527,10 @@ func (c *Client) uploadReaderPDF(ctx context.Context, fileName string, data []by
 	return userResourceID, nil
 }
 
-func (c *Client) registerReaderEntry(ctx context.Context, userResourceID string) (string, error) {
+func (c *Client) registerReaderEntry(ctx context.Context, userResourceID string) (string, string, error) {
 	auth := c.store.GetAuth()
 	u := c.endpoints.SBCloudBase + "/api/v1/scix/reader/entries"
-	resp, err := c.http.DoJSON(ctx, http.MethodPost, u, map[string]any{
+	payload := map[string]any{
 		"entries": []map[string]any{
 			{
 				"source": map[string]any{
@@ -532,63 +539,142 @@ func (c *Client) registerReaderEntry(ctx context.Context, userResourceID string)
 				},
 			},
 		},
-	}, c.sbCloudHeaders(auth.Token, "agent/chat-with-paper"))
-	if err != nil {
-		return "", err
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("reader/entries HTTP %d: %s", resp.StatusCode, truncateText(string(resp.Body), 180))
+
+	type readerEntryResult struct {
+		Code      int    `json:"code"`
+		Error     string `json:"error"`
+		Retryable *bool  `json:"retryable"`
+		Entry     struct {
+			ID             string `json:"id"`
+			SourceRevision string `json:"sourceRevision"`
+		} `json:"entry"`
 	}
-	var body struct {
-		Results []struct {
-			Code  int    `json:"code"`
-			Error string `json:"error"`
-			Entry struct {
-				ID string `json:"id"`
-			} `json:"entry"`
-		} `json:"results"`
-	}
-	if err := json.Unmarshal(resp.Body, &body); err != nil {
-		return "", fmt.Errorf("解析 reader/entries 响应失败: %w", err)
-	}
-	if len(body.Results) == 0 || body.Results[0].Entry.ID == "" {
-		errMsg := "empty results"
-		if len(body.Results) > 0 && body.Results[0].Error != "" {
-			errMsg = body.Results[0].Error
+
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		resp, err := c.http.DoJSON(ctx, http.MethodPost, u, payload, c.sbCloudHeaders(auth.Token, "agent/chat-with-paper"))
+		if err != nil {
+			lastErr = err
+		} else if resp.StatusCode == http.StatusConflict || resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("reader/entries HTTP %d: %s", resp.StatusCode, truncateText(string(resp.Body), 180))
+		} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return "", "", fmt.Errorf("reader/entries HTTP %d: %s", resp.StatusCode, truncateText(string(resp.Body), 180))
+		} else {
+			var body struct {
+				Code int    `json:"code"`
+				Msg  string `json:"msg"`
+				Data struct {
+					Results []readerEntryResult `json:"results"`
+				} `json:"data"`
+				Results []readerEntryResult `json:"results"`
+			}
+			if err := json.Unmarshal(resp.Body, &body); err != nil {
+				return "", "", fmt.Errorf("解析 reader/entries 响应失败: %w", err)
+			}
+			if body.Code != 0 {
+				return "", "", fmt.Errorf("reader/entries 返回错误 code=%d: %s", body.Code, body.Msg)
+			}
+			results := body.Data.Results
+			if len(results) == 0 {
+				results = body.Results
+			}
+			if len(results) > 0 && results[0].Entry.ID != "" && results[0].Code == 0 {
+				return results[0].Entry.ID, results[0].Entry.SourceRevision, nil
+			}
+			errMsg := truncateText(string(resp.Body), 180)
+			retryable := true
+			if len(results) > 0 {
+				if results[0].Error != "" {
+					errMsg = results[0].Error
+				}
+				if results[0].Retryable != nil && !*results[0].Retryable {
+					retryable = false
+				}
+			}
+			lastErr = fmt.Errorf("reader/entries 登记失败: %s", errMsg)
+			if !retryable {
+				return "", "", lastErr
+			}
 		}
-		return "", fmt.Errorf("reader/entries 登记失败: %s", errMsg)
+
+		if attempt < 3 {
+			select {
+			case <-ctx.Done():
+				return "", "", ctx.Err()
+			case <-time.After(1500 * time.Millisecond):
+			}
+		}
 	}
-	return body.Results[0].Entry.ID, nil
+	return "", "", lastErr
 }
 
-func (c *Client) brieflyPrepareReaderDocument(ctx context.Context, entryID string) {
+// waitForReaderDocumentReady reproduces the official reader-web prepareOnce state machine:
+// 1. Call POST /api/v1/scix/reader/entries/<id>/document to kick off parsing/upgrade.
+// 2. While kind != "ready": sleep briefly, re-POST if kind is "upgrade_required"/"not_started",
+//    otherwise poll GET .../document?status=1 until ready (or failed/timeout).
+func (c *Client) waitForReaderDocumentReady(ctx context.Context, entryID, sourceRev string) error {
 	auth := c.store.GetAuth()
 	headers := c.sbCloudHeaders(auth.Token, "agent/chat-with-paper")
 	docURL := fmt.Sprintf("%s/api/v1/scix/reader/entries/%s/document", c.endpoints.SBCloudBase, url.PathEscape(entryID))
 
-	triggered := false
-	for attempt := 0; attempt < 5; attempt++ {
-		resp, err := c.http.DoJSON(ctx, http.MethodGet, docURL+"?status=1", nil, headers)
-		if err != nil {
-			return
-		}
+	prepareBody := map[string]any{}
+	if sourceRev != "" {
+		prepareBody["sourceRevision"] = sourceRev
+	}
+
+	parseKind := func(raw []byte) string {
 		var parsed map[string]any
-		_ = json.Unmarshal(resp.Body, &parsed)
-		kind := asString(parsed["kind"])
-		status := asString(parsed["status"])
-		if kind == "ready" || status == "ready" {
-			return
+		if json.Unmarshal(raw, &parsed) != nil {
+			return ""
 		}
-		if !triggered && (kind == "pending" || status == "pending" || resp.StatusCode == http.StatusNotFound) {
-			triggered = true
-			_, _ = c.http.DoJSON(ctx, http.MethodPost, docURL, map[string]any{}, headers)
+		obj := parsed
+		if data := asMap(parsed["data"]); data != nil {
+			obj = data
+		}
+		if k := asString(obj["kind"]); k != "" {
+			return k
+		}
+		return asString(obj["status"])
+	}
+
+	// Step 1: Always invoke POST .../document first (triggers parsing / upgrade_required).
+	resp, err := c.http.DoJSON(ctx, http.MethodPost, docURL, prepareBody, headers)
+	kind := ""
+	if err == nil {
+		kind = parseKind(resp.Body)
+	}
+
+	deadline := time.Now().Add(90 * time.Second)
+	for attempt := 0; time.Now().Before(deadline); attempt++ {
+		switch kind {
+		case "ready":
+			return nil
+		case "failed":
+			return fmt.Errorf("文献解析失败 (kind=failed)")
+		}
+
+		wait := 2500 * time.Millisecond
+		if attempt >= 4 {
+			wait = 3500 * time.Millisecond
 		}
 		select {
 		case <-ctx.Done():
-			return
-		case <-time.After(1500 * time.Millisecond):
+			return ctx.Err()
+		case <-time.After(wait):
 		}
+
+		if kind == "" || kind == "upgrade_required" || kind == "not_started" {
+			resp, err = c.http.DoJSON(ctx, http.MethodPost, docURL, prepareBody, headers)
+		} else {
+			resp, err = c.http.DoJSON(ctx, http.MethodGet, docURL+"?status=1", nil, headers)
+		}
+		if err != nil {
+			return err
+		}
+		kind = parseKind(resp.Body)
 	}
+	return fmt.Errorf("等待文献解析超时（最后状态: %s）", nonEmpty(kind, "unknown"))
 }
 
 type chatOutcome struct {
