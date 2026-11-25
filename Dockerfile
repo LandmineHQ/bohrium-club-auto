@@ -7,7 +7,7 @@
 #     -e BOHRIUM_ADMIN_PASSWORD="change-me" \
 #     -v bohrium-club-auto-data:/data bohrium-club-auto:latest
 #
-# 设计参考 LandmineHQ/duckai-cpa：
+# 设计：
 #   - build 阶段使用 golang:1.24-alpine，CGO_ENABLED=0 静态编译单文件二进制
 #     （所有 870+ 提问语料、100 篇文献目录与管理面板均通过 go:embed 内置）；
 #   - runtime 阶段仅包含 alpine:3.20 + ca-certificates + tzdata + 单文件二进制。

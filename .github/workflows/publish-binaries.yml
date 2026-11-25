@@ -1,6 +1,6 @@
 name: publish-binaries
 
-# 参考 LandmineHQ/duckai-cpa：手动构建多平台静态单文件二进制并发布到 GitHub Release。
+# 手动构建多平台静态单文件二进制并发布到 GitHub Release。
 on:
   workflow_dispatch:
     inputs:

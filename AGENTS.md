@@ -9,7 +9,7 @@ Repository guidance for automated coding agents and human contributors working o
 - Automated & manual daily task execution for **Bohrium User Community (`https://club.bohrium.com/`)**.
 - Remote server-side authentication (WeChat Official Account QR scan, `brmToken` import, automatic JWT refresh).
 - An embedded, admin-password-protected Web Dashboard (`web/static/*` via `go:embed`) showing remaining photons, expiring lots, ledger history, membership quotas, knowledge-base storage capacity, daily tasks, execution logs, schedule settings, and live frontend recon drift checks.
-- A built-in frontend snapshot/diff checker (`recon pull` / `recon diff`) modeled on `LandmineHQ/duckai-cpa` conventions.
+- A built-in frontend snapshot/diff checker (`recon pull` / `recon diff`) writing local baselines to gitignored `/recon/`.
 
 ## 2. Non-Negotiable Invariants
 

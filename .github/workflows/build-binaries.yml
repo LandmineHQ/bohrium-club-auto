@@ -1,6 +1,6 @@
 name: build-binaries
 
-# 参考 LandmineHQ/duckai-cpa：手动构建多平台静态单文件二进制并在对应架构 runner 上做原生 HTTP 冒烟测试。
+# 手动构建多平台静态单文件二进制并在对应架构 runner 上做原生 HTTP 冒烟测试。
 # 注意：使用 macos-15-intel / macos-15（macos-13 / macos-14 已从 GitHub Actions 下线）。
 on:
   workflow_dispatch:

@@ -1,6 +1,6 @@
 name: build-docker-image
 
-# 参考 LandmineHQ/duckai-cpa：手动构建极简 Alpine 镜像，启动容器做真实 HTTP 冒烟并输出镜像大小（不推送 registry）。
+# 手动构建极简 Alpine 镜像，启动容器做真实 HTTP 冒烟并输出镜像大小（不推送 registry）。
 on:
   workflow_dispatch:
 

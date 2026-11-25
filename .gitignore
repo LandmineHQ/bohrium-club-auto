@@ -1,4 +1,4 @@
-# Local recon snapshots (comparable to duckai-cpa: never vendor upstream web bundles)
+# Local recon snapshots (never vendor upstream web bundles)
 /recon/
 
 # Runtime data at repo root only (do NOT ignore internal/prompts/data/)

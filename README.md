@@ -1,90 +1,370 @@
-# Bohrium Club Auto
+# ⚛️ Bohrium Club Auto — Daily Task Automation & Admin Console for Bohrium Community
 
-面向 **玻尔用户社区 (`https://club.bohrium.com/`)** 的自托管 **Go** 每日任务自动化程序与 Web 管理面板，零第三方依赖、静态单文件编译、内置 Chrome 浏览器出站指纹与前端 Recon 变更查询。
+**A self-hosted, zero-dependency Go automation service and embedded Web Dashboard for [Bohrium User Community (`club.bohrium.com`)](https://club.bohrium.com/) — featuring remote WeChat QR login, Chrome browser outgoing fingerprint, points & storage capacity monitoring, one-click daily task claiming, real Web API task execution with immediate workflow cancellation, and frontend recon drift checks.**
 
-## 核心特性
+[![Go](https://img.shields.io/badge/Go-1.24-00ADD8.svg?style=flat-square&logo=go&logoColor=white)](https://go.dev/)
+[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED.svg?style=flat-square&logo=docker&logoColor=white)](https://www.docker.com/)
+[![Zero Dependencies](https://img.shields.io/badge/Dependencies-Stdlib%20Only-10B981.svg?style=flat-square)](go.mod)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
+[![CI](https://github.com/LandmineHQ/bohrium-club-auto/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/LandmineHQ/bohrium-club-auto/actions/workflows/ci.yml)
 
-1. **服务器端远程登录（无需本地电脑挂机）**
-   - **微信官方扫码登录（推荐）**：服务端直接向 `platform.bohrium.com` 申请微信登录二维码，在管理面板中手机扫码即可完成服务器侧登录，无图形验证码。
-   - **手动导入 `brmToken`**：支持直接粘贴浏览器 Cookie 中的 `brmToken`。
-   - **自动续期**：后台定时调用 `/platform-gateway/v1/account/refresh_token` 延长 JWT 有效期。
-2. **管理员密码保护的 Web 管理面板**
-   - 展示**剩余积分与容量**：个人/组织光子余额、钱包余额、7 日即将过期光子及批次明细、近期光子收支流水、会员等级与功能配额（文献检索 / 知识库对话 / 深度研究）、知识库存储容量（剩余 / 已用 / 总量）。
-   - 展示**每日 4 项任务状态**（未领取 / 待完成 / 已完成 / 已跳过）：
-     - 提供 **「一键领取每日任务」** 按钮；
-     - 提供 **「一键执行全部 Web 任务」** 及 **单项任务手动触发按钮**；
-     - 自动跳过第 2 项桌面客户端任务（`体验玻尔科学空间「客户端」`）；
-     - **彻底禁用旧版已废弃的 200 光子每日签到接口**（绝不调用 `/bohrapi/v1/account/user/integral_receive`）。
-3. **真实产品 API 执行 + 立即终止请求**
-   - 内置 **870 条科研与学术写作随机提问语料**（330 条科学空间 Web 问题 + 320 条学术写作问题 + 220 条文献阅读问题）及 **100 篇真实公开 arXiv 科学文献 PDF 目录**（通过 `go:embed` 直接打包进二进制）。
-   - **任务 1（科学空间 Web）** / **任务 4（学术写作）**：随机抽取问题调用真实聊天 API，上报对应 `task_key` 至 `/api/v1/query-events` 后**立即调用 `cancelWorkflow` 终止请求**。
-   - **任务 3（文献阅读）**：从 100 篇文献目录中随机挑选 PDF（自动下载并缓存到 `data/pdfs/`，也支持往 `data/custom_pdfs/` 放入自定义 PDF），经由 `literature-sage` 上传并登记至 `scix/reader`，随机抽取文献问题提交提问后**立即终止请求**。
-4. **Chrome 浏览器出站指纹**
-   - 所有出站 HTTP 请求统一注入桌面端 Chrome `User-Agent`、`Sec-CH-UA`、`Sec-CH-UA-Mobile`、`Sec-CH-UA-Platform` 与 `Accept-Language`，绝不暴露 `Go-http-client`。
-5. **Recon 快照与上游变更查询 + GitHub Actions CI/CD**
-   - 参考 [`LandmineHQ/duckai-cpa`](https://github.com/LandmineHQ/duckai-cpa) 的仓库结构、CI 流水线及 `recon/` 本地快照比对模式（详见 [docs/RECON-SNAPSHOT.md](docs/RECON-SNAPSHOT.md)）。
+*Deploy on any Linux/Docker server, scan WeChat QR remotely in your browser, monitor remaining photons, quotas and knowledge-base capacity, and automate all 3 Bohrium Web daily tasks — while skipping the desktop client task and deprecated legacy check-in.*
 
-## Docker Compose 快速部署（推荐）
+**Repository:** <https://github.com/LandmineHQ/bohrium-club-auto> · **Docs:** <https://landminehq.github.io/bohrium-club-auto/> · **Actions:** <https://github.com/LandmineHQ/bohrium-club-auto/actions>
+
+[Features](#-key-features) • [Daily Tasks](#-daily-tasks-matrix) • [Quick Start](#-quick-start) • [Architecture](#-architecture) • [Configuration](#%EF%B8%8F-configuration) • [API Surface](#-api-surface) • [Security](#-security--reliability)
+
+---
+
+## 📖 Overview
+
+**Bohrium Club Auto** connects directly to Bohrium's native Web APIs (`club.bohrium.com`, `platform.bohrium.com`, `www.bohrium.com`, and `sb-cloud.dp.tech`) from a single static Go binary (~7.5 MB) with an embedded admin console and embedded scientific prompt/paper corpora.
+
+Instead of keeping a local desktop browser open or running heavy headless Chromium containers, it supports **remote server-side WeChat Official Account QR login**, automatically renews `brmToken` JWT sessions, displays real-time photon balances and capacity metrics, provides one-click claim & manual per-task triggers, and runs scheduled daily Web tasks in `Asia/Shanghai` timezone.
+
+---
+
+## ✨ Key Features
+
+### Remote Authentication & Session Lifecycle
+
+- **Server-side WeChat QR login (recommended)**: Requests official QR codes from `platform.bohrium.com/api/account/wechat/login_qrcode` and polls login status right inside the Dashboard — zero CAPTCHA, zero local machine dependency.
+- **Manual `brmToken` import**: Paste raw JWT or cookie strings directly in the login modal; validates against `www.bohrium.com/bohrapi/v1/account/info` and auto-enrolls `club.bohrium.com` binding (`/api/enroll`) if needed.
+- **Optional password login**: Supports `platform.bohrium.com` AES-128-CBC login when `/api/captcha/check_user` returns `skip: true` (never attempts CAPTCHA bypass; guides to WeChat QR when CAPTCHA is required).
+- **Automatic JWT renewal**: Periodically calls `/platform-gateway/v1/account/refresh_token` in the background before expiration so long-running server deployments stay signed in.
+
+### Points, Quotas & Capacity Dashboard
+
+- **Photons & wallet**: Displays personal photon balance, organization balance & limit, wallet balance, 7-day expiring photon alert, expiring lots breakdown, and recent photon ledger history.
+- **Membership & feature quotas**: Shows membership level, expiry date, and remaining counts for Literature Search (`sn.paper`), Knowledge Base Chat (`knowledge_base.chat`), and Deep Research (`sn.deep_research`).
+- **Knowledge-base storage**: Visual progress bar and human-readable breakdown of remaining, used, and total storage bytes (`/bohrapi/v1/literature-sage/api/v1/file/capacity`).
+
+### Daily Tasks & Embedded Scientific Corpus
+
+- **One-click claim**: Trigger `POST /api/plaza/tasks/claim` from the Dashboard or automatically before daily runs.
+- **Per-task manual triggers & batch run**: Click any Web task individually or run all incomplete Web tasks with one button.
+- **Strict task rules**:
+  - Automatically skips Task #2 (Desktop Client `体验玻尔科学空间「客户端」`).
+  - Never calls the deprecated legacy 200-photon daily check-in endpoint (`/bohrapi/v1/account/user/integral_receive`).
+- **870 embedded prompts + 100 real arXiv papers**:
+  - 330 Science Space Web questions, 320 Academic Writing requests, and 220 Literature Reading PDF questions compiled via `go:embed`.
+  - 100 curated open-access arXiv PDFs cataloged for Task #3 (downloaded on demand with Chrome UA and cached in `data/pdfs/`, plus optional user-supplied PDFs in `data/custom_pdfs/`).
+- **Immediate workflow cancellation**: Every Web task submits a real product API request, reports official `query-events` telemetry for its matching `task_key`, and immediately terminates the workflow via `POST /api/v1/chat/<workflowId>/cancel` (`{"source":"api_request"}`).
+
+### Operations, Fingerprint & Recon
+
+- **Desktop Chrome outgoing fingerprint**: Every outbound HTTP request injects Chrome `User-Agent`, `Sec-CH-UA`, `Sec-CH-UA-Mobile`, `Sec-CH-UA-Platform`, and `Accept-Language` — never `Go-http-client`.
+- **Admin password protection**: All operational APIs require constant-time verified admin password authentication with rate limiting and HMAC-SHA256 signed `HttpOnly` cookies (or `X-Admin-Password` header for scripts).
+- **Frontend recon drift checker**: Built-in `recon pull` / `recon diff` CLI and Dashboard tab snapshot live Bohrium static bundles into gitignored `recon/` and check SHA-256 & API contract markers for upstream changes.
+- **Minimal Docker & multi-platform binaries**: Zero third-party Go dependencies, ~7.5 MB static binary, ~15 MB Alpine runtime image.
+
+---
+
+## 📋 Daily Tasks Matrix
+
+| # | Bohrium Plaza Task | `task_key` | Execution Strategy | Immediate Cancel |
+| --- | --- | --- | --- | --- |
+| 1 | 体验玻尔科学空间「Web端」 | `bohrium_science_space_web` | Random prompt from 330 Science Space prompts → `sb-cloud.dp.tech/api/v1/chat` (`teamId: AgK4D5B8Fdju`) → `query-events` | Yes (`/cancel`) |
+| 2 | 体验玻尔科学空间「客户端」 | `bohrium_science_space_client` | **Automatically skipped** | — |
+| 3 | 体验玻尔「文献阅读」 | `bohrium_literature_reading` | Random PDF from 100 arXiv papers (or `data/custom_pdfs/`) → `literature-sage` upload → `scix/reader/entries` → random prompt from 220 PDF prompts → `query-events` | Yes (`/cancel`) |
+| 4 | 体验玻尔「学术写作」 | `bohrium_academic_writing` | Random prompt from 320 Academic Writing prompts → `sb-cloud.dp.tech/api/v1/chat` (`Referer: /academic-writing`) → `query-events` | Yes (`/cancel`) |
+
+---
+
+## 🚀 Quick Start
+
+### Requirements
+
+- **Option A (recommended): Docker + Docker Compose only.** Use the prebuilt minimal image from GHCR — no Go toolchain, no Node.js, no source build.
+- **Option B: nothing on the target machine.** Download a prebuilt static single-file binary for your OS/arch from the latest GitHub Release.
+
+> Building from source is a developer task; see [docs/BINARY-BUILDS.md](docs/BINARY-BUILDS.md).
+
+### Option A — GHCR image with Docker Compose (recommended)
+
+Image: `ghcr.io/landminehq/bohrium-club-auto:latest` (minimal `alpine:3.20` + static Go binary, `linux/amd64` & `linux/arm64`).
+Save this as `compose.yml` and run `docker compose up -d`:
+
+```yaml
+services:
+  bohrium-club-auto:
+    image: ghcr.io/landminehq/bohrium-club-auto:latest
+    container_name: bohrium-club-auto
+    restart: unless-stopped
+    ports:
+      - "8788:8788"
+    environment:
+      BOHRIUM_HOST: "0.0.0.0"
+      BOHRIUM_PORT: "8788"
+      BOHRIUM_DATA_DIR: "/data"
+      BOHRIUM_RECON_DIR: "/data/recon/bohrium-web"
+      TZ: "Asia/Shanghai"
+      # Recommended: set a strong password; leave empty to auto-generate on first start
+      BOHRIUM_ADMIN_PASSWORD: "replace-with-a-strong-password"
+      BOHRIUM_SCHEDULE_ENABLED: "true"
+      BOHRIUM_SCHEDULE_TIME: "08:15"
+      BOHRIUM_SCHEDULE_TZ: "Asia/Shanghai"
+    volumes:
+      - bohrium-club-auto-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8788/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+volumes:
+  bohrium-club-auto-data:
+```
 
 ```bash
-git clone <your-repo-url> bohrium-club-auto
-cd bohrium-club-auto
-
-# 设置管理员密码并启动
-BOHRIUM_ADMIN_PASSWORD="YourStrongPassword" docker compose up -d --build
-
-# 查看日志（若未设置 BOHRIUM_ADMIN_PASSWORD，首次启动会在日志中打印随机生成的密码）
+docker compose up -d
 docker compose logs -f bohrium-club-auto
 ```
 
-打开浏览器访问 `http://<server-ip>:8788/`，输入管理员密码进入控制台，点击 **「远程登录玻尔」** 扫码绑定账号即可。
-
-使用预构建 GHCR 镜像：
+Or run inline without a compose file:
 
 ```bash
-GHCR_IMAGE="ghcr.io/<owner>/bohrium-club-auto:latest" \
-BOHRIUM_ADMIN_PASSWORD="YourStrongPassword" \
-docker compose -f docker-compose.ghcr.yml up -d
+docker run -d --name bohrium-club-auto -p 8788:8788 \
+  -v bohrium-club-auto-data:/data \
+  -e BOHRIUM_ADMIN_PASSWORD="replace-with-a-strong-password" \
+  ghcr.io/landminehq/bohrium-club-auto:latest
 ```
 
-## 环境变量
+- Dashboard: <http://127.0.0.1:8788/> — health check: `GET /healthz`.
+- Persistent volume `/data` stores `config.json`, `state.json`, cached PDFs (`pdfs/`), optional custom PDFs (`custom_pdfs/`), and recon snapshots (`recon/`). Container runs as non-root UID `10001`.
+- The repository also ships [`docker-compose.ghcr.yml`](docker-compose.ghcr.yml) (GHCR image) and [`docker-compose.yml`](docker-compose.yml) (local build).
 
-| 变量名 | 默认值 | 说明 |
-| --- | --- | --- |
-| `BOHRIUM_HOST` | `0.0.0.0` | 监听地址 |
-| `BOHRIUM_PORT` | `8788` | 监听端口 |
-| `BOHRIUM_DATA_DIR` | `data`（容器内 `/data`） | 配置、登录态、日志与 PDF 缓存目录 |
-| `BOHRIUM_ADMIN_PASSWORD` | 首次启动自动生成 | 控制台管理员密码（也支持 `ADMIN_PASSWORD`） |
-| `BOHRIUM_SCHEDULE_ENABLED` | `true` | 是否开启每日定时自动执行 |
-| `BOHRIUM_SCHEDULE_TIME` | `08:15` | 每日定时执行时间（24 小时制 `HH:MM`） |
-| `BOHRIUM_SCHEDULE_TZ` | `Asia/Shanghai` | 定时任务时区 |
-| `BOHRIUM_USER_AGENT` | Chrome 136 Windows UA | 自定义出站 Chrome User-Agent |
-| `BOHRIUM_PROXY` | 空 | 可选 HTTP/HTTPS 出站代理 |
-| `BOHRIUM_RECON_DIR` | `recon/bohrium-web` | 本地 Recon 基线目录（已 gitignore） |
+> If `ghcr.io/landminehq/bohrium-club-auto:latest` has not been published yet, run `Actions → publish-docker-image` first (see [Publishing](#publishing)), or use `docker compose up -d --build` from the cloned repository.
 
-## 本地开发与 Recon 命令
+### Option B — Download a prebuilt single-file binary (latest release)
+
+Go to the **[latest GitHub Release](https://github.com/LandmineHQ/bohrium-club-auto/releases/latest)** and download the archive for your platform (`CGO_ENABLED=0` static binaries, no external runtime required):
+
+| Platform | Release asset |
+| --- | --- |
+| Windows x64 | `bohrium-club-auto-windows-x64.zip` |
+| Linux x64 (static: glibc & Alpine) | `bohrium-club-auto-linux-x64.tar.gz` |
+| Linux arm64 (static: glibc & Alpine) | `bohrium-club-auto-linux-arm64.tar.gz` |
+| macOS Intel | `bohrium-club-auto-darwin-x64.tar.gz` |
+| macOS Apple Silicon | `bohrium-club-auto-darwin-arm64.tar.gz` |
+| Checksums | `SHA256SUMS.txt` |
 
 ```bash
-# 运行全部单元测试（含竞态检测）
+# Linux / macOS example
+tar -xzf bohrium-club-auto-linux-x64.tar.gz
+chmod +x bohrium-club-auto
+BOHRIUM_ADMIN_PASSWORD="replace-with-a-strong-password" ./bohrium-club-auto
+```
+
+Windows: unzip and run `bohrium-club-auto.exe`.
+
+- Data directory defaults to `./data` next to the working directory (override with `BOHRIUM_DATA_DIR`).
+- Unsigned binaries: Windows SmartScreen / macOS Gatekeeper may warn (macOS: `xattr -d com.apple.quarantine ./bohrium-club-auto`).
+
+### First Start
+
+1. Open <http://127.0.0.1:8788/> and sign in with your `BOHRIUM_ADMIN_PASSWORD` (if unset, check the auto-generated password printed in startup logs or `data/config.json`).
+2. Click **远程登录玻尔** → **获取 / 刷新二维码** and scan with WeChat on your phone.
+3. View remaining photons, storage capacity, and daily tasks on the home tab; click **一键领取每日任务** or **一键执行全部 Web 任务** to verify immediately.
+
+> `/data` contains your admin password and Bohrium session JWT (`brmToken`). Keep permissions `0600` and never commit it.
+
+### Permission error on a bind-mounted `./data`
+
+The container runs as UID/GID **10001:10001**. If you use a host bind mount instead of the default named volume:
+
+```bash
+mkdir -p data
+sudo chown -R 10001:10001 data
+docker compose up -d
+```
+
+### Publishing
+
+Release artifacts and container images are published manually via GitHub Actions:
+
+**Container image** — `Actions → publish-docker-image`:
+
+```text
+version: v0.1.0        # required, Docker tag rules (letters/digits/._-)
+also_latest: true      # optionally also tag :latest
+```
+
+- Builds `Dockerfile` for `linux/amd64,linux/arm64` and pushes `ghcr.io/landminehq/bohrium-club-auto:<version>`.
+
+**Binaries** — `Actions → publish-binaries`:
+
+```text
+version: v0.1.0        # required; release tag and asset version
+prerelease: false      # true = pre-release (excluded from /releases/latest)
+draft: false           # true = create as draft
+```
+
+- Compiles all 5 platforms natively, attaches `.zip`/`.tar.gz` archives plus `SHA256SUMS.txt`, and generates a release download table.
+
+**Docs site** — `Actions → Deploy docs`:
+
+- Automatically builds `docs-site/` (VitePress) and deploys to <https://landminehq.github.io/bohrium-club-auto/> on pushes to `main` touching `docs-site/**` or manual dispatch.
+
+---
+
+## 📐 Architecture
+
+```mermaid
+flowchart LR
+    Browser["Admin Browser"] -->|"Cookie / X-Admin-Password"| HTTP["Go HTTP Server<br/>(internal/server + embedded web/)"]
+    HTTP --> Sched["Daily Scheduler & Mutex<br/>(Asia/Shanghai + auto refresh_token)"]
+    HTTP --> Recon["Recon Engine<br/>(pull / diff + contract markers)"]
+    Sched --> Client["Bohrium Client<br/>(internal/bohrium + embedded prompts)"]
+    HTTP --> Client
+    Client --> Chrome["Chrome HTTP Client<br/>(Chrome UA + Sec-CH-UA + optional proxy)"]
+    Recon --> Chrome
+    Chrome --> Club["club.bohrium.com<br/>(tasks, claim, session, enroll)"]
+    Chrome --> Platform["platform.bohrium.com<br/>(WeChat QR login)"]
+    Chrome --> WWW["www.bohrium.com<br/>(photons, quotas, storage, PDF upload)"]
+    Chrome --> SB["sb-cloud.dp.tech<br/>(Reader, chat, query-events, cancel)"]
+    HTTP --> Store[("Atomic JSON Store<br/>data/config.json & data/state.json")]
+    Client --> Store
+```
+
+- **Stdlib-only Go 1.24**: Zero external Go modules in `go.mod`; embeds IANA tzdata (`time/tzdata`), all 870 prompts, 100 arXiv paper metadata records, and the full dashboard SPA directly into the executable.
+- **Mutex-protected execution**: Manual dashboard triggers and scheduled daily runs share a single lock in `internal/scheduler`, preventing duplicate runs.
+- **Graceful shutdown**: Handles `SIGTERM`/`SIGINT` cleanly, stopping the scheduler and draining in-flight HTTP requests.
+
+---
+
+## ⚙️ Configuration
+
+Configuration is stored atomically in `data/config.json` (editable in the Dashboard) and overridden by environment variables:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `BOHRIUM_HOST` | `0.0.0.0` | Listen address |
+| `BOHRIUM_PORT` | `8788` | HTTP listen port |
+| `BOHRIUM_DATA_DIR` | `data` (`/data` in Docker) | Persistent data directory (`config.json`, `state.json`, `pdfs/`, `custom_pdfs/`) |
+| `BOHRIUM_ADMIN_PASSWORD` | auto-generated | Admin password for Dashboard & API (also accepts `ADMIN_PASSWORD`) |
+| `BOHRIUM_SESSION_SECRET` | auto-generated | HMAC-SHA256 signing secret for admin cookies |
+| `BOHRIUM_SCHEDULE_ENABLED` | `true` | Enable daily scheduled execution |
+| `BOHRIUM_SCHEDULE_TIME` | `08:15` | Daily trigger time (`HH:MM`, 24-hour) |
+| `BOHRIUM_SCHEDULE_TZ` | `Asia/Shanghai` | Scheduler timezone |
+| `BOHRIUM_USER_AGENT` | Chrome 136 Windows UA | Outgoing Chrome User-Agent override |
+| `BOHRIUM_PROXY` | empty | Optional HTTP/HTTPS outbound proxy (`HTTPS_PROXY` / `HTTP_PROXY` fallback) |
+| `BOHRIUM_RECON_DIR` | `recon/bohrium-web` | Local recon baseline snapshot directory |
+
+Additional runtime fields in `data/config.json` (see [`config/config.example.json`](config/config.example.json)):
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `schedule.jitterMinutes` | `15` | Deterministic per-day random delay (0–120 min) |
+| `schedule.autoClaim` | `true` | Automatically claim unclaimed daily tasks before running |
+| `schedule.autoRefresh` | `true` | Background `refresh_token` renewal |
+| `taskDelaySec` | `3` | Pause between sequential Web tasks |
+| `cancelAfterMs` | `450` | Delay before invoking `cancelWorkflow` after chat acceptance |
+| `maxPdfSizeBytes` | `26214400` (25 MB) | Max PDF file size accepted for Task #3 |
+
+---
+
+## 📚 API Surface
+
+All `/api/*` operational endpoints require either an authenticated admin cookie (`POST /api/auth/login`) or the `X-Admin-Password` header:
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/healthz` | Public health status, build version, and active Chrome UA |
+| `POST` | `/api/auth/login` | Admin password login (rate-limited, sets `HttpOnly` cookie) |
+| `GET` | `/api/overview` | Aggregated session, points/capacity, daily tasks, scheduler status, logs |
+| `POST` | `/api/bohrium/wechat/qr` | Request official WeChat QR code for remote login |
+| `GET` | `/api/bohrium/wechat/poll` | Poll WeChat QR login status and persist `brmToken` |
+| `POST` | `/api/bohrium/login/token` | Import and validate manual `brmToken` |
+| `POST` | `/api/bohrium/refresh-token` | Trigger immediate JWT refresh |
+| `GET` | `/api/tasks` | Fetch current daily tasks list |
+| `POST` | `/api/tasks/claim-all` | Claim all daily tasks in one click |
+| `POST` | `/api/tasks/run` | Manually execute a single Web task (auto-claims if needed, skips client task) |
+| `POST` | `/api/tasks/run-all` | Claim and run all incomplete Web tasks sequentially |
+| `GET` | `/api/assets` | Fetch photons, wallet, 7-day expiring lots, ledger, quotas, and storage capacity |
+| `GET` / `PUT` | `/api/settings` | Read or update schedule, UA, proxy, cancel timing, and admin password |
+| `POST` | `/api/recon/pull` / `/api/recon/diff` | Pull local frontend snapshot baseline or check live upstream drift |
+
+Full endpoint docs: <https://landminehq.github.io/bohrium-club-auto/api/admin>
+
+---
+
+## 🛡️ Security & Reliability
+
+- **Constant-time password check & rate limit**: Admin login hashes passwords with SHA-256 and compares with `subtle.ConstantTimeCompare`; repeated failures are rate-limited per client IP.
+- **Token redaction**: Full `brmToken` JWT strings are never returned back through dashboard APIs; `config.json` and `state.json` are written atomically with `0600` permissions.
+- **No CAPTCHA circumvention**: Password login stops gracefully whenever upstream requires Tencent Captcha and instructs the user to use official WeChat QR login.
+- **Offline / restricted-network resilience**: Task #3 caches downloaded arXiv PDFs in `data/pdfs/`, prioritizes user-provided PDFs in `data/custom_pdfs/`, retries across multiple catalog papers and mirrors, and falls back to a valid minimal PDF if external arXiv access is blocked.
+- **Zero false-positive recon diffs**: HTML hashing strips ephemeral per-request edge CDN `clientSignal` and `nonce` attributes while checking static bundle SHA-256 digests and API contract markers.
+
+---
+
+## 🧪 Development & Verification
+
+```bash
+# Static analysis & full test suite (all unit tests run offline via httptest)
+go vet ./...
 go test -race -v ./...
 
-# 编译单文件二进制
-CGO_ENABLED=0 go build -o bohrium-club-auto ./cmd/bohrium-club-auto
+# Build static single-file binary
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.Version=dev" \
+  -o dist/bohrium-club-auto ./cmd/bohrium-club-auto
 
-# 启动服务
-./bohrium-club-auto serve
+# Start server locally
+./dist/bohrium-club-auto serve
 
-# 拉取前端基线快照 & 检测线上更新
-./bohrium-club-auto recon pull
-./bohrium-club-auto recon diff
+# Pull & diff upstream Bohrium frontend snapshot (writes only to gitignored /recon/)
+./dist/bohrium-club-auto recon pull
+./dist/bohrium-club-auto recon diff --json
+
+# Preview or build VitePress documentation site
+npm ci --prefix docs-site
+npm run dev --prefix docs-site
+npm run build --prefix docs-site
 ```
 
-## GitHub Actions 流水线与文档站
+---
 
-- `.github/workflows/ci.yml`：Push/PR 自动执行 `go vet`、`go test -race` 与静态编译校验。
-- `.github/workflows/build-binaries.yml`：手动触发构建 5 平台静态单文件二进制（Windows x64 / Linux x64 & arm64 / macOS Intel & Apple Silicon）并执行原生 HTTP `/healthz` + 管理员鉴权冒烟测试。
-- `.github/workflows/publish-binaries.yml`：手动触发构建并发布多平台归档与 `SHA256SUMS.txt` 至 GitHub Release（详见 [docs/BINARY-BUILDS.md](docs/BINARY-BUILDS.md)）。
-- `.github/workflows/build-docker-image.yml`：手动构建极简 Alpine 镜像、统计体积并运行容器级 HTTP 冒烟测试。
-- `.github/workflows/publish-docker-image.yml`：手动构建多架构（`linux/amd64,linux/arm64`）镜像并推送至 GHCR。
-- `.github/workflows/recon-check.yml`：手动触发线上 Bohrium 前端静态源码 Recon 巡检与契约标记验证。
-- `.github/workflows/deploy-docs.yml`：自动构建并发布 `docs-site/` VitePress 文档站至 GitHub Pages（本地预览：`npm ci --prefix docs-site && npm run dev --prefix docs-site`）。
+## 📁 Project Layout
+
+```text
+cmd/bohrium-club-auto/     CLI entry point (serve, recon pull, recon diff, version)
+internal/chromehttp/       Chrome browser User-Agent & Client Hints HTTP client
+internal/config/           Atomic config.json management, env overrides, first-boot password
+internal/store/            Atomic state.json persistence (auth, schedule day, logs)
+internal/prompts/          go:embed 870 scientific prompts + 100 real arXiv papers catalog
+internal/bohrium/          Bohrium auth, daily tasks, assets/capacity, PDF pool, task executor
+internal/scheduler/        Daily Asia/Shanghai scheduler + periodic token auto-refresh
+internal/recon/            Live Bohrium frontend snapshot & diff engine
+internal/server/           Admin password gate, rate limiter, REST API, embedded SPA router
+web/                       Embedded Web Dashboard SPA (HTML / CSS / vanilla JS)
+docs/                      Binary build guide & recon snapshot specification
+docs-site/                 VitePress documentation site source
+config/                    Sample configuration file
+.github/workflows/         CI, binary build/release, Docker build/GHCR push, recon & docs deploy
+data/                      Runtime data (gitignored; contains secrets & PDF cache)
+recon/                     Local frontend recon snapshots (gitignored)
+```
+
+---
+
+## 📄 Documentation Index
+
+| Document | Content |
+| --- | --- |
+| [Online Docs (VitePress)](https://landminehq.github.io/bohrium-club-auto/) | Full user guide, API reference, configuration, and deployment docs |
+| [`docs/BINARY-BUILDS.md`](docs/BINARY-BUILDS.md) | Multi-platform static binary & Docker build/release guide |
+| [`docs/RECON-SNAPSHOT.md`](docs/RECON-SNAPSHOT.md) | Pull/compare local Bohrium web-source snapshots (`recon pull` / `recon diff`) |
+| [`config/config.example.json`](config/config.example.json) | Annotated configuration example |
+| [`AGENTS.md`](AGENTS.md) | Engineering invariants & contributor guide |
+
+---
+
+## ⚠️ Disclaimer
+
+This project is an independent self-hosted automation tool created for **personal convenience, educational, and research purposes**. It is **not affiliated with, endorsed by, or associated with Bohrium or DP Technology**. Please respect Bohrium's terms of service; upstream web APIs may change at any time.
+
+## 📝 License
+
+MIT — see [LICENSE](LICENSE).

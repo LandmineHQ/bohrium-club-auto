@@ -34,7 +34,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w -X main
 
 ## 3. GitHub Actions 构建与发布
 
-参考 `LandmineHQ/duckai-cpa` 的手动发布工作流设计：
+全部构建与发布流水线均位于 `.github/workflows/`：
 
 1. **`.github/workflows/build-binaries.yml`**（手动 `workflow_dispatch`）：
    - 在 `windows-latest`、`ubuntu-latest`、`ubuntu-24.04-arm`、`macos-15-intel`、`macos-15` 5 个原生 Runner 上分别运行 `go test`、静态编译并执行真实 HTTP 冒烟（验证 `/healthz` Chrome UA、未鉴权 `/api/settings` 返回 `401`、携带 `X-Admin-Password` 返回 `200`）；
@@ -45,7 +45,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w -X main
 3. **`.github/workflows/build-docker-image.yml`**（手动 `workflow_dispatch`）：
    - 构建 `Dockerfile`（`alpine:3.20` + 单文件二进制），输出镜像体积并运行容器级 HTTP 冒烟验证。
 4. **`.github/workflows/publish-docker-image.yml`**（手动 `workflow_dispatch`，入参 `version` / `also_latest`）：
-   - 通过 Buildx + QEMU 构建 `linux/amd64,linux/arm64` 多架构镜像并推送至 `ghcr.io/<owner>/<repo>`。
+   - 通过 Buildx + QEMU 构建 `linux/amd64,linux/arm64` 多架构镜像并推送至 `ghcr.io/landminehq/bohrium-club-auto`。
 
 > Runner 说明：保留 `macos-15-intel` 与 `macos-15` 标签（已避开 GitHub Actions 退役的 `macos-13`/`macos-14`）。
 

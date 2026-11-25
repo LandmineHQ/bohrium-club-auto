@@ -1,5 +1,6 @@
 import { defineConfig } from 'vitepress'
 
+// GitHub Pages project site: https://landminehq.github.io/bohrium-club-auto/
 // Override with DOCS_BASE=/ when deploying at a custom domain.
 // GitHub Actions automatically injects DOCS_BASE="/<repo-name>/" in deploy-docs.yml.
 const base = (process.env.DOCS_BASE || '/bohrium-club-auto/').replace(/\/?$/, '/')
@@ -30,7 +31,8 @@ export default defineConfig({
       { text: '首页', link: '/' },
       { text: '使用指南', link: '/guide/introduction', activeMatch: '^/guide/' },
       { text: '管理 API', link: '/api/overview', activeMatch: '^/api/' },
-      { text: '参考文档', link: '/reference/configuration', activeMatch: '^/reference/' }
+      { text: '参考文档', link: '/reference/configuration', activeMatch: '^/reference/' },
+      { text: 'GitHub', link: 'https://github.com/LandmineHQ/bohrium-club-auto' }
     ],
     sidebar: {
       '/guide/': [
@@ -100,6 +102,11 @@ export default defineConfig({
     footer: {
       message: '自托管私有部署项目 · Go 静态单文件二进制 + 内置管理面板',
       copyright: 'MIT Licensed · Bohrium Club Auto'
+    },
+    socialLinks: [{ icon: 'github', link: 'https://github.com/LandmineHQ/bohrium-club-auto' }],
+    editLink: {
+      pattern: 'https://github.com/LandmineHQ/bohrium-club-auto/edit/main/docs-site/:path',
+      text: '在 GitHub 上编辑此页'
     }
   }
 })

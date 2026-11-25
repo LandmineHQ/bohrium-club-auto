@@ -28,7 +28,7 @@ const (
 	DefaultMaxBytes    = 25 * 1024 * 1024
 )
 
-// Options configures Bohrium web source snapshot / diff runs (modeled on LandmineHQ/duckai-cpa).
+// Options configures Bohrium web source snapshot / diff runs.
 type Options struct {
 	TargetURLs      []string
 	OutDir          string
@@ -155,7 +155,7 @@ func NormalizeOptions(opts Options) Options {
 }
 
 // TakeSnapshot crawls the configured public Bohrium frontend entries and referenced static JS/CSS assets.
-// If writeDisk is true, it replaces opts.OutDir and writes manifest.json (like duckai-cpa recon:pull).
+// If writeDisk is true, it replaces opts.OutDir and writes manifest.json.
 func TakeSnapshot(ctx context.Context, opts Options, writeDisk bool) (*Manifest, error) {
 	opts = NormalizeOptions(opts)
 	client, err := chromehttp.New(chromehttp.Options{

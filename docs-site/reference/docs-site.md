@@ -14,10 +14,12 @@ npm run preview  # 预览构建产物
 
 ## GitHub Pages 自动部署
 
+文档站在线地址：<https://landminehq.github.io/bohrium-club-auto/>
+
 工作流文件为 `.github/workflows/deploy-docs.yml`：
 
 1. 在 GitHub 仓库进入 **Settings → Pages**，将 **Source** 设置为 **GitHub Actions**；
-2. 每次修改 `docs-site/**` 并推送到 `main`，或手动触发 **Actions → Deploy docs** 时，工作流会自动注入 `DOCS_BASE="/<仓库名>/"` 构建并发布；
+2. 每次修改 `docs-site/**` 并推送到 `main`，或手动触发 **Actions → Deploy docs** 时，工作流会自动注入 `DOCS_BASE="/bohrium-club-auto/"`（随仓库名自动适配）构建并发布；
 3. 若绑定了自定义域名，可将构建环境变量覆盖为 `DOCS_BASE=/`。
 
 ::: tip 私有仓库说明

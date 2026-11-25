@@ -1,6 +1,6 @@
 # 前端 Recon 快照与更新比对
 
-参考 `LandmineHQ/duckai-cpa` 的本地快照设计：`/recon/` 目录已写入 `.gitignore`，**绝不将上游前端源码提交进 Git 仓库**。
+`/recon/` 目录已写入 `.gitignore`，**绝不将上游前端源码提交进 Git 仓库**，所有快照仅保存在本地用于基线比对。
 
 ## 命令行用法
 

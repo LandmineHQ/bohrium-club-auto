@@ -1,6 +1,6 @@
 name: publish-docker-image
 
-# 参考 LandmineHQ/duckai-cpa：手动构建多架构极简镜像（Alpine + 静态 Go 二进制）并推送至 GHCR。
+# 手动构建多架构极简镜像（Alpine + 静态 Go 二进制）并推送至 GHCR。
 on:
   workflow_dispatch:
     inputs:

@@ -5,7 +5,7 @@
 ## 方式一：Docker Compose（推荐）
 
 ```bash
-git clone <your-repo-url> bohrium-club-auto
+git clone https://github.com/LandmineHQ/bohrium-club-auto.git
 cd bohrium-club-auto
 
 # 指定管理员密码并启动
@@ -22,14 +22,15 @@ docker compose logs -f bohrium-club-auto
 通过仓库内置的 `publish-docker-image.yml` 发布镜像后，可直接拉取运行：
 
 ```bash
-GHCR_IMAGE="ghcr.io/<owner>/<repo>:latest" \
 BOHRIUM_ADMIN_PASSWORD="YourStrongPassword" \
 docker compose -f docker-compose.ghcr.yml up -d
 ```
 
+默认镜像地址为 `ghcr.io/landminehq/bohrium-club-auto:latest`。
+
 ## 方式三：直接运行单文件二进制
 
-从仓库 **Releases** 下载对应平台的归档文件（无需安装 Go、Node.js 或任何依赖）：
+从仓库 **[Releases](https://github.com/LandmineHQ/bohrium-club-auto/releases/latest)** 下载对应平台的归档文件（无需安装 Go、Node.js 或任何依赖）：
 
 ```bash
 # Linux / macOS

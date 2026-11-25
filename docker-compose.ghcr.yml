@@ -1,15 +1,16 @@
 # ---------------------------------------------------------------------------
 # Bohrium Club Auto — 预构建极简镜像（GHCR）
 #
-#   export GHCR_IMAGE=ghcr.io/<your-github-user>/bohrium-club-auto:latest
 #   docker compose -f docker-compose.ghcr.yml up -d
+#   # 或手动：
+#   docker pull ghcr.io/landminehq/bohrium-club-auto:latest
 #
 # 镜像由 .github/workflows/publish-docker-image.yml 手动发布。
 # ---------------------------------------------------------------------------
 
 services:
   bohrium-club-auto:
-    image: ${GHCR_IMAGE:-ghcr.io/owner/bohrium-club-auto:latest}
+    image: ${GHCR_IMAGE:-ghcr.io/landminehq/bohrium-club-auto:latest}
     container_name: bohrium-club-auto
     restart: unless-stopped
 
