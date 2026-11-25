@@ -66,6 +66,10 @@ Environment Variables:
   BOHRIUM_SCHEDULE_ENABLED     Enable daily auto-run (default true)
   BOHRIUM_SCHEDULE_TIME        Daily run time HH:MM in TZ (default 08:15)
   BOHRIUM_SCHEDULE_TZ          Schedule timezone (default Asia/Shanghai)
+  BOHRIUM_GATEWAY_ENABLED      Enable OpenAI /v1/* API gateway (default true)
+  BOHRIUM_API_KEYS             Comma-separated API keys for /v1/* (auto-generated if unset)
+  BOHRIUM_GATEWAY_DEFAULT_MODEL Default model when omitted (default dspro-high)
+  BOHRIUM_GATEWAY_ALLOW_NO_AUTH Allow unauthenticated /v1/* calls (default false)
 `, Version)
 }
 
@@ -106,6 +110,9 @@ func runServer() {
 	log.Printf("============================================================")
 	log.Printf("bohrium-club-auto %s", Version)
 	log.Printf("Dashboard:      http://%s/", displayHost(cfg.Host, cfg.Port))
+	if cfg.Gateway.Enabled {
+		log.Printf("OpenAI API:     http://%s/v1 (Chat Completions + Responses)", displayHost(cfg.Host, cfg.Port))
+	}
 	log.Printf("Data Dir:       %s", cfg.DataDir)
 	log.Printf("Chrome UA:      %s", httpCli.UserAgent())
 	log.Printf("Prompt Corpus:  SciSpace=%d, Writing=%d, Reading=%d, Papers=%d",
@@ -117,6 +124,14 @@ func runServer() {
 		log.Printf("------------------------------------------------------------")
 	} else {
 		log.Printf("Admin Auth:     enabled (configured via env or %s)", cfgMgr.Path())
+	}
+	if apiKey := cfgMgr.GeneratedAPIKey(); apiKey != "" {
+		log.Printf("------------------------------------------------------------")
+		log.Printf("GENERATED OPENAI API KEY: %s", apiKey)
+		log.Printf("(Saved to %s; manage in Web Console or set BOHRIUM_API_KEYS)", cfgMgr.Path())
+		log.Printf("------------------------------------------------------------")
+	} else {
+		log.Printf("OpenAI Auth:    %d key(s) configured (allowNoAuth=%v)", len(cfg.Gateway.APIKeys), cfg.Gateway.AllowNoAuth)
 	}
 	log.Printf("============================================================")
 

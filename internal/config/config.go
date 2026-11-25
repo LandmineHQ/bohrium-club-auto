@@ -11,9 +11,30 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"bohrium-club-auto/internal/chromehttp"
 )
+
+// APIKey represents a client API key accepted by the OpenAI-compatible /v1/* gateway.
+type APIKey struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Key       string `json:"key"`
+	CreatedAt string `json:"createdAt"`
+	Enabled   bool   `json:"enabled"`
+}
+
+// GatewayConfig configures the Bohrium desktop-compatible OpenAI /v1/* API gateway.
+type GatewayConfig struct {
+	Enabled       bool     `json:"enabled"`
+	APIKeys       []APIKey `json:"apiKeys"`
+	DefaultModel  string   `json:"defaultModel"`
+	AllowNoAuth   bool     `json:"allowNoAuth"`
+	CORSOrigins   string   `json:"corsOrigins"`
+	PreflightMode bool     `json:"preflightMode"`
+	StoreID       string   `json:"storeId"`
+}
 
 // Config holds persisted and environment-overridden application settings.
 type Config struct {
@@ -25,6 +46,7 @@ type Config struct {
 	UserAgent       string         `json:"userAgent"`
 	ProxyURL        string         `json:"proxyUrl"`
 	Schedule        ScheduleConfig `json:"schedule"`
+	Gateway         GatewayConfig  `json:"gateway"`
 	PDFCacheDir     string         `json:"pdfCacheDir"`
 	LocalPDFDir     string         `json:"localPdfDir"`
 	ReconDir        string         `json:"reconDir"`
@@ -45,10 +67,11 @@ type ScheduleConfig struct {
 
 // Manager provides thread-safe access and atomic persistence for Config.
 type Manager struct {
-	mu          sync.RWMutex
-	cfg         Config
-	path        string
-	firstBootPW string
+	mu              sync.RWMutex
+	cfg             Config
+	path            string
+	firstBootPW     string
+	firstBootAPIKey string
 }
 
 // Load reads config from <dataDir>/config.json (creating defaults on first boot)
@@ -126,6 +149,41 @@ func Load() (*Manager, error) {
 	if v := strings.TrimSpace(os.Getenv("BOHRIUM_RECON_DIR")); v != "" {
 		cfg.ReconDir = v
 	}
+	if v := strings.TrimSpace(os.Getenv("BOHRIUM_GATEWAY_ENABLED")); v != "" {
+		cfg.Gateway.Enabled = parseBool(v, cfg.Gateway.Enabled)
+	}
+	if v := strings.TrimSpace(os.Getenv("BOHRIUM_GATEWAY_DEFAULT_MODEL")); v != "" {
+		cfg.Gateway.DefaultModel = v
+	}
+	if v := strings.TrimSpace(os.Getenv("BOHRIUM_GATEWAY_ALLOW_NO_AUTH")); v != "" {
+		cfg.Gateway.AllowNoAuth = parseBool(v, cfg.Gateway.AllowNoAuth)
+	}
+	if v := strings.TrimSpace(os.Getenv("BOHRIUM_GATEWAY_CORS_ORIGINS")); v != "" {
+		cfg.Gateway.CORSOrigins = v
+	}
+	if v := strings.TrimSpace(os.Getenv("BOHRIUM_GATEWAY_PREFLIGHT")); v != "" {
+		cfg.Gateway.PreflightMode = parseBool(v, cfg.Gateway.PreflightMode)
+	}
+	if v := strings.TrimSpace(os.Getenv("BOHRIUM_API_KEYS")); v != "" {
+		var envKeys []APIKey
+		nowISO := time.Now().UTC().Format(time.RFC3339)
+		for i, part := range strings.Split(v, ",") {
+			k := strings.TrimSpace(part)
+			if k == "" {
+				continue
+			}
+			envKeys = append(envKeys, APIKey{
+				ID:        fmt.Sprintf("env-%d", i+1),
+				Name:      fmt.Sprintf("ENV Key #%d", i+1),
+				Key:       k,
+				CreatedAt: nowISO,
+				Enabled:   true,
+			})
+		}
+		if len(envKeys) > 0 {
+			cfg.Gateway.APIKeys = envKeys
+		}
+	}
 
 	generatedPW := ""
 	if strings.TrimSpace(cfg.AdminPassword) == "" {
@@ -134,6 +192,24 @@ func Load() (*Manager, error) {
 	}
 	if strings.TrimSpace(cfg.SessionSecret) == "" {
 		cfg.SessionSecret = randomHex(32)
+	}
+	configMutated := false
+	generatedAPIKey := ""
+	if strings.TrimSpace(cfg.Gateway.StoreID) == "" {
+		cfg.Gateway.StoreID = NewUUIDv4()
+		configMutated = true
+	}
+	if len(cfg.Gateway.APIKeys) == 0 {
+		key := GenerateAPIKey()
+		cfg.Gateway.APIKeys = []APIKey{{
+			ID:        "key_" + randomHex(6),
+			Name:      "Default Key",
+			Key:       key,
+			CreatedAt: time.Now().UTC().Format(time.RFC3339),
+			Enabled:   true,
+		}}
+		generatedAPIKey = key
+		configMutated = true
 	}
 
 	if err := os.MkdirAll(cfg.PDFCacheDir, 0o755); err != nil {
@@ -144,11 +220,12 @@ func Load() (*Manager, error) {
 	}
 
 	m := &Manager{
-		cfg:         cfg,
-		path:        cfgPath,
-		firstBootPW: generatedPW,
+		cfg:             cfg,
+		path:            cfgPath,
+		firstBootPW:     generatedPW,
+		firstBootAPIKey: generatedAPIKey,
 	}
-	if firstBoot || generatedPW != "" {
+	if firstBoot || generatedPW != "" || configMutated {
 		if err := m.saveLocked(); err != nil {
 			return nil, fmt.Errorf("save initial config: %w", err)
 		}
@@ -175,6 +252,13 @@ func defaultConfig(dataDir string) Config {
 			JitterMinutes: 15,
 			AutoClaim:     true,
 			AutoRefresh:   true,
+		},
+		Gateway: GatewayConfig{
+			Enabled:       true,
+			DefaultModel:  "dspro-high",
+			AllowNoAuth:   false,
+			CORSOrigins:   "*",
+			PreflightMode: true,
 		},
 	}
 }
@@ -214,13 +298,29 @@ func fillMissingDefaults(cfg *Config, dataDir string) {
 	if cfg.Schedule.Timezone == "" {
 		cfg.Schedule.Timezone = def.Schedule.Timezone
 	}
+	// Existing config files created before the OpenAI gateway was added won't have DefaultModel/StoreID set.
+	if cfg.Gateway.DefaultModel == "" && cfg.Gateway.StoreID == "" && len(cfg.Gateway.APIKeys) == 0 {
+		cfg.Gateway.Enabled = def.Gateway.Enabled
+		cfg.Gateway.PreflightMode = def.Gateway.PreflightMode
+	}
+	if strings.TrimSpace(cfg.Gateway.DefaultModel) == "" {
+		cfg.Gateway.DefaultModel = def.Gateway.DefaultModel
+	}
+	if strings.TrimSpace(cfg.Gateway.CORSOrigins) == "" {
+		cfg.Gateway.CORSOrigins = def.Gateway.CORSOrigins
+	}
 }
 
 // Get returns a snapshot copy of the current configuration.
 func (m *Manager) Get() Config {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.cfg
+	cp := m.cfg
+	if len(m.cfg.Gateway.APIKeys) > 0 {
+		cp.Gateway.APIKeys = make([]APIKey, len(m.cfg.Gateway.APIKeys))
+		copy(cp.Gateway.APIKeys, m.cfg.Gateway.APIKeys)
+	}
+	return cp
 }
 
 // Path returns the config.json file path.
@@ -231,6 +331,27 @@ func (m *Manager) Path() string {
 // GeneratedPassword returns the password generated on first boot (empty if pre-configured).
 func (m *Manager) GeneratedPassword() string {
 	return m.firstBootPW
+}
+
+// GeneratedAPIKey returns the default OpenAI gateway API key generated on first boot/upgrade.
+func (m *Manager) GeneratedAPIKey() string {
+	return m.firstBootAPIKey
+}
+
+// GenerateAPIKey creates a new random sk-brm-... API key.
+func GenerateAPIKey() string {
+	return "sk-brm-" + randomHex(24)
+}
+
+// NewUUIDv4 returns a canonical lowercase RFC 4122 UUIDv4 string.
+func NewUUIDv4() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Sprintf("crypto/rand failed: %v", err))
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 // Update mutates the config via fn and atomically persists it to disk.

@@ -31,10 +31,11 @@ type Options struct {
 // Client wraps net/http.Client and automatically injects realistic Chrome browser headers
 // on every outgoing request so the Go default User-Agent is never leaked.
 type Client struct {
-	httpClient *http.Client
-	userAgent  string
-	secCHUA    string
-	proxyURL   string
+	httpClient   *http.Client
+	streamClient *http.Client
+	userAgent    string
+	secCHUA      string
+	proxyURL     string
 }
 
 // chromeTransport wraps an http.RoundTripper to enforce Chrome headers.
@@ -96,10 +97,22 @@ func New(opts Options) (*Client, error) {
 		secCHUA:   secCH,
 	}
 
+	streamTransport := baseTransport.Clone()
+	streamTransport.ResponseHeaderTimeout = 3 * time.Minute
+	streamTr := &chromeTransport{
+		base:      streamTransport,
+		userAgent: ua,
+		secCHUA:   secCH,
+	}
+
 	return &Client{
 		httpClient: &http.Client{
 			Transport: tr,
 			Timeout:   timeout,
+		},
+		streamClient: &http.Client{
+			Transport: streamTr,
+			Timeout:   0, // Streaming requests rely on request context and ResponseHeaderTimeout
 		},
 		userAgent: ua,
 		secCHUA:   secCH,
@@ -146,6 +159,12 @@ func (c *Client) HTTPClient() *http.Client {
 // Do executes an HTTP request using the Chrome transport.
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	return c.httpClient.Do(req)
+}
+
+// DoStream executes an HTTP request without a total body timeout (suitable for long-lived SSE streams).
+// Callers are responsible for closing resp.Body and cancelling req.Context().
+func (c *Client) DoStream(req *http.Request) (*http.Response, error) {
+	return c.streamClient.Do(req)
 }
 
 // Response holds a fully read HTTP response.

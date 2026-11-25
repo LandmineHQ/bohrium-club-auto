@@ -35,6 +35,9 @@ features:
   - icon: 🌐
     title: Chrome 浏览器出站指纹
     details: 所有出站请求自动注入桌面端 Chrome User-Agent 与 Sec-CH-UA Client Hints，彻底屏蔽 Go 默认 HTTP 客户端标识，支持自定义代理与 UA。
+  - icon: 🤖
+    title: OpenAI 兼容网关（Chat & Responses）
+    details: 完整还原 Bohrium 客户端（SciX）原生 Sigma LLM 上游协议与 x-scix-execution 交互，提供 /v1/models、/v1/chat/completions 与 /v1/responses 全能力及双向跨协议桥接。
   - icon: 🔍
     title: 前端 Recon 漂移监控与全套 CI/CD
     details: 内置 recon pull / recon diff 检查线上前端源码与关键 API 契约变化；配套多平台静态二进制 Release、多架构 GHCR Docker 与文档站发布流水线。

@@ -1,6 +1,6 @@
 # ⚛️ Bohrium Club Auto — Daily Task Automation & Admin Console for Bohrium Community
 
-**A self-hosted, zero-dependency Go automation service and embedded Web Dashboard for [Bohrium User Community (`club.bohrium.com`)](https://club.bohrium.com/) — featuring remote WeChat QR login, Chrome browser outgoing fingerprint, points & storage capacity monitoring, one-click daily task claiming, real Web API task execution with immediate workflow cancellation, and frontend recon drift checks.**
+**A self-hosted, zero-dependency Go automation service, OpenAI-compatible LLM gateway (faithful to Bohrium Desktop SciX protocol), and embedded Swiss Minimalist Web Console for [Bohrium (`club.bohrium.com` / `www.bohrium.com`)](https://club.bohrium.com/) — featuring remote WeChat QR & OAuth/OTP login, Chrome browser outgoing fingerprint, points & storage capacity monitoring, one-click daily task claiming, real Web API task execution with immediate cancellation, full `/v1/chat/completions` & `/v1/responses` OpenAI APIs, and frontend recon drift checks.**
 
 [![Go](https://img.shields.io/badge/Go-1.24-00ADD8.svg?style=flat-square&logo=go&logoColor=white)](https://go.dev/)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED.svg?style=flat-square&logo=docker&logoColor=white)](https://www.docker.com/)
@@ -52,6 +52,15 @@ Instead of keeping a local desktop browser open or running heavy headless Chromi
   - 330 Science Space Web questions, 320 Academic Writing requests, and 220 Literature Reading PDF questions compiled via `go:embed`.
   - 100 curated open-access arXiv PDFs cataloged for Task #3 (downloaded on demand with Chrome UA and cached in `data/pdfs/`, plus optional user-supplied PDFs in `data/custom_pdfs/`).
 - **Immediate workflow cancellation**: Every Web task submits a real product API request, reports official `query-events` telemetry for its matching `task_key`, and immediately terminates the workflow via `POST /api/v1/chat/<workflowId>/cancel` (`{"source":"api_request"}`).
+
+### OpenAI-Compatible Gateway (Bohrium Desktop SciX Fidelity)
+
+- **Native Bohrium Desktop (`scix` v0.10.25) upstream protocol**: Talks directly to `https://www.bohrium.com/bohrapi/v1/sigma-search/api/v1/scix/llm` using your authenticated `brmToken`, live model catalog (`/models?tag=shrimp-brain-v2`), W3C `traceparent`, and authentic base64url `x-scix-execution` (`version: 1`, `scenario: "local_agent"`, persistent `storeId`, session continuity, canonical UUIDs, `purpose`).
+- **Full `/v1/models`, `/v1/chat/completions`, and `/v1/responses` support**:
+  - **Streaming SSE & non-streaming JSON** on both endpoints, with `: heartbeat` filtering, `reasoning_content` / `response.reasoning_text.*`, `tools` / `tool_choice` / `parallel_tool_calls`, `response_format` / `text.format` (`json_object` & `json_schema`), multimodal `image_url` / `input_image`, and accurate `usage` accounting (including `cached_tokens` and `reasoning_tokens`).
+  - **Bidirectional cross-protocol bridge**: Bohrium's flagship models (`dspro-high`, `dsflash-high`, `kimi-k3`, `kimi-k3.1-pro`) natively speak `chat_completions`, while helper models (`vision`, `title`, `summary`) speak stateless `responses`. The gateway automatically routes native calls directly and seamlessly bridges `/v1/responses` ↔ `/chat/completions` and `/v1/chat/completions` ↔ `/responses` so every model works on both endpoints.
+  - **Stateful Responses API chaining**: Implements local bounded persistence (`data/responses.json`) for `previous_response_id`, `store`, `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}`, and `GET /v1/responses/{id}/input_items`, while always sending stateless `store: false` upstream as required by Bohrium SciX.
+  - **Dedicated API Keys & Console Playground**: Separate `sk-brm-...` API keys managed in the **OpenAI 网关** tab (or via `BOHRIUM_API_KEYS`), CORS support, `/billing/preflight` verification, live token metrics, and an interactive in-browser Playground.
 
 ### Operations, Fingerprint & Recon
 
@@ -216,17 +225,20 @@ draft: false           # true = create as draft
 ```mermaid
 flowchart LR
     Browser["Admin Browser"] -->|"Cookie / X-Admin-Password"| HTTP["Go HTTP Server<br/>(internal/server + embedded web/)"]
+    SDK["OpenAI SDK / Codex / Cursor"] -->|"Bearer sk-brm-..."| GW["OpenAI /v1/* Gateway<br/>(internal/openai)"]
+    HTTP --> GW
     HTTP --> Sched["Daily Scheduler & Mutex<br/>(Asia/Shanghai + auto refresh_token)"]
     HTTP --> Recon["Recon Engine<br/>(pull / diff + contract markers)"]
-    Sched --> Client["Bohrium Client<br/>(internal/bohrium + embedded prompts)"]
+    GW --> Client["Bohrium Client<br/>(internal/bohrium + embedded prompts)"]
+    Sched --> Client
     HTTP --> Client
-    Client --> Chrome["Chrome HTTP Client<br/>(Chrome UA + Sec-CH-UA + optional proxy)"]
+    Client --> Chrome["Chrome HTTP Client<br/>(Chrome UA + Sec-CH-UA + streaming transport)"]
     Recon --> Chrome
     Chrome --> Club["club.bohrium.com<br/>(tasks, claim, session, enroll)"]
-    Chrome --> Platform["platform.bohrium.com<br/>(WeChat QR login)"]
-    Chrome --> WWW["www.bohrium.com<br/>(photons, quotas, storage, PDF upload)"]
+    Chrome --> Platform["platform.bohrium.com<br/>(WeChat QR / OAuth / OTP login)"]
+    Chrome --> WWW["www.bohrium.com<br/>(photons, quotas, storage, PDF, SciX Sigma LLM)"]
     Chrome --> SB["sb-cloud.dp.tech<br/>(Reader, chat, query-events, cancel)"]
-    HTTP --> Store[("Atomic JSON Store<br/>data/config.json & data/state.json")]
+    HTTP --> Store[("Atomic JSON Store<br/>data/config.json, state.json, responses.json")]
     Client --> Store
 ```
 
@@ -253,6 +265,12 @@ Configuration is stored atomically in `data/config.json` (editable in the Dashbo
 | `BOHRIUM_USER_AGENT` | Chrome 136 Windows UA | Outgoing Chrome User-Agent override |
 | `BOHRIUM_PROXY` | empty | Optional HTTP/HTTPS outbound proxy (`HTTPS_PROXY` / `HTTP_PROXY` fallback) |
 | `BOHRIUM_RECON_DIR` | `recon/bohrium-web` | Local recon baseline snapshot directory |
+| `BOHRIUM_GATEWAY_ENABLED` | `true` | Enable OpenAI `/v1/*` API gateway |
+| `BOHRIUM_API_KEYS` | auto-generated `sk-brm-...` | Comma-separated API keys for `/v1/*` clients |
+| `BOHRIUM_GATEWAY_DEFAULT_MODEL` | `dspro-high` | Fallback model ID when client omits `model` |
+| `BOHRIUM_GATEWAY_ALLOW_NO_AUTH` | `false` | Allow unauthenticated `/v1/*` requests (trusted LAN only) |
+| `BOHRIUM_GATEWAY_CORS_ORIGINS` | `*` | `Access-Control-Allow-Origin` header value on `/v1/*` |
+| `BOHRIUM_GATEWAY_PREFLIGHT` | `true` | Run `/billing/preflight` on new user turns (matches Bohrium desktop client; skips mid-loop tool continuations) |
 
 Additional runtime fields in `data/config.json` (see [`config/config.example.json`](config/config.example.json)):
 
@@ -290,8 +308,25 @@ All `/api/*` operational endpoints require either an authenticated admin cookie 
 | `GET` | `/api/assets` | Fetch photons, wallet, 7-day expiring lots, ledger, quotas, and storage capacity |
 | `GET` / `PUT` | `/api/settings` | Read or update schedule, UA, proxy, cancel timing, and admin password |
 | `POST` | `/api/recon/pull` / `/api/recon/diff` | Pull local frontend snapshot baseline or check live upstream drift |
+| `GET` / `PUT` | `/api/gateway/status` / `settings` | Inspect OpenAI gateway stats/catalog or update gateway settings |
+| `POST` / `PATCH` / `DELETE` | `/api/gateway/keys` | Create, toggle, or revoke OpenAI gateway API keys |
+| `POST` | `/api/gateway/preflight` / `playground` | Run Bohrium billing preflight or test models in-browser |
 
-Full endpoint docs: <https://landminehq.github.io/bohrium-club-auto/api/admin>
+### OpenAI-Compatible `/v1/*` Endpoints
+
+Authenticate with `Authorization: Bearer <sk-brm-...>` (or `x-api-key` / `api-key`):
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/v1/models` | Live Bohrium SciX model catalog (`tag=shrimp-brain-v2`) with `scix_catalog` metadata |
+| `GET` | `/v1/models/{id}` | Resolve model metadata by ID, `scix/<id>`, or display name alias |
+| `GET` | `/v1/balance` | Real-time Bohrium photons, org balance, CNY wallet, expiring lots, quotas, storage & `balance_infos` |
+| `POST` | `/v1/chat/completions` | Full Chat Completions (SSE & JSON, tools, reasoning, vision, structured outputs) |
+| `POST` | `/v1/responses` | Full Responses API (SSE & JSON, tools, reasoning, vision, `previous_response_id` chaining) |
+| `GET` / `DELETE` | `/v1/responses/{id}` | Retrieve or delete a locally stored response |
+| `GET` | `/v1/responses/{id}/input_items` | List input items recorded for a stored response |
+
+Full endpoint docs: <https://landminehq.github.io/bohrium-club-auto/api/openai> · <https://landminehq.github.io/bohrium-club-auto/api/admin>
 
 ---
 
@@ -339,7 +374,8 @@ internal/chromehttp/       Chrome browser User-Agent & Client Hints HTTP client
 internal/config/           Atomic config.json management, env overrides, first-boot password
 internal/store/            Atomic state.json persistence (auth, schedule day, logs)
 internal/prompts/          go:embed 870 scientific prompts + 100 real arXiv papers catalog
-internal/bohrium/          Bohrium auth, daily tasks, assets/capacity, PDF pool, task executor
+internal/bohrium/          Bohrium auth, daily tasks, assets/capacity, PDF pool, task executor, SciX LLM client
+internal/openai/           OpenAI /v1/models, /v1/chat/completions, /v1/responses gateway + bidirectional bridge
 internal/scheduler/        Daily Asia/Shanghai scheduler + periodic token auto-refresh
 internal/recon/            Live Bohrium frontend snapshot & diff engine
 internal/server/           Admin password gate, rate limiter, REST API, embedded SPA router

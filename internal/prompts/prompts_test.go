@@ -19,6 +19,23 @@ func TestEmbeddedCorpusAndPapers(t *testing.T) {
 	if stats.PaperCatalogCount != 100 {
 		t.Fatalf("expected 100 papers in catalog, got %d", stats.PaperCatalogCount)
 	}
+	if stats.PlaygroundPrompts != 100 {
+		t.Fatalf("expected 100 playground prompts, got %d", stats.PlaygroundPrompts)
+	}
+	pgList, err := PlaygroundPrompts()
+	if err != nil || len(pgList) != 100 {
+		t.Fatalf("PlaygroundPrompts(): err=%v len=%d", err, len(pgList))
+	}
+	seenPG := make(map[string]bool, len(pgList))
+	for i, q := range pgList {
+		if strings.TrimSpace(q) == "" || seenPG[q] {
+			t.Fatalf("invalid or duplicate playground prompt[%d]: %q", i, q)
+		}
+		seenPG[q] = true
+	}
+	if q, err := RandomPlaygroundPrompt(); err != nil || len(q) < 6 {
+		t.Fatalf("RandomPlaygroundPrompt failed: %v %q", err, q)
+	}
 
 	papers, err := Papers()
 	if err != nil {

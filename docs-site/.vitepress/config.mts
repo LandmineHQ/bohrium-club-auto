@@ -30,7 +30,8 @@ export default defineConfig({
     nav: [
       { text: '首页', link: '/' },
       { text: '使用指南', link: '/guide/introduction', activeMatch: '^/guide/' },
-      { text: '管理 API', link: '/api/overview', activeMatch: '^/api/' },
+      { text: 'OpenAI 网关', link: '/api/openai', activeMatch: '^/api/openai' },
+      { text: '管理 API', link: '/api/overview', activeMatch: '^/api/(?!openai)' },
       { text: '参考文档', link: '/reference/configuration', activeMatch: '^/reference/' },
       { text: 'GitHub', link: 'https://github.com/LandmineHQ/bohrium-club-auto' }
     ],
@@ -55,6 +56,12 @@ export default defineConfig({
         }
       ],
       '/api/': [
+        {
+          text: 'OpenAI 兼容网关',
+          items: [
+            { text: 'OpenAI Chat & Responses API', link: '/api/openai' }
+          ]
+        },
         {
           text: '管理 API 文档',
           items: [

@@ -791,8 +791,89 @@ code {
 .toast.err { border-left-color: var(--err); }
 .toast.warn { border-left-color: var(--warn); }
 
+/* OpenAI Gateway & Playground */
+.gw-endpoint-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.pg-controls {
+  display: grid;
+  grid-template-columns: 1.4fr 1.2fr 0.8fr;
+  gap: 12px;
+}
+.field select {
+  width: 100%;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 13px;
+}
+.inline-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--ink-2);
+  cursor: pointer;
+}
+.inline-check input { accent-color: var(--ink); }
+.pg-output {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-subtle);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.pg-output-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.pg-reasoning {
+  padding: 8px 10px;
+  border-left: 2px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.pg-answer {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: 13.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--ink);
+}
+.key-cell {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  word-break: break-all;
+}
+.model-desc-sub {
+  font-size: 11.5px;
+  color: var(--muted);
+  margin-top: 2px;
+  max-width: 340px;
+}
+
 /* Responsive */
 @media (max-width: 960px) {
+  .pg-controls { grid-template-columns: 1fr; }
   .console-shell { grid-template-columns: 1fr; }
   .sidebar { position: static; height: auto; border-right: none; border-bottom: 1px solid var(--border); }
   .sidebar-nav { flex-direction: row; flex-wrap: wrap; gap: 6px; padding: 10px; }

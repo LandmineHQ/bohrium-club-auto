@@ -5,6 +5,7 @@
   const TAB_TITLES = {
     overview: "任务与总览",
     assets: "积分与容量",
+    gateway: "OpenAI 网关",
     logs: "执行日志",
     recon: "前端 Recon",
     settings: "定时与设置",
@@ -13,6 +14,11 @@
   let qrPollTimer = null;
   let currentSceneId = "";
   let selectedOAuthProvider = "google";
+  let gatewayCache = null;
+  let playgroundPrompts = [];
+  let pgPromptCustomized = false;
+  let pgLastRandomIdx = -1;
+  const revealedKeyIDs = new Set();
 
   function escapeHTML(str) {
     return String(str ?? "")
@@ -102,7 +108,7 @@
       if (st.version) $("app-version").textContent = st.version;
       if (st.authenticated) {
         showAppShell();
-        await Promise.all([loadOverview(), loadSettings(), loadReconStatus()]);
+        await Promise.all([loadOverview(), loadSettings(), loadReconStatus(), loadGatewayStatus()]);
       } else {
         showLoginGate();
       }
@@ -754,6 +760,458 @@
     }
   }
 
+  // --- OpenAI Gateway Console ---
+  function gatewayBaseURL() {
+    return `${window.location.origin}/v1`;
+  }
+
+  function maskKey(k) {
+    if (!k || k.length < 16) return k || "--";
+    return `${k.slice(0, 11)}••••••••${k.slice(-4)}`;
+  }
+
+  async function copyText(text, label) {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast(`已复制${label}`, "ok");
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+      toast(`已复制${label}`, "ok");
+    }
+  }
+
+  async function loadGatewayStatus() {
+    try {
+      const data = await api("/api/gateway/status");
+      gatewayCache = data;
+      renderGateway(data);
+    } catch (e) {
+      toast("加载 OpenAI 网关状态失败: " + e.message, "err");
+    }
+  }
+
+  function renderGateway(data) {
+    const cfg = data.config || {};
+    const stats = data.stats || {};
+    const cat = data.catalog || null;
+    const models = cat?.data || [];
+
+    if ($("gw-base-url")) $("gw-base-url").value = gatewayBaseURL();
+
+    $("gw-kpi-state").textContent = cfg.enabled ? "运行中" : "已停用";
+    $("gw-kpi-state-sub").textContent = `默认 ${cfg.defaultModel || "dspro-high"} · ${cfg.allowNoAuth ? "免鉴权" : "Key 鉴权"}`;
+
+    $("gw-kpi-reqs").textContent = formatNum(stats.totalRequests || 0);
+    $("gw-kpi-reqs-sub").textContent = `Chat ${formatNum(stats.chatRequests || 0)} · Resp ${formatNum(stats.responseRequests || 0)} · 流式 ${formatNum(stats.streamRequests || 0)}`;
+
+    const totalTok = (stats.promptTokens || 0) + (stats.completionTokens || 0);
+    $("gw-kpi-tokens").textContent = formatNum(totalTok);
+    $("gw-kpi-tokens-sub").textContent = `入 ${formatNum(stats.promptTokens || 0)} · 出 ${formatNum(stats.completionTokens || 0)} · 思 ${formatNum(stats.reasoningTokens || 0)}`;
+
+    const visibleCount = models.filter((m) => !m.hidden).length;
+    $("gw-kpi-models").textContent = models.length ? `${visibleCount} / ${models.length}` : "--";
+    $("gw-kpi-models-sub").textContent = `本地会话链 ${formatNum(stats.storedResponses || 0)} 条`;
+
+    $("gw-set-enabled").checked = !!cfg.enabled;
+    $("gw-set-noauth").checked = !!cfg.allowNoAuth;
+    $("gw-set-preflight").checked = !!cfg.preflightMode;
+    $("gw-set-default-model").value = cfg.defaultModel || "dspro-high";
+    $("gw-set-cors").value = cfg.corsOrigins || "*";
+
+    renderGatewayKeys(cfg.apiKeys || []);
+    renderGatewayModels(models, data.catalogError, data.bohriumLoggedIn);
+    renderGatewayRecent(stats.recentRequests || []);
+
+    if (Array.isArray(data.playgroundPrompts) && data.playgroundPrompts.length > 0) {
+      playgroundPrompts = data.playgroundPrompts;
+      if (!pgPromptCustomized && !$("pg-prompt").value.trim()) {
+        rollRandomPlaygroundPrompt();
+      } else if (pgLastRandomIdx < 0 && $("pg-pool-badge")) {
+        $("pg-pool-badge").textContent = `随机池 ${playgroundPrompts.length} 条`;
+      }
+    }
+  }
+
+  function rollRandomPlaygroundPrompt() {
+    if (!playgroundPrompts.length) return "";
+    let idx = Math.floor(Math.random() * playgroundPrompts.length);
+    if (playgroundPrompts.length > 1 && idx === pgLastRandomIdx) {
+      idx = (idx + 1 + Math.floor(Math.random() * (playgroundPrompts.length - 1))) % playgroundPrompts.length;
+    }
+    pgLastRandomIdx = idx;
+    pgPromptCustomized = false;
+    const picked = playgroundPrompts[idx];
+    if ($("pg-prompt")) $("pg-prompt").value = picked;
+    if ($("pg-pool-badge")) $("pg-pool-badge").textContent = `随机 #${idx + 1} / ${playgroundPrompts.length}`;
+    return picked;
+  }
+
+  function renderGatewayKeys(keys) {
+    const tbody = $("gw-keys-body");
+    if (!keys.length) {
+      tbody.innerHTML = '<tr><td colspan="4" class="empty-cell">暂无 API Key，请点击上方「新建 Key」</td></tr>';
+      return;
+    }
+    tbody.innerHTML = keys
+      .map((k) => {
+        const shown = revealedKeyIDs.has(k.id) ? k.key : maskKey(k.key);
+        const pill = k.enabled
+          ? '<span class="status-badge done">启用</span>'
+          : '<span class="status-badge skipped">停用</span>';
+        return `<tr>
+          <td><strong>${escapeHTML(k.name || k.id)}</strong></td>
+          <td class="key-cell">${escapeHTML(shown)}</td>
+          <td>${pill}</td>
+          <td class="align-right">
+            <div class="btn-row" style="justify-content:flex-end;">
+              <button type="button" class="btn btn-ghost btn-xs" data-key-act="reveal" data-key-id="${escapeHTML(k.id)}">${revealedKeyIDs.has(k.id) ? "隐藏" : "显示"}</button>
+              <button type="button" class="btn btn-outline btn-xs" data-key-act="copy" data-key-val="${escapeHTML(k.key)}">复制</button>
+              <button type="button" class="btn btn-ghost btn-xs" data-key-act="toggle" data-key-id="${escapeHTML(k.id)}" data-key-enabled="${k.enabled ? "1" : "0"}">${k.enabled ? "停用" : "启用"}</button>
+              <button type="button" class="btn btn-ghost btn-xs ink-err" data-key-act="delete" data-key-id="${escapeHTML(k.id)}">删除</button>
+            </div>
+          </td>
+        </tr>`;
+      })
+      .join("");
+
+    tbody.querySelectorAll("[data-key-act]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const act = btn.getAttribute("data-key-act");
+        const id = btn.getAttribute("data-key-id");
+        if (act === "reveal") {
+          if (revealedKeyIDs.has(id)) revealedKeyIDs.delete(id);
+          else revealedKeyIDs.add(id);
+          renderGatewayKeys(gatewayCache?.config?.apiKeys || []);
+          return;
+        }
+        if (act === "copy") {
+          await copyText(btn.getAttribute("data-key-val") || "", " API Key");
+          return;
+        }
+        if (act === "toggle") {
+          const cur = btn.getAttribute("data-key-enabled") === "1";
+          try {
+            const res = await api(`/api/gateway/keys/${encodeURIComponent(id)}`, {
+              method: "PATCH",
+              body: JSON.stringify({ enabled: !cur }),
+            });
+            if (gatewayCache?.config) gatewayCache.config.apiKeys = res.apiKeys || [];
+            renderGatewayKeys(res.apiKeys || []);
+            toast(cur ? "API Key 已停用" : "API Key 已启用", "ok");
+          } catch (e) {
+            toast(e.message, "err");
+          }
+          return;
+        }
+        if (act === "delete") {
+          if (!confirm("确定删除此 API Key 吗？使用该 Key 的客户端将立即失去访问权限。")) return;
+          try {
+            const res = await api(`/api/gateway/keys/${encodeURIComponent(id)}`, { method: "DELETE" });
+            if (gatewayCache?.config) gatewayCache.config.apiKeys = res.apiKeys || [];
+            renderGatewayKeys(res.apiKeys || []);
+            toast("API Key 已删除", "warn");
+          } catch (e) {
+            toast(e.message, "err");
+          }
+        }
+      });
+    });
+  }
+
+  function renderGatewayModels(models, catalogError, loggedIn) {
+    const errEl = $("gw-catalog-error");
+    if (catalogError) {
+      errEl.textContent = catalogError;
+      errEl.classList.remove("hidden");
+    } else {
+      errEl.classList.add("hidden");
+    }
+
+    const tbody = $("gw-models-body");
+    if (!models.length) {
+      tbody.innerHTML = `<tr><td colspan="6" class="empty-cell">${loggedIn ? "暂无模型数据，请点击「刷新模型目录」" : "请先绑定并登录玻尔账号，即可自动拉取 SciX 模型目录"}</td></tr>`;
+      return;
+    }
+
+    const sorted = [...models].sort((a, b) => {
+      const av = a.presentation?.visible ? 0 : 1;
+      const bv = b.presentation?.visible ? 0 : 1;
+      if (av !== bv) return av - bv;
+      return (a.presentation?.sortOrder || 999) - (b.presentation?.sortOrder || 999);
+    });
+
+    // Update Playground model dropdown
+    const pgSel = $("pg-model");
+    const prevSel = pgSel.value;
+    pgSel.innerHTML = sorted
+      .map((m) => {
+        const label = m.presentation?.name || m.name || m.id;
+        const tag = m.hidden ? " [hidden]" : "";
+        return `<option value="${escapeHTML(m.id)}">${escapeHTML(m.id)} (${escapeHTML(label)})${tag}</option>`;
+      })
+      .join("");
+    if (prevSel && sorted.some((m) => m.id === prevSel)) {
+      pgSel.value = prevSel;
+    } else {
+      const defModel = sorted.find((m) => m.id === "dsflash-high") || sorted.find((m) => m.presentation?.default) || sorted[0];
+      if (defModel) pgSel.value = defModel.id;
+    }
+
+    tbody.innerHTML = sorted
+      .map((m) => {
+        const nativeApi = m.api === "chat_completions" ? "chat_completions" : "responses";
+        const displayName = m.presentation?.name || m.name || m.id;
+        const desc = m.presentation?.description || "";
+        const ctxK = m.context_window ? `${Math.round(m.context_window / 1000)}K` : "--";
+        const outK = m.max_output_tokens ? `${Math.round(m.max_output_tokens / 1000)}K` : "--";
+        const mods = (m.input || ["text"]).join(", ");
+        const effs = (m.reasoning_efforts || []).join("/");
+        const mult = m.presentation?.usageMultiplier ? `${m.presentation.usageMultiplier}x` : "--";
+        const badges = [
+          m.presentation?.default ? '<span class="mono-tag">default</span>' : "",
+          m.hidden ? '<span class="mono-tag">internal</span>' : "",
+        ].filter(Boolean).join(" ");
+        return `<tr>
+          <td>
+            <div><code>${escapeHTML(m.id)}</code> <strong>${escapeHTML(displayName)}</strong> ${badges}</div>
+            ${desc ? `<div class="model-desc-sub">${escapeHTML(desc)}</div>` : ""}
+          </td>
+          <td><span class="mono-tag">${escapeHTML(nativeApi)}</span></td>
+          <td class="tabular">${escapeHTML(ctxK)} / ${escapeHTML(outK)}</td>
+          <td><div>${escapeHTML(mods)}</div>${effs ? `<div class="model-desc-sub">effort: ${escapeHTML(effs)}</div>` : ""}</td>
+          <td class="tabular">${escapeHTML(mult)}</td>
+          <td class="align-right">
+            <div class="btn-row" style="justify-content:flex-end;">
+              <button type="button" class="btn btn-ghost btn-xs" data-model-preflight="${escapeHTML(m.id)}">预检</button>
+              <button type="button" class="btn btn-outline btn-xs" data-model-try="${escapeHTML(m.id)}">调试</button>
+            </div>
+          </td>
+        </tr>`;
+      })
+      .join("");
+
+    tbody.querySelectorAll("[data-model-preflight]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const mid = btn.getAttribute("data-model-preflight");
+        btn.disabled = true;
+        try {
+          const res = await api("/api/gateway/preflight", { method: "POST", body: JSON.stringify({ model: mid }) });
+          toast(res.allowed ? `模型 ${mid} 额度预检通过 (allowed=true)` : `模型 ${mid} 预检拒绝: ${res.reason || "额度不足"}`, res.allowed ? "ok" : "warn");
+        } catch (e) {
+          toast("预检失败: " + e.message, "err");
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    });
+
+    tbody.querySelectorAll("[data-model-try]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const mid = btn.getAttribute("data-model-try");
+        $("pg-model").value = mid;
+        $("pg-prompt").focus();
+        toast(`已在调试区选中模型 ${mid}`, "info");
+      });
+    });
+  }
+
+  function renderGatewayRecent(rows) {
+    const tbody = $("gw-recent-body");
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty-cell">暂无网关调用记录</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows
+      .map((r) => {
+        const ok = r.status >= 200 && r.status < 300 && !r.error;
+        const stBadge = ok
+          ? `<span class="status-badge done">${r.status}</span>`
+          : `<span class="status-badge failed">${r.status || "ERR"}</span>`;
+        const tokStr = `${formatNum(r.promptTokens)} / ${formatNum(r.completionTokens)} / ${formatNum(r.reasoningTokens)}`;
+        return `<tr>
+          <td class="tabular">${escapeHTML(formatTime(r.timestamp))}</td>
+          <td><code>${escapeHTML(r.endpoint)}</code>${r.stream ? ' <span class="mono-tag">SSE</span>' : ""}</td>
+          <td><code>${escapeHTML(r.model || "--")}</code></td>
+          <td><span class="mono-tag">${escapeHTML(r.upstreamApi || "--")}</span></td>
+          <td>${stBadge}</td>
+          <td class="tabular">${formatNum(r.durationMs)} ms</td>
+          <td class="tabular">${escapeHTML(tokStr)}</td>
+        </tr>`;
+      })
+      .join("");
+  }
+
+  function firstEnabledGatewayKey() {
+    const keys = gatewayCache?.config?.apiKeys || [];
+    const active = keys.find((k) => k.enabled && k.key);
+    return active ? active.key : "sk-brm-YOUR_KEY";
+  }
+
+  async function runGatewayPlayground() {
+    const endpoint = $("pg-endpoint").value;
+    const model = $("pg-model").value;
+    const effort = $("pg-effort").value;
+    const stream = $("pg-stream").checked;
+    const autoRandom = $("pg-auto-random")?.checked;
+    let prompt = $("pg-prompt").value.trim();
+    if (!prompt && playgroundPrompts.length > 0) {
+      prompt = rollRandomPlaygroundPrompt();
+    }
+    if (!prompt) return toast("请输入测试提示词", "warn");
+
+    const shouldRollNext = !!autoRandom && !pgPromptCustomized && playgroundPrompts.length > 1;
+    const btn = $("btn-pg-run");
+    const wrap = $("pg-result-wrap");
+    const badge = $("pg-status-badge");
+    const usageEl = $("pg-usage-meta");
+    const sentPromptEl = $("pg-sent-prompt");
+    const reasonBox = $("pg-reasoning-box");
+    const ansBox = $("pg-answer-box");
+
+    btn.disabled = true;
+    wrap.classList.remove("hidden");
+    if (sentPromptEl) {
+      sentPromptEl.textContent = `本次提问：${prompt}`;
+      sentPromptEl.classList.remove("hidden");
+    }
+    reasonBox.classList.add("hidden");
+    reasonBox.textContent = "";
+    ansBox.textContent = "";
+    usageEl.textContent = "";
+    badge.textContent = `请求中 (${endpoint} / ${model})...`;
+    if (shouldRollNext) {
+      rollRandomPlaygroundPrompt();
+    }
+
+    const t0 = performance.now();
+    try {
+      const res = await fetch("/api/gateway/playground", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          endpoint,
+          model,
+          prompt,
+          reasoningEffort: effort,
+          stream,
+          maxTokens: 1024,
+        }),
+      });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        const msg = errData.error?.message || errData.error || `HTTP ${res.status}`;
+        badge.textContent = `失败 (HTTP ${res.status})`;
+        ansBox.textContent = msg;
+        toast("调试请求失败: " + msg, "err");
+        return;
+      }
+
+      if (!stream) {
+        const data = await res.json();
+        const ms = Math.round(performance.now() - t0);
+        badge.textContent = `完成 (${ms} ms)`;
+        if (endpoint === "responses") {
+          const outputs = data.output || [];
+          const rTexts = outputs
+            .filter((o) => o.type === "reasoning")
+            .flatMap((o) => (o.content || []).map((p) => p.text || ""));
+          const aTexts = outputs
+            .filter((o) => o.type === "message")
+            .flatMap((o) => (o.content || []).map((p) => p.text || ""));
+          if (rTexts.join("")) {
+            reasonBox.textContent = rTexts.join("\n");
+            reasonBox.classList.remove("hidden");
+          }
+          ansBox.textContent = aTexts.join("") || JSON.stringify(data, null, 2);
+          if (data.usage) {
+            usageEl.textContent = `in=${data.usage.input_tokens || 0} out=${data.usage.output_tokens || 0} reasoning=${data.usage.output_tokens_details?.reasoning_tokens || 0}`;
+          }
+        } else {
+          const msg = data.choices?.[0]?.message || {};
+          if (msg.reasoning_content) {
+            reasonBox.textContent = msg.reasoning_content;
+            reasonBox.classList.remove("hidden");
+          }
+          ansBox.textContent = msg.content || JSON.stringify(msg.tool_calls || data, null, 2);
+          if (data.usage) {
+            usageEl.textContent = `in=${data.usage.prompt_tokens || 0} out=${data.usage.completion_tokens || 0} reasoning=${data.usage.completion_tokens_details?.reasoning_tokens || 0}`;
+          }
+        }
+        loadGatewayStatus();
+        return;
+      }
+
+      // Streaming SSE parser (supports both Chat Completions and Responses API)
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      let reasoningText = "";
+      let answerText = "";
+      let usageText = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() || "";
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
+          if (!line.startsWith("data:")) continue;
+          const payload = line.slice(5).trim();
+          if (!payload || payload === "[DONE]") continue;
+          let obj;
+          try { obj = JSON.parse(payload); } catch { continue; }
+
+          if (endpoint === "responses") {
+            if (obj.type === "response.reasoning_text.delta" || obj.type === "response.reasoning_summary_text.delta") {
+              reasoningText += obj.delta || "";
+              reasonBox.textContent = reasoningText;
+              reasonBox.classList.remove("hidden");
+            } else if (obj.type === "response.output_text.delta") {
+              answerText += obj.delta || "";
+              ansBox.textContent = answerText;
+            } else if ((obj.type === "response.completed" || obj.type === "response.incomplete") && obj.response?.usage) {
+              const u = obj.response.usage;
+              usageText = `in=${u.input_tokens || 0} out=${u.output_tokens || 0} reasoning=${u.output_tokens_details?.reasoning_tokens || 0}`;
+              usageEl.textContent = usageText;
+            }
+          } else {
+            const delta = obj.choices?.[0]?.delta;
+            if (delta?.reasoning_content) {
+              reasoningText += delta.reasoning_content;
+              reasonBox.textContent = reasoningText;
+              reasonBox.classList.remove("hidden");
+            }
+            if (delta?.content) {
+              answerText += delta.content;
+              ansBox.textContent = answerText;
+            }
+            if (obj.usage) {
+              usageText = `in=${obj.usage.prompt_tokens || 0} out=${obj.usage.completion_tokens || 0} reasoning=${obj.usage.completion_tokens_details?.reasoning_tokens || 0}`;
+              usageEl.textContent = usageText;
+            }
+          }
+        }
+      }
+      const ms = Math.round(performance.now() - t0);
+      badge.textContent = `流式完成 (${ms} ms)`;
+      loadGatewayStatus();
+    } catch (e) {
+      badge.textContent = "异常";
+      ansBox.textContent = e.message;
+      toast("调试异常: " + e.message, "err");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
   document.addEventListener("DOMContentLoaded", () => {
     initTheme();
 
@@ -775,7 +1233,7 @@
         });
         $("admin-password-input").value = "";
         showAppShell();
-        await Promise.all([loadOverview(), loadSettings(), loadReconStatus()]);
+        await Promise.all([loadOverview(), loadSettings(), loadReconStatus(), loadGatewayStatus()]);
       } catch (err) {
         errBox.textContent = err.message;
         errBox.classList.remove("hidden");
@@ -794,6 +1252,8 @@
         $("page-title").textContent = TAB_TITLES[target] || target;
         if (target === "logs") {
           api("/api/logs?limit=100").then((r) => renderLogs(r.data || [])).catch(() => {});
+        } else if (target === "gateway") {
+          loadGatewayStatus();
         }
       });
     });
@@ -856,6 +1316,77 @@
     $("settings-form").addEventListener("submit", saveSettings);
     $("btn-recon-pull").addEventListener("click", handleReconPull);
     $("btn-recon-diff").addEventListener("click", handleReconDiff);
+
+    // OpenAI Gateway controls
+    $("btn-copy-gw-url").addEventListener("click", () => copyText(gatewayBaseURL(), " Base URL"));
+    $("btn-copy-curl-chat").addEventListener("click", () => {
+      const m = $("gw-set-default-model").value.trim() || "dspro-high";
+      const snippet = `curl ${gatewayBaseURL()}/chat/completions \\\n  -H "Authorization: Bearer ${firstEnabledGatewayKey()}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"${m}","stream":true,"messages":[{"role":"user","content":"Hello!"}]}'`;
+      copyText(snippet, " Chat Completions cURL");
+    });
+    $("btn-copy-curl-resp").addEventListener("click", () => {
+      const m = $("gw-set-default-model").value.trim() || "dspro-high";
+      const snippet = `curl ${gatewayBaseURL()}/responses \\\n  -H "Authorization: Bearer ${firstEnabledGatewayKey()}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"${m}","stream":true,"input":"Hello!"}'`;
+      copyText(snippet, " Responses API cURL");
+    });
+    $("btn-copy-curl-balance").addEventListener("click", () => {
+      const snippet = `curl ${gatewayBaseURL()}/balance \\\n  -H "Authorization: Bearer ${firstEnabledGatewayKey()}"`;
+      copyText(snippet, " Balance cURL");
+    });
+    $("btn-pg-random").addEventListener("click", () => {
+      if (rollRandomPlaygroundPrompt()) toast("已随机切换测试提示词", "info");
+    });
+    $("pg-prompt").addEventListener("input", () => {
+      pgPromptCustomized = $("pg-prompt").value.trim().length > 0;
+      if (pgPromptCustomized && $("pg-pool-badge")) {
+        $("pg-pool-badge").textContent = "自定义输入";
+      }
+    });
+    $("btn-save-gw-settings").addEventListener("click", async () => {
+      try {
+        await api("/api/gateway/settings", {
+          method: "PUT",
+          body: JSON.stringify({
+            enabled: $("gw-set-enabled").checked,
+            allowNoAuth: $("gw-set-noauth").checked,
+            preflightMode: $("gw-set-preflight").checked,
+            defaultModel: $("gw-set-default-model").value.trim() || "dspro-high",
+            corsOrigins: $("gw-set-cors").value.trim() || "*",
+          }),
+        });
+        toast("OpenAI 网关配置已保存", "ok");
+        await loadGatewayStatus();
+      } catch (e) {
+        toast("保存失败: " + e.message, "err");
+      }
+    });
+    $("btn-gw-create-key").addEventListener("click", async () => {
+      const name = $("gw-new-key-name").value.trim();
+      try {
+        const res = await api("/api/gateway/keys", { method: "POST", body: JSON.stringify({ name }) });
+        $("gw-new-key-name").value = "";
+        if (res.key?.id) revealedKeyIDs.add(res.key.id);
+        toast("已新建 API Key", "ok");
+        await loadGatewayStatus();
+      } catch (e) {
+        toast("创建失败: " + e.message, "err");
+      }
+    });
+    $("btn-gw-refresh-models").addEventListener("click", async () => {
+      const btn = $("btn-gw-refresh-models");
+      btn.disabled = true;
+      try {
+        await api("/api/gateway/models/refresh", { method: "POST" });
+        toast("已刷新 Bohrium SciX 模型目录", "ok");
+        await loadGatewayStatus();
+      } catch (e) {
+        toast("刷新失败: " + e.message, "err");
+      } finally {
+        btn.disabled = false;
+      }
+    });
+    $("btn-gw-refresh-stats").addEventListener("click", () => loadGatewayStatus().then(() => toast("已刷新网关调用统计", "ok")));
+    $("btn-pg-run").addEventListener("click", runGatewayPlayground);
 
     checkAuthAndBoot();
   });

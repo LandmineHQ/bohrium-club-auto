@@ -17,6 +17,12 @@
 | `BOHRIUM_USER_AGENT` | Chrome 136 Windows UA | 自定义出站 Chrome User-Agent |
 | `BOHRIUM_PROXY` | 空 | 可选 HTTP/HTTPS 出站代理（自动回退读取 `HTTPS_PROXY`/`HTTP_PROXY`） |
 | `BOHRIUM_RECON_DIR` | `recon/bohrium-web` | 本地 Recon 基线保存目录（容器内为 `/data/recon/bohrium-web`） |
+| `BOHRIUM_GATEWAY_ENABLED` | `true` | 是否开启 OpenAI 兼容 `/v1/*` API 网关 |
+| `BOHRIUM_API_KEYS` | 首次启动自动生成 `sk-brm-...` | 逗号分隔的 OpenAI 网关 API Key 列表 |
+| `BOHRIUM_GATEWAY_DEFAULT_MODEL` | `dspro-high` | 请求未指定 `model` 时的默认模型 |
+| `BOHRIUM_GATEWAY_ALLOW_NO_AUTH` | `false` | 是否允许免 Key 访问 `/v1/*`（仅限可信内网） |
+| `BOHRIUM_GATEWAY_CORS_ORIGINS` | `*` | `/v1/*` 响应的 `Access-Control-Allow-Origin` |
+| `BOHRIUM_GATEWAY_PREFLIGHT` | `true` | 是否在新用户轮次前调用 `/billing/preflight`（与客户端一致，工具续跑步骤自动跳过） |
 
 ## `data/config.json` 示例
 

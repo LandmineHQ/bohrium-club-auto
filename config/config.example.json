@@ -13,6 +13,23 @@
     "autoClaim": true,
     "autoRefresh": true
   },
+  "gateway": {
+    "enabled": true,
+    "apiKeys": [
+      {
+        "id": "key_example",
+        "name": "Default Key",
+        "key": "sk-brm-replace-with-random-key",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "enabled": true
+      }
+    ],
+    "defaultModel": "dspro-high",
+    "allowNoAuth": false,
+    "corsOrigins": "*",
+    "preflightMode": true,
+    "storeId": ""
+  },
   "taskDelaySec": 3,
   "cancelAfterMs": 450,
   "maxPdfSizeBytes": 26214400

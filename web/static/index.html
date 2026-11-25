@@ -58,16 +58,20 @@
             <span class="nav-index">02</span>
             <span>积分与容量</span>
           </button>
+          <button class="nav-item" data-tab="gateway">
+            <span class="nav-index">03</span>
+            <span>OpenAI 网关</span>
+          </button>
         </div>
 
         <div class="nav-group">
           <div class="nav-label">可观测性</div>
           <button class="nav-item" data-tab="logs">
-            <span class="nav-index">03</span>
+            <span class="nav-index">04</span>
             <span>执行日志</span>
           </button>
           <button class="nav-item" data-tab="recon">
-            <span class="nav-index">04</span>
+            <span class="nav-index">05</span>
             <span>前端 Recon</span>
           </button>
         </div>
@@ -75,7 +79,7 @@
         <div class="nav-group">
           <div class="nav-label">系统</div>
           <button class="nav-item" data-tab="settings">
-            <span class="nav-index">05</span>
+            <span class="nav-index">06</span>
             <span>定时与设置</span>
           </button>
         </div>
@@ -251,7 +255,233 @@
           </div>
         </section>
 
-        <!-- TAB 3: LOGS -->
+        <!-- TAB 3: OPENAI GATEWAY (BOHRIUM DESKTOP COMPATIBLE) -->
+        <section id="tab-gateway" class="tab-panel">
+          <div class="metric-strip">
+            <div class="metric-cell">
+              <div class="metric-label">网关状态</div>
+              <div id="gw-kpi-state" class="metric-value tabular">--</div>
+              <div id="gw-kpi-state-sub" class="metric-sub tabular">默认模型 --</div>
+            </div>
+            <div class="metric-cell">
+              <div class="metric-label">累计 API 调用</div>
+              <div id="gw-kpi-reqs" class="metric-value tabular">0</div>
+              <div id="gw-kpi-reqs-sub" class="metric-sub tabular">Chat 0 · Responses 0 · 流式 0</div>
+            </div>
+            <div class="metric-cell">
+              <div class="metric-label">Token 统计</div>
+              <div id="gw-kpi-tokens" class="metric-value tabular">0</div>
+              <div id="gw-kpi-tokens-sub" class="metric-sub tabular">输入 0 · 输出 0 · 推理 0</div>
+            </div>
+            <div class="metric-cell">
+              <div class="metric-label">SciX 模型目录</div>
+              <div id="gw-kpi-models" class="metric-value tabular">--</div>
+              <div id="gw-kpi-models-sub" class="metric-sub tabular">会话存储 0 条</div>
+            </div>
+          </div>
+
+          <div class="spec-grid">
+            <div class="panel">
+              <div class="panel-head compact">
+                <div>
+                  <h3>OpenAI 兼容接入配置</h3>
+                  <p class="panel-desc">严格保持 Bohrium 桌面客户端（SciX）原生 <code>x-scix-execution</code>、<code>traceparent</code> 与 Sigma LLM 上游协议，同时完整支持 Chat Completions 与 Responses API。</p>
+                </div>
+              </div>
+              <div class="panel-pad stack-md">
+                <div class="field">
+                  <label>API Base URL</label>
+                  <div class="input-inline">
+                    <input id="gw-base-url" type="text" readonly />
+                    <button type="button" id="btn-copy-gw-url" class="btn btn-outline btn-sm">复制</button>
+                  </div>
+                </div>
+
+                <div class="gw-endpoint-tags">
+                  <span class="mono-tag">GET /v1/models</span>
+                  <span class="mono-tag">GET /v1/balance</span>
+                  <span class="mono-tag">POST /v1/chat/completions</span>
+                  <span class="mono-tag">POST /v1/responses</span>
+                  <span class="mono-tag">GET/DELETE /v1/responses/{id}</span>
+                </div>
+
+                <div class="toggle-group">
+                  <label class="toggle-row">
+                    <input type="checkbox" id="gw-set-enabled" />
+                    <span><strong>启用 OpenAI /v1/* 网关</strong><small>关闭后所有 /v1/* 请求返回 HTTP 503</small></span>
+                  </label>
+                  <label class="toggle-row">
+                    <input type="checkbox" id="gw-set-noauth" />
+                    <span><strong>允许无 Key 访问（仅限可信内网）</strong><small>默认关闭，建议保持 Bearer API Key 鉴权</small></span>
+                  </label>
+                  <label class="toggle-row">
+                    <input type="checkbox" id="gw-set-preflight" />
+                    <span><strong>新轮次前执行 Billing Preflight（与客户端一致）</strong><small>默认开启：每轮新对话前调用 /billing/preflight 校验额度；工具续跑步骤自动跳过，运行中余额不足由上游直接返回 402</small></span>
+                  </label>
+                </div>
+
+                <div class="form-grid">
+                  <div class="field">
+                    <label for="gw-set-default-model">默认模型（未指定 model 时）</label>
+                    <input id="gw-set-default-model" type="text" placeholder="dspro-high" />
+                  </div>
+                  <div class="field">
+                    <label for="gw-set-cors">CORS Allow-Origin</label>
+                    <input id="gw-set-cors" type="text" placeholder="*" />
+                  </div>
+                </div>
+
+                <div class="btn-row">
+                  <button type="button" id="btn-save-gw-settings" class="btn btn-primary btn-sm">保存网关设置</button>
+                  <button type="button" id="btn-copy-curl-chat" class="btn btn-outline btn-sm">Chat cURL</button>
+                  <button type="button" id="btn-copy-curl-resp" class="btn btn-outline btn-sm">Responses cURL</button>
+                  <button type="button" id="btn-copy-curl-balance" class="btn btn-outline btn-sm">Balance cURL</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="panel">
+              <div class="panel-head compact">
+                <div>
+                  <h3>API Key 管理</h3>
+                  <p class="panel-desc">独立于控制台管理员密码，供 OpenAI SDK / Codex / Cursor / Cherry Studio 鉴权调用。</p>
+                </div>
+              </div>
+              <div class="panel-pad stack-md">
+                <div class="input-inline">
+                  <input id="gw-new-key-name" type="text" placeholder="新 Key 备注名（如 Codex / Cursor）" />
+                  <button type="button" id="btn-gw-create-key" class="btn btn-primary btn-sm">新建 Key</button>
+                </div>
+              </div>
+              <div class="table-scroll">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>备注</th>
+                      <th>API Key</th>
+                      <th>状态</th>
+                      <th class="align-right">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody id="gw-keys-body"><tr><td colspan="4" class="empty-cell">加载中...</td></tr></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <div class="panel-title-row">
+                  <h2>Bohrium SciX 模型目录</h2>
+                  <span id="gw-catalog-pill" class="mono-tag">shrimp-brain-v2</span>
+                </div>
+                <p class="panel-desc">实时同步 Bohrium 客户端模型列表；网关自动为 <code>chat_completions</code> 与 <code>responses</code> 原生模型提供双向跨协议兼容。</p>
+              </div>
+              <button type="button" id="btn-gw-refresh-models" class="btn btn-outline btn-sm">刷新模型目录</button>
+            </div>
+            <div id="gw-catalog-error" class="notice notice-error hidden" style="margin:12px 20px 0;"></div>
+            <div class="table-scroll">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>模型 ID / 名称</th>
+                    <th>原生上游协议</th>
+                    <th>上下文 / 最大输出</th>
+                    <th>模态与推理</th>
+                    <th>倍率</th>
+                    <th class="align-right">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="gw-models-body"><tr><td colspan="6" class="empty-cell">加载模型目录中...</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <div class="panel-title-row">
+                  <h2>在线调试（Playground）</h2>
+                  <span id="pg-pool-badge" class="mono-tag">随机池 100 条</span>
+                </div>
+                <p class="panel-desc">内置 100 条科研与通用测试提示词并自动随机抽取；支持通过 <code>/v1/chat/completions</code> 或 <code>/v1/responses</code> 实时验证流式输出与推理。</p>
+              </div>
+              <div class="btn-row">
+                <label class="inline-check"><input type="checkbox" id="pg-auto-random" checked /> 每次自动随机</label>
+                <label class="inline-check"><input type="checkbox" id="pg-stream" checked /> SSE 流式</label>
+                <button type="button" id="btn-pg-random" class="btn btn-outline btn-sm">随机换一题</button>
+                <button type="button" id="btn-pg-run" class="btn btn-primary btn-sm">发送测试</button>
+              </div>
+            </div>
+            <div class="panel-pad stack-md">
+              <div class="pg-controls">
+                <div class="field">
+                  <label for="pg-endpoint">接口协议</label>
+                  <select id="pg-endpoint">
+                    <option value="chat">Chat Completions (/v1/chat/completions)</option>
+                    <option value="responses">Responses API (/v1/responses)</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="pg-model">模型</label>
+                  <select id="pg-model">
+                    <option value="dsflash-high">dsflash-high (DeepSeek-V4.1-Flash)</option>
+                    <option value="dspro-high">dspro-high (DeepSeek-V4-Pro)</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="pg-effort">推理强度</label>
+                  <select id="pg-effort">
+                    <option value="low">low</option>
+                    <option value="medium">medium</option>
+                    <option value="high">high</option>
+                    <option value="max">max</option>
+                    <option value="">默认</option>
+                  </select>
+                </div>
+              </div>
+              <div class="field">
+                <label for="pg-prompt">测试提示词（默认从 100 条题库随机选取，也可自行编辑）</label>
+                <textarea id="pg-prompt" rows="2" placeholder="正在从 100 条内置测试题库随机抽取，也可直接输入自定义提示词..."></textarea>
+              </div>
+              <div id="pg-result-wrap" class="pg-output hidden">
+                <div class="pg-output-meta">
+                  <span id="pg-status-badge" class="mono-tag">等待响应</span>
+                  <span id="pg-usage-meta" class="mono-tag tabular"></span>
+                </div>
+                <div id="pg-sent-prompt" class="model-desc-sub hidden" style="max-width:none;"></div>
+                <div id="pg-reasoning-box" class="pg-reasoning hidden"></div>
+                <pre id="pg-answer-box" class="pg-answer"></pre>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head compact">
+              <h3>近期网关调用记录</h3>
+              <button type="button" id="btn-gw-refresh-stats" class="btn btn-ghost btn-xs">刷新</button>
+            </div>
+            <div class="table-scroll">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>时间</th>
+                    <th>接口</th>
+                    <th>模型</th>
+                    <th>上游协议</th>
+                    <th>状态</th>
+                    <th>耗时</th>
+                    <th>Token (入/出/思)</th>
+                  </tr>
+                </thead>
+                <tbody id="gw-recent-body"><tr><td colspan="7" class="empty-cell">暂无网关调用记录</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 4: LOGS -->
         <section id="tab-logs" class="tab-panel">
           <div class="panel">
             <div class="panel-head">

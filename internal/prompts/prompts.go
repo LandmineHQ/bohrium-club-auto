@@ -9,7 +9,7 @@ import (
 	"sync"
 )
 
-//go:embed data/science_space_prompts.json data/academic_writing_prompts.json data/literature_reading_prompts.json data/papers_catalog.json
+//go:embed data/science_space_prompts.json data/academic_writing_prompts.json data/literature_reading_prompts.json data/playground_prompts.json data/papers_catalog.json
 var embeddedFS embed.FS
 
 // Paper represents one real open-access scientific paper PDF in the pre-collected 100-paper catalog.
@@ -31,6 +31,7 @@ type Stats struct {
 	ScienceSpacePrompts      int `json:"scienceSpacePrompts"`
 	AcademicWritingPrompts   int `json:"academicWritingPrompts"`
 	LiteratureReadingPrompts int `json:"literatureReadingPrompts"`
+	PlaygroundPrompts        int `json:"playgroundPrompts"`
 	PaperCatalogCount        int `json:"paperCatalogCount"`
 }
 
@@ -41,6 +42,7 @@ var (
 	scienceSpacePrompts      []string
 	academicWritingPrompts   []string
 	literatureReadingPrompts []string
+	playgroundPrompts        []string
 	papersCatalog            []Paper
 )
 
@@ -55,6 +57,10 @@ func ensureLoaded() error {
 			return
 		}
 		if err := loadJSON("data/literature_reading_prompts.json", &literatureReadingPrompts); err != nil {
+			loadErr = err
+			return
+		}
+		if err := loadJSON("data/playground_prompts.json", &playgroundPrompts); err != nil {
 			loadErr = err
 			return
 		}
@@ -84,8 +90,27 @@ func GetStats() Stats {
 		ScienceSpacePrompts:      len(scienceSpacePrompts),
 		AcademicWritingPrompts:   len(academicWritingPrompts),
 		LiteratureReadingPrompts: len(literatureReadingPrompts),
+		PlaygroundPrompts:        len(playgroundPrompts),
 		PaperCatalogCount:        len(papersCatalog),
 	}
+}
+
+// PlaygroundPrompts returns a copy of all 100 embedded OpenAI gateway playground test prompts.
+func PlaygroundPrompts() ([]string, error) {
+	if err := ensureLoaded(); err != nil {
+		return nil, err
+	}
+	out := make([]string, len(playgroundPrompts))
+	copy(out, playgroundPrompts)
+	return out, nil
+}
+
+// RandomPlaygroundPrompt picks a random prompt from the 100-item playground pool.
+func RandomPlaygroundPrompt() (string, error) {
+	if err := ensureLoaded(); err != nil {
+		return "", err
+	}
+	return pickRandom(playgroundPrompts)
 }
 
 // RandomScienceSpacePrompt picks a random scientific question for Task 1.

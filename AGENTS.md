@@ -38,6 +38,7 @@ internal/prompts/                 go:embed loader for prompt corpora & 100-paper
   data/science_space_prompts.json     330 scientific prompts (Task 1)
   data/academic_writing_prompts.json  320 academic writing prompts (Task 4)
   data/literature_reading_prompts.json 220 PDF reading prompts (Task 3)
+  data/playground_prompts.json         100 OpenAI Gateway Playground random test prompts
   data/papers_catalog.json            100 curated open-access arXiv papers (Task 3)
 internal/bohrium/                 Upstream Bohrium API client
   endpoints.go                        Host URLs, constants, header builders, JWT parser
@@ -46,6 +47,8 @@ internal/bohrium/                 Upstream Bohrium API client
   assets.go                           Photons, wallet, expiring lots, ledger, quotas, storage capacity
   papers.go                           PDF selection, cache, arXiv download + mirror fallback, offline fallback
   executor.go                         3-task execution orchestration, query-events telemetry, immediate cancel
+  scix_llm.go                         Bohrium desktop SciX Sigma LLM client (/models, /billing/preflight, /chat/completions, /responses, x-scix-execution)
+internal/openai/                  OpenAI-compatible /v1/* gateway (types, response store, bidirectional converter, SSE stream bridge, HTTP handler + tests)
 internal/scheduler/               Daily timezone-aware scheduler (Asia/Shanghai) + periodic token refresh
 internal/recon/                   Frontend snapshot/diff engine + contract marker scanner + tests
 internal/server/                  Admin cookie/header auth, rate limiter, REST API, embedded SPA router + tests
@@ -71,6 +74,12 @@ docs-site/                        VitePress documentation site (independent npm 
 - **Recon HTML Diff Normalization**:
   - Bohrium's CDN injects a per-request `clientSignal="..."` attribute into entry HTML. `internal/recon/snapshot.go` normalizes `clientSignal` and `nonce` before hashing HTML so `recon diff` reports genuine frontend updates only.
   - First-party `cdn.bohrium.com/platform/web/*` scripts are crawled alongside `club.bohrium.com` and `platform.bohrium.com` to verify login contract markers.
+- **Bohrium Desktop SciX LLM Gateway (`www.bohrium.com/bohrapi/v1/sigma-search/api/v1/scix/llm`)**:
+  - Model catalog: `GET /models?tag=shrimp-brain-v2` with `Authorization: Bearer <brmToken>`.
+  - Billing preflight: `POST /billing/preflight` with `{"model":"<id>"}`.
+  - Completions & Responses: `POST /chat/completions` and `POST /responses` require `Authorization: Bearer <brmToken>`, `traceparent` (`00-<32hex>-<16hex>-01`), and unpadded-base64url `x-scix-execution` JSON with `"version":1` and `"scenario":"local_agent"` plus canonical UUIDs (`storeId`, `rootSessionId`, `sessionId`, `callId`, `rootRunId`, `runId`, `purpose`, `recoveryAttempt`, `sessionCreatedAt`, `question`).
+  - Upstream enforces per-model endpoint routing (`api: "chat_completions"` models reject `/responses`, omitted `api` models speak stateless `/responses` with `store: false`); `internal/openai` transparently bridges both directions while keeping upstream requests 100% native.
+  - Streaming LLM calls MUST use `chromehttp.Client.DoStream` (`Timeout: 0`, `ResponseHeaderTimeout: 3m`) so long reasoning/generation streams are never terminated by the 45s non-streaming timeout.
 
 ## 5. Build, Test, and Verification
 

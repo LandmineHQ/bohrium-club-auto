@@ -12,6 +12,7 @@ import (
 	"bohrium-club-auto/internal/bohrium"
 	"bohrium-club-auto/internal/chromehttp"
 	"bohrium-club-auto/internal/config"
+	"bohrium-club-auto/internal/openai"
 	"bohrium-club-auto/internal/prompts"
 	"bohrium-club-auto/internal/recon"
 	"bohrium-club-auto/internal/scheduler"
@@ -19,7 +20,7 @@ import (
 	"bohrium-club-auto/web"
 )
 
-// Server exposes the admin-protected Web Dashboard and REST API.
+// Server exposes the admin-protected Web Dashboard, REST API, and OpenAI /v1/* gateway.
 type Server struct {
 	version   string
 	cfg       *config.Manager
@@ -27,6 +28,7 @@ type Server struct {
 	httpCli   *chromehttp.Client
 	client    *bohrium.Client
 	scheduler *scheduler.Scheduler
+	gateway   *openai.Gateway
 	limiter   *loginRateLimiter
 	mux       *http.ServeMux
 	startedAt time.Time
@@ -41,12 +43,18 @@ func New(version string, cfg *config.Manager, st *store.Store, httpCli *chromeht
 		httpCli:   httpCli,
 		client:    client,
 		scheduler: sched,
+		gateway:   openai.NewGateway(cfg, client),
 		limiter:   newLoginRateLimiter(),
 		mux:       http.NewServeMux(),
 		startedAt: time.Now().UTC(),
 	}
 	s.routes()
 	return s
+}
+
+// Gateway returns the embedded OpenAI-compatible gateway handler.
+func (s *Server) Gateway() *openai.Gateway {
+	return s.gateway
 }
 
 // Handler returns the root http.Handler.
@@ -90,6 +98,19 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/recon/status", s.requireAdmin(s.handleReconStatus))
 	s.mux.HandleFunc("POST /api/recon/pull", s.requireAdmin(s.handleReconPull))
 	s.mux.HandleFunc("POST /api/recon/diff", s.requireAdmin(s.handleReconDiff))
+
+	// Admin OpenAI Gateway management endpoints
+	s.mux.HandleFunc("GET /api/gateway/status", s.requireAdmin(s.handleGatewayStatus))
+	s.mux.HandleFunc("POST /api/gateway/models/refresh", s.requireAdmin(s.handleGatewayRefreshModels))
+	s.mux.HandleFunc("POST /api/gateway/keys", s.requireAdmin(s.handleGatewayCreateKey))
+	s.mux.HandleFunc("PATCH /api/gateway/keys/{id}", s.requireAdmin(s.handleGatewayUpdateKey))
+	s.mux.HandleFunc("DELETE /api/gateway/keys/{id}", s.requireAdmin(s.handleGatewayDeleteKey))
+	s.mux.HandleFunc("PUT /api/gateway/settings", s.requireAdmin(s.handleGatewayUpdateSettings))
+	s.mux.HandleFunc("POST /api/gateway/preflight", s.requireAdmin(s.handleGatewayPreflight))
+	s.mux.HandleFunc("POST /api/gateway/playground", s.requireAdmin(s.handleGatewayPlayground))
+
+	// OpenAI-compatible /v1/* endpoints (authenticated via Gateway API key)
+	s.gateway.RegisterRoutes(s.mux)
 
 	// Embedded Web Dashboard SPA
 	staticSub, err := fs.Sub(web.FS, "static")

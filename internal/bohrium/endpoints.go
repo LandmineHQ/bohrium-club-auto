@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"bohrium-club-auto/internal/chromehttp"
@@ -19,6 +20,11 @@ const (
 	DefaultWWWBaseURL      = "https://www.bohrium.com"
 	DefaultSBCloudBaseURL  = "https://sb-cloud.dp.tech"
 	DefaultAgentBaseURL    = "https://agent.bohrium.com"
+	DefaultSigmaLLMBaseURL = "https://www.bohrium.com/bohrapi/v1/sigma-search/api/v1/scix/llm"
+
+	SciXModelCatalogTag   = "shrimp-brain-v2"
+	SciXExecutionScenario = "local_agent"
+	SciXExecutionHeader   = "x-scix-execution"
 
 	PublisherCommunity        = "bohrium-user-community"
 	PlazaGatewayHeader        = "X-Plaza-Daily-Task-Gateway"
@@ -41,6 +47,7 @@ type Endpoints struct {
 	WWWBase      string
 	SBCloudBase  string
 	AgentBase    string
+	SigmaLLMBase string
 }
 
 func defaultEndpoints() Endpoints {
@@ -50,6 +57,7 @@ func defaultEndpoints() Endpoints {
 		WWWBase:      DefaultWWWBaseURL,
 		SBCloudBase:  DefaultSBCloudBaseURL,
 		AgentBase:    DefaultAgentBaseURL,
+		SigmaLLMBase: DefaultSigmaLLMBaseURL,
 	}
 }
 
@@ -61,6 +69,11 @@ type Client struct {
 	cfg       *config.Manager
 	store     *store.Store
 	endpoints Endpoints
+
+	catalogMu        sync.RWMutex
+	catalogCache     *SciXModelCatalog
+	catalogFetchedAt time.Time
+	catalogUserID    int64
 }
 
 // NewClient creates a Bohrium API client using the Chrome-emulating HTTP client.
@@ -89,6 +102,9 @@ func (c *Client) SetEndpoints(ep Endpoints) {
 	}
 	if ep.AgentBase != "" {
 		c.endpoints.AgentBase = strings.TrimRight(ep.AgentBase, "/")
+	}
+	if ep.SigmaLLMBase != "" {
+		c.endpoints.SigmaLLMBase = strings.TrimRight(ep.SigmaLLMBase, "/")
 	}
 }
 
