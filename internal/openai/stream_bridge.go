@@ -644,6 +644,267 @@ func StreamResponsesToChatSSE(w http.ResponseWriter, body io.Reader, modelID str
 	return usage, nil
 }
 
+// isSSEContentType reports whether an upstream HTTP response carries an SSE stream.
+func isSSEContentType(resp *http.Response) bool {
+	if resp == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
+}
+
+// AggregateChatSSE reads a Bohrium /chat/completions SSE stream (requested with stream=true to match brain.mjs)
+// and reassembles it into a complete non-streaming OpenAI ChatCompletionResponse.
+func AggregateChatSSE(body io.Reader, fallbackModel string) (*ChatCompletionResponse, error) {
+	chatID := ""
+	created := int64(0)
+	model := fallbackModel
+	finishReason := ""
+
+	var contentBuf strings.Builder
+	var reasoningBuf strings.Builder
+
+	type tcAccum struct {
+		id      string
+		typ     string
+		name    string
+		argsBuf strings.Builder
+	}
+	tcMap := make(map[int]*tcAccum)
+	var tcOrder []int
+	var finalUsage *ChatUsage
+
+	sc := newSSEScanner(body)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, ":") || !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "[DONE]" {
+			break
+		}
+		var chunk ChatCompletionChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		if chunk.ID != "" && chatID == "" {
+			chatID = chunk.ID
+		}
+		if chunk.Created > 0 && created == 0 {
+			created = chunk.Created
+		}
+		if chunk.Model != "" {
+			model = chunk.Model
+		}
+		if chunk.Usage != nil {
+			finalUsage = chunk.Usage
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		ch := chunk.Choices[0]
+		if ch.FinishReason != nil && *ch.FinishReason != "" {
+			finishReason = *ch.FinishReason
+		}
+		if ch.Delta.ReasoningContent != nil && *ch.Delta.ReasoningContent != "" {
+			reasoningBuf.WriteString(*ch.Delta.ReasoningContent)
+		}
+		if ch.Delta.Content != nil && *ch.Delta.Content != "" {
+			contentBuf.WriteString(*ch.Delta.Content)
+		}
+		for i, tc := range ch.Delta.ToolCalls {
+			idx := i
+			if tc.Index != nil {
+				idx = *tc.Index
+			}
+			acc, ok := tcMap[idx]
+			if !ok {
+				acc = &tcAccum{
+					id:   tc.ID,
+					typ:  tc.Type,
+					name: tc.Function.Name,
+				}
+				if acc.typ == "" {
+					acc.typ = "function"
+				}
+				tcMap[idx] = acc
+				tcOrder = append(tcOrder, idx)
+			} else {
+				if tc.ID != "" && acc.id == "" {
+					acc.id = tc.ID
+				}
+				if tc.Type != "" && acc.typ == "" {
+					acc.typ = tc.Type
+				}
+				if tc.Function.Name != "" && acc.name == "" {
+					acc.name = tc.Function.Name
+				}
+			}
+			if tc.Function.Arguments != "" {
+				acc.argsBuf.WriteString(tc.Function.Arguments)
+			}
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+
+	if chatID == "" {
+		chatID = RandomID("chatcmpl-")
+	}
+	if created == 0 {
+		created = time.Now().UTC().Unix()
+	}
+
+	sort.Ints(tcOrder)
+	var toolCalls []ChatToolCall
+	for _, idx := range tcOrder {
+		acc := tcMap[idx]
+		callID := acc.id
+		if callID == "" {
+			callID = RandomID("call_")
+		}
+		toolCalls = append(toolCalls, ChatToolCall{
+			ID:   callID,
+			Type: acc.typ,
+			Function: ChatToolCallFunction{
+				Name:      acc.name,
+				Arguments: acc.argsBuf.String(),
+			},
+		})
+	}
+	if finishReason == "" {
+		if len(toolCalls) > 0 {
+			finishReason = "tool_calls"
+		} else {
+			finishReason = "stop"
+		}
+	}
+
+	msg := ChatMessage{
+		Role:      "assistant",
+		ToolCalls: toolCalls,
+	}
+	if contentBuf.Len() > 0 || len(toolCalls) == 0 {
+		msg.Content = contentBuf.String()
+	}
+	if reasoningBuf.Len() > 0 {
+		rc := reasoningBuf.String()
+		msg.ReasoningContent = &rc
+	}
+
+	return &ChatCompletionResponse{
+		ID:      chatID,
+		Object:  "chat.completion",
+		Created: created,
+		Model:   model,
+		Choices: []ChatCompletionChoice{{
+			Index:        0,
+			Message:      msg,
+			Logprobs:     nil,
+			FinishReason: finishReason,
+		}},
+		Usage: finalUsage,
+	}, nil
+}
+
+// AggregateResponsesSSE reads a Bohrium native /responses SSE stream (requested with stream=true to match brain.mjs)
+// and returns the final OpenAI Responses object map.
+func AggregateResponsesSSE(body io.Reader, req *ResponsesRequest, fallbackModel string) (map[string]any, error) {
+	var terminalResp map[string]any
+	var createdResp map[string]any
+	var textBuf strings.Builder
+	var reasoningBuf strings.Builder
+
+	var dataLines []string
+	processFrame := func() {
+		if len(dataLines) == 0 {
+			return
+		}
+		payload := strings.Join(dataLines, "\n")
+		dataLines = dataLines[:0]
+		var ev map[string]any
+		if json.Unmarshal([]byte(payload), &ev) != nil {
+			return
+		}
+		evType, _ := ev["type"].(string)
+		switch evType {
+		case "response.created", "response.in_progress":
+			if r, ok := ev["response"].(map[string]any); ok {
+				createdResp = r
+			}
+		case "response.output_text.delta":
+			if d, _ := ev["delta"].(string); d != "" {
+				textBuf.WriteString(d)
+			}
+		case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
+			if d, _ := ev["delta"].(string); d != "" {
+				reasoningBuf.WriteString(d)
+			}
+		case "response.completed", "response.incomplete", "response.failed":
+			if r, ok := ev["response"].(map[string]any); ok {
+				terminalResp = r
+			}
+		}
+	}
+
+	sc := newSSEScanner(body)
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" {
+			processFrame()
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+	processFrame()
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+
+	if terminalResp != nil {
+		patchClientResponseMeta(terminalResp, req)
+		return terminalResp, nil
+	}
+	// Fallback if upstream ended without a terminal snapshot event
+	now := time.Now().UTC().Unix()
+	respID := RandomID("resp_")
+	if createdResp != nil {
+		if id, _ := createdResp["id"].(string); id != "" {
+			respID = id
+		}
+	}
+	outputs := make([]map[string]any, 0, 2)
+	if reasoningBuf.Len() > 0 {
+		outputs = append(outputs, map[string]any{
+			"id":      RandomID("rs_"),
+			"type":    "reasoning",
+			"status":  "completed",
+			"content": []map[string]any{{"type": "reasoning_text", "text": reasoningBuf.String()}},
+			"summary": []any{},
+		})
+	}
+	outputs = append(outputs, map[string]any{
+		"id":     RandomID("msg_"),
+		"type":   "message",
+		"status": "completed",
+		"role":   "assistant",
+		"content": []map[string]any{{
+			"type":        "output_text",
+			"text":        textBuf.String(),
+			"annotations": []any{},
+			"logprobs":    []any{},
+		}},
+	})
+	env := buildResponseEnvelope(respID, fallbackModel, now, &now, "completed", nil, outputs, nil, req)
+	return structToMap(env), nil
+}
+
 func patchClientResponseMeta(respObj map[string]any, req *ResponsesRequest) {
 	if req == nil || respObj == nil {
 		return

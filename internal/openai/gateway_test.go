@@ -24,6 +24,9 @@ type capturedUpstream struct {
 	mu                  sync.Mutex
 	path                string
 	auth                string
+	headers             http.Header
+	modelsHeaders       http.Header
+	preflightHeaders    http.Header
 	execRaw             string
 	execPayload         bohrium.SciXExecutionPayload
 	traceparent         string
@@ -40,6 +43,9 @@ func setupTestGateway(t *testing.T, upstreamHandler http.HandlerFunc) (*openai.G
 	capUp := &capturedUpstream{}
 	upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/models" {
+			capUp.mu.Lock()
+			capUp.modelsHeaders = r.Header.Clone()
+			capUp.mu.Unlock()
 			if r.URL.Query().Get("tag") != bohrium.SciXModelCatalogTag {
 				w.WriteHeader(http.StatusBadRequest)
 				_, _ = io.WriteString(w, `{"error":{"code":"tag_required","message":"query parameter tag is required"}}`)
@@ -65,6 +71,7 @@ func setupTestGateway(t *testing.T, upstreamHandler http.HandlerFunc) (*openai.G
 			_ = json.NewDecoder(r.Body).Decode(&pb)
 			capUp.mu.Lock()
 			capUp.preflightCount++
+			capUp.preflightHeaders = r.Header.Clone()
 			capUp.preflightTrace = r.Header.Get("traceparent")
 			capUp.preflightModel = pb["model"]
 			denyReason := capUp.preflightDenyReason
@@ -92,6 +99,7 @@ func setupTestGateway(t *testing.T, upstreamHandler http.HandlerFunc) (*openai.G
 		capUp.mu.Lock()
 		capUp.path = r.URL.Path
 		capUp.auth = r.Header.Get("Authorization")
+		capUp.headers = r.Header.Clone()
 		capUp.execRaw = execRaw
 		capUp.execPayload = execObj
 		capUp.traceparent = r.Header.Get("traceparent")
@@ -293,10 +301,14 @@ func TestResponsesBridgeToChatCompletionsStreamingAndChaining(t *testing.T) {
 		turn++
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		if body["stream"] == true {
-			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-			w.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(w, ": heartbeat\n\n")
+		// Gateway always requests stream=true upstream (matching brain.mjs), even when client requested stream=false.
+		if body["stream"] != true {
+			t.Errorf("turn %d: expected upstream stream=true, got %v", turn, body["stream"])
+		}
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, ": heartbeat\n\n")
+		if turn == 1 {
 			_, _ = io.WriteString(w, `data: {"id":"s1","object":"chat.completion.chunk","created":1700000001,"model":"dspro-high","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Let me check."},"finish_reason":null}]}`+"\n\n")
 			_, _ = io.WriteString(w, `data: {"id":"s1","object":"chat.completion.chunk","created":1700000001,"model":"dspro-high","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"get_weather","arguments":"{\"city\":"}}]},"finish_reason":null}]}`+"\n\n")
 			_, _ = io.WriteString(w, `data: {"id":"s1","object":"chat.completion.chunk","created":1700000001,"model":"dspro-high","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Beijing\"}"}}]},"finish_reason":null}]}`+"\n\n")
@@ -304,8 +316,9 @@ func TestResponsesBridgeToChatCompletionsStreamingAndChaining(t *testing.T) {
 			_, _ = io.WriteString(w, "data: [DONE]\n\n")
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"id":"s2","object":"chat.completion","created":1700000002,"model":"dspro-high","choices":[{"index":0,"message":{"role":"assistant","content":"Beijing is sunny, 22C."},"finish_reason":"stop"}],"usage":{"prompt_tokens":80,"completion_tokens":10,"total_tokens":90}}`)
+		_, _ = io.WriteString(w, `data: {"id":"s2","object":"chat.completion.chunk","created":1700000002,"model":"dspro-high","choices":[{"index":0,"delta":{"role":"assistant","content":"Beijing is sunny, 22C."},"finish_reason":null}]}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"id":"s2","object":"chat.completion.chunk","created":1700000002,"model":"dspro-high","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":80,"completion_tokens":10,"total_tokens":90}}`+"\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
 	})
 
 	// Turn 1: Streaming /v1/responses on chat_completions-native dspro-high with tools!
@@ -677,5 +690,226 @@ func TestBillingPreflightClientFidelityAndInsufficientBalance(t *testing.T) {
 	resp4.Body.Close()
 	if resp4.StatusCode != http.StatusPaymentRequired || errEnv4.Error.Code != "insufficient_balance" || errEnv4.Error.Type != "insufficient_quota" {
 		t.Fatalf("expected 402 insufficient_balance from upstream rejection, got status=%d env=%+v", resp4.StatusCode, errEnv4)
+	}
+}
+
+func assertNoBrowserHeaders(t *testing.T, label string, h http.Header) {
+	t.Helper()
+	for _, forbidden := range []string{"User-Agent", "Sec-Ch-Ua", "Sec-Ch-Ua-Mobile", "Sec-Ch-Ua-Platform", "Accept-Language"} {
+		if v := h.Get(forbidden); v != "" {
+			t.Fatalf("%s: expected no browser/Go header %s, got %q", label, forbidden, v)
+		}
+	}
+	if rt := h.Get(bohrium.SciXRuntimeHeader); rt != bohrium.SciXRuntimeValue {
+		t.Fatalf("%s: expected %s=%q, got %q", label, bohrium.SciXRuntimeHeader, bohrium.SciXRuntimeValue, rt)
+	}
+}
+
+func TestDesktopClientFingerprintAndSciMasterPromptToggle(t *testing.T) {
+	// Part 1: Default SciMasterPrompt=true + native desktop headers + always-SSE aggregation + tool strict + session/run affinity
+	_, gwSrv, apiKey, capUp := setupTestGateway(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/responses" {
+			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+			_, _ = io.WriteString(w, ": heartbeat\n\n")
+			_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_vis1\",\"model\":\"vision\",\"status\":\"in_progress\"}}\n\n")
+			_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Described image\"}\n\n")
+			_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_vis1\",\"object\":\"response\",\"model\":\"vision\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Described image\"}]}],\"usage\":{\"input_tokens\":50,\"output_tokens\":4,\"total_tokens\":54}}}\n\n")
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		_, _ = io.WriteString(w, ": heartbeat\n\n")
+		_, _ = io.WriteString(w, `data: {"id":"c_agg","object":"chat.completion.chunk","created":1700000100,"model":"dsflash-high","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"step 1"},"finish_reason":null}]}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"id":"c_agg","object":"chat.completion.chunk","created":1700000100,"model":"dsflash-high","choices":[{"index":0,"delta":{"content":"Hello!"},"finish_reason":null}]}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"id":"c_agg","object":"chat.completion.chunk","created":1700000100,"model":"dsflash-high","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":8,"total_tokens":108,"completion_tokens_details":{"reasoning_tokens":3}}}`+"\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	})
+
+	// 1a. Non-streaming Chat Completions with custom system prompt & tools (without strict)
+	req1, _ := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/chat/completions", strings.NewReader(`{
+		"model": "dsflash-high",
+		"stream": false,
+		"messages": [
+			{"role": "system", "content": "Custom instruction."},
+			{"role": "user", "content": "Explain DFT briefly"}
+		],
+		"tools": [
+			{"type": "function", "function": {"name": "calc", "description": "math", "parameters": {"type": "object"}}},
+			{"type": "function", "function": {"name": "strict_fn", "description": "strict", "parameters": {"type": "object"}, "strict": true}}
+		]
+	}`))
+	req1.Header.Set("Authorization", "Bearer "+apiKey)
+	req1.Header.Set("Content-Type", "application/json")
+	resp1, err := http.DefaultClient.Do(req1)
+	if err != nil {
+		t.Fatalf("req1: %v", err)
+	}
+	var chat1 openai.ChatCompletionResponse
+	if err := json.NewDecoder(resp1.Body).Decode(&chat1); err != nil {
+		t.Fatalf("decode chat1: %v", err)
+	}
+	resp1.Body.Close()
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp1.StatusCode)
+	}
+	if chat1.Choices[0].Message.Content != "Hello!" || chat1.Choices[0].Message.ReasoningContent == nil || *chat1.Choices[0].Message.ReasoningContent != "step 1" {
+		t.Fatalf("unexpected aggregated SSE chat response: %+v", chat1)
+	}
+	if chat1.Usage == nil || chat1.Usage.PromptTokens != 100 || chat1.Usage.CompletionTokens != 8 {
+		t.Fatalf("expected aggregated usage, got %+v", chat1.Usage)
+	}
+
+	capUp.mu.Lock()
+	assertNoBrowserHeaders(t, "/models", capUp.modelsHeaders)
+	assertNoBrowserHeaders(t, "/billing/preflight", capUp.preflightHeaders)
+	assertNoBrowserHeaders(t, "/chat/completions", capUp.headers)
+	if capUp.preflightHeaders.Get(bohrium.SciXExecutionHeader) != "" {
+		t.Fatalf("expected /billing/preflight to omit synthetic x-scix-execution, got %q", capUp.preflightHeaders.Get(bohrium.SciXExecutionHeader))
+	}
+	if capUp.body["stream"] != true {
+		t.Fatalf("expected upstream stream=true even when caller requested stream=false")
+	}
+	msgs1, _ := capUp.body["messages"].([]any)
+	sys1, _ := msgs1[0].(map[string]any)["content"].(string)
+	if !strings.HasPrefix(sys1, "You are SciMaster,") || !strings.Contains(sys1, "Custom instruction.") {
+		t.Fatalf("expected SciMaster prefix merged with caller system prompt, got prefix=%q", sys1[:min(80, len(sys1))])
+	}
+	if capUp.execPayload.Question != "Explain DFT briefly" {
+		t.Fatalf("expected x-scix-execution.question to stay user question, got %q", capUp.execPayload.Question)
+	}
+	tools1, _ := capUp.body["tools"].([]any)
+	fn0 := tools1[0].(map[string]any)["function"].(map[string]any)
+	fn1 := tools1[1].(map[string]any)["function"].(map[string]any)
+	if fn0["strict"] != false || fn1["strict"] != true {
+		t.Fatalf("expected default strict=false and explicit strict=true, got %v / %v", fn0["strict"], fn1["strict"])
+	}
+	turn1Sess := capUp.execPayload.SessionID
+	turn1Run := capUp.execPayload.RunID
+	turn1CreatedAt := capUp.execPayload.SessionCreatedAt
+	capUp.mu.Unlock()
+
+	// 1b. Tool continuation in same conversation MUST keep sessionId, rootRunId, runId, sessionCreatedAt and attach toolCallId
+	reqTool, _ := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/chat/completions", strings.NewReader(`{
+		"model": "dsflash-high",
+		"stream": false,
+		"messages": [
+			{"role": "system", "content": "Custom instruction."},
+			{"role": "user", "content": "Explain DFT briefly"},
+			{"role": "assistant", "content": null, "tool_calls": [{"id":"call_42","type":"function","function":{"name":"calc","arguments":"{}"}}]},
+			{"role": "tool", "tool_call_id": "call_42", "content": "42"}
+		]
+	}`))
+	reqTool.Header.Set("Authorization", "Bearer "+apiKey)
+	reqTool.Header.Set("Content-Type", "application/json")
+	respTool, err := http.DefaultClient.Do(reqTool)
+	if err != nil {
+		t.Fatalf("reqTool: %v", err)
+	}
+	respTool.Body.Close()
+	capUp.mu.Lock()
+	if capUp.execPayload.SessionID != turn1Sess || capUp.execPayload.RunID != turn1Run || capUp.execPayload.SessionCreatedAt != turn1CreatedAt {
+		t.Fatalf("expected tool continuation to preserve session/run affinity: turn1=(%s,%s,%s) tool=(%s,%s,%s)",
+			turn1Sess, turn1Run, turn1CreatedAt, capUp.execPayload.SessionID, capUp.execPayload.RunID, capUp.execPayload.SessionCreatedAt)
+	}
+	if capUp.execPayload.ToolCallID != "call_42" {
+		t.Fatalf("expected toolCallId=call_42 on tool continuation, got %q", capUp.execPayload.ToolCallID)
+	}
+	capUp.mu.Unlock()
+
+	// 1c. No duplication if caller already starts system prompt with "You are SciMaster"
+	reqDup, _ := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/chat/completions", strings.NewReader(`{
+		"model": "dsflash-high",
+		"stream": false,
+		"messages": [
+			{"role": "system", "content": "You are SciMaster, custom edition."},
+			{"role": "user", "content": "hi"}
+		]
+	}`))
+	reqDup.Header.Set("Authorization", "Bearer "+apiKey)
+	reqDup.Header.Set("Content-Type", "application/json")
+	respDup, _ := http.DefaultClient.Do(reqDup)
+	respDup.Body.Close()
+	capUp.mu.Lock()
+	dupSys, _ := capUp.body["messages"].([]any)[0].(map[string]any)["content"].(string)
+	capUp.mu.Unlock()
+	if dupSys != "You are SciMaster, custom edition." {
+		t.Fatalf("expected no duplicate SciMaster injection, got %q", dupSys)
+	}
+
+	// 1d. Native /responses model ("vision") places SciMaster + instructions in input[0] with role="developer", NO top-level instructions, WITH prompt_cache_key
+	reqVis, _ := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/responses", strings.NewReader(`{
+		"model": "vision",
+		"stream": false,
+		"instructions": "Describe charts accurately.",
+		"input": "What is in this plot?"
+	}`))
+	reqVis.Header.Set("Authorization", "Bearer "+apiKey)
+	reqVis.Header.Set("Content-Type", "application/json")
+	respVis, err := http.DefaultClient.Do(reqVis)
+	if err != nil {
+		t.Fatalf("reqVis: %v", err)
+	}
+	var visOut map[string]any
+	_ = json.NewDecoder(respVis.Body).Decode(&visOut)
+	respVis.Body.Close()
+	if respVis.StatusCode != http.StatusOK || visOut["status"] != "completed" {
+		t.Fatalf("expected 200 completed from SSE-aggregated vision response, got %d %+v", respVis.StatusCode, visOut)
+	}
+	capUp.mu.Lock()
+	if _, hasTopInstr := capUp.body["instructions"]; hasTopInstr {
+		t.Fatalf("expected native /responses to place instructions in input[0], not top-level instructions")
+	}
+	if capUp.body["prompt_cache_key"] == nil || capUp.body["prompt_cache_key"] == "" {
+		t.Fatalf("expected prompt_cache_key on native /responses upstream")
+	}
+	visInput, _ := capUp.body["input"].([]any)
+	visSys := visInput[0].(map[string]any)
+	if visSys["role"] != "developer" || !strings.HasPrefix(visSys["content"].(string), "You are SciMaster,") || !strings.Contains(visSys["content"].(string), "Describe charts accurately.") {
+		t.Fatalf("unexpected vision input[0]: %+v", visSys)
+	}
+	capUp.mu.Unlock()
+
+	// 1e. Auxiliary "title" model MUST skip SciMaster injection
+	reqTitle, _ := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/responses", strings.NewReader(`{
+		"model": "title",
+		"stream": false,
+		"instructions": "Generate a short title.",
+		"input": "quantum error correction"
+	}`))
+	reqTitle.Header.Set("Authorization", "Bearer "+apiKey)
+	reqTitle.Header.Set("Content-Type", "application/json")
+	respTitle, _ := http.DefaultClient.Do(reqTitle)
+	respTitle.Body.Close()
+	capUp.mu.Lock()
+	titleInput, _ := capUp.body["input"].([]any)
+	titleSys := titleInput[0].(map[string]any)
+	capUp.mu.Unlock()
+	if titleSys["role"] != "system" || titleSys["content"] != "Generate a short title." {
+		t.Fatalf("expected title auxiliary model to skip SciMaster and use role=system, got %+v", titleSys)
+	}
+
+	// Part 2: BOHRIUM_GATEWAY_SCIMASTER_PROMPT=false disables SciMaster prompt injection cleanly
+	t.Setenv("BOHRIUM_GATEWAY_SCIMASTER_PROMPT", "false")
+	_, gwSrvOff, apiKeyOff, capOff := setupTestGateway(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		_, _ = io.WriteString(w, `data: {"id":"c_off","object":"chat.completion.chunk","created":1700000200,"model":"dsflash-high","choices":[{"index":0,"delta":{"role":"assistant","content":"Raw"},"finish_reason":"stop"}]}`+"\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	})
+	reqOff, _ := http.NewRequest(http.MethodPost, gwSrvOff.URL+"/v1/chat/completions", strings.NewReader(`{
+		"model": "dsflash-high",
+		"stream": false,
+		"messages": [{"role": "user", "content": "plain message"}]
+	}`))
+	reqOff.Header.Set("Authorization", "Bearer "+apiKeyOff)
+	reqOff.Header.Set("Content-Type", "application/json")
+	respOff, err := http.DefaultClient.Do(reqOff)
+	if err != nil {
+		t.Fatalf("reqOff: %v", err)
+	}
+	respOff.Body.Close()
+	capOff.mu.Lock()
+	msgsOff, _ := capOff.body["messages"].([]any)
+	capOff.mu.Unlock()
+	if len(msgsOff) != 1 || msgsOff[0].(map[string]any)["role"] != "user" {
+		t.Fatalf("expected raw pass-through without SciMaster when toggle is off, got %+v", msgsOff)
 	}
 }

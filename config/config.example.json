@@ -28,6 +28,7 @@
     "allowNoAuth": false,
     "corsOrigins": "*",
     "preflightMode": true,
+    "sciMasterPrompt": true,
     "storeId": ""
   },
   "taskDelaySec": 3,

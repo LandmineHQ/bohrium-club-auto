@@ -38,13 +38,14 @@ func (s *Server) handleGatewayStatus(w http.ResponseWriter, r *http.Request) {
 		"ok":                true,
 		"bohriumLoggedIn":   auth.Token != "",
 		"config": map[string]any{
-			"enabled":       gwCfg.Enabled,
-			"defaultModel":  gwCfg.DefaultModel,
-			"allowNoAuth":   gwCfg.AllowNoAuth,
-			"corsOrigins":   gwCfg.CORSOrigins,
-			"preflightMode": gwCfg.PreflightMode,
-			"storeId":       gwCfg.StoreID,
-			"apiKeys":       gwCfg.APIKeys,
+			"enabled":         gwCfg.Enabled,
+			"defaultModel":    gwCfg.DefaultModel,
+			"allowNoAuth":     gwCfg.AllowNoAuth,
+			"corsOrigins":     gwCfg.CORSOrigins,
+			"preflightMode":   gwCfg.PreflightMode,
+			"sciMasterPrompt": gwCfg.SciMasterPrompt,
+			"storeId":         gwCfg.StoreID,
+			"apiKeys":         gwCfg.APIKeys,
 		},
 		"catalog":           catalog,
 		"catalogError":      catalogErr,
@@ -158,11 +159,12 @@ func (s *Server) handleGatewayDeleteKey(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) handleGatewayUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Enabled       *bool   `json:"enabled"`
-		DefaultModel  *string `json:"defaultModel"`
-		AllowNoAuth   *bool   `json:"allowNoAuth"`
-		CORSOrigins   *string `json:"corsOrigins"`
-		PreflightMode *bool   `json:"preflightMode"`
+		Enabled         *bool   `json:"enabled"`
+		DefaultModel    *string `json:"defaultModel"`
+		AllowNoAuth     *bool   `json:"allowNoAuth"`
+		CORSOrigins     *string `json:"corsOrigins"`
+		PreflightMode   *bool   `json:"preflightMode"`
+		SciMasterPrompt *bool   `json:"sciMasterPrompt"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "无效请求体"})
@@ -183,6 +185,9 @@ func (s *Server) handleGatewayUpdateSettings(w http.ResponseWriter, r *http.Requ
 		}
 		if body.PreflightMode != nil {
 			c.Gateway.PreflightMode = *body.PreflightMode
+		}
+		if body.SciMasterPrompt != nil {
+			c.Gateway.SciMasterPrompt = *body.SciMasterPrompt
 		}
 		return nil
 	})

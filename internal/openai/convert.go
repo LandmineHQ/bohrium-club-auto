@@ -7,11 +7,80 @@ import (
 	"time"
 
 	"bohrium-club-auto/internal/bohrium"
+	"bohrium-club-auto/internal/prompts"
 )
+
+// SciXRequestOptions controls Bohrium desktop-client protocol fidelity during request normalization.
+type SciXRequestOptions struct {
+	SciMasterPrompt bool   // prepend Bohrium desktop client's SciMaster system prompt on main agent models
+	ForceStream     bool   // always request stream=true from upstream (matching brain.mjs)
+	SessionID       string // canonical session UUID used for prompt_cache_key on Responses API
+}
+
+func shouldInjectSciMasterPrompt(modelID string, enabled bool) bool {
+	if !enabled {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(modelID)) {
+	case "title", "summary":
+		// Auxiliary session-purpose models use dedicated short prompts in Bohrium desktop client.
+		return false
+	default:
+		return true
+	}
+}
+
+func prependSciMasterText(existing string) string {
+	sci := strings.TrimSpace(prompts.SciMasterSystemPrompt())
+	if sci == "" {
+		return existing
+	}
+	trimmed := strings.TrimSpace(existing)
+	if trimmed == "" {
+		return sci
+	}
+	// Do not duplicate if the caller (or real Bohrium desktop client) already provided SciMaster.
+	if strings.HasPrefix(strings.ToLower(trimmed), "you are scimaster") {
+		return existing
+	}
+	return sci + "\n\n" + existing
+}
+
+func injectSciMasterIntoChatMessages(msgs []map[string]any, modelID string, enabled bool) []map[string]any {
+	if !shouldInjectSciMasterPrompt(modelID, enabled) {
+		return msgs
+	}
+	sci := strings.TrimSpace(prompts.SciMasterSystemPrompt())
+	if sci == "" {
+		return msgs
+	}
+	if len(msgs) > 0 {
+		if r, _ := msgs[0]["role"].(string); r == "system" || r == "developer" {
+			existing := flattenContentToText(msgs[0]["content"])
+			msgs[0]["content"] = prependSciMasterText(existing)
+			return msgs
+		}
+	}
+	out := make([]map[string]any, 0, len(msgs)+1)
+	out = append(out, map[string]any{
+		"role":    "system",
+		"content": sci,
+	})
+	out = append(out, msgs...)
+	return out
+}
+
+func clampCacheKey(k string) string {
+	k = strings.TrimSpace(k)
+	if len(k) > 64 {
+		return k[:64]
+	}
+	return k
+}
 
 // NormalizeChatRequestForSciX converts an incoming OpenAI /v1/chat/completions request
 // into the exact payload shape expected by Bohrium desktop client's /api/v1/scix/llm/chat/completions.
-func NormalizeChatRequestForSciX(req *ChatCompletionRequest, model bohrium.SciXModel) (map[string]any, string, error) {
+func NormalizeChatRequestForSciX(req *ChatCompletionRequest, model bohrium.SciXModel, opts SciXRequestOptions) (map[string]any, string, error) {
 	if len(req.Messages) == 0 {
 		return nil, "", fmt.Errorf("messages array is required and cannot be empty")
 	}
@@ -113,14 +182,17 @@ func NormalizeChatRequestForSciX(req *ChatCompletionRequest, model bohrium.SciXM
 		return nil, "", fmt.Errorf("model %q does not support image inputs; use a vision-capable model such as kimi-k3, kimi-k3.1-pro, advanced, or vision", model.ID)
 	}
 
+	outMsgs = injectSciMasterIntoChatMessages(outMsgs, model.ID, opts.SciMasterPrompt)
+
+	upstreamStream := req.Stream || opts.ForceStream
 	payload := map[string]any{
 		"model":    model.ID,
 		"messages": outMsgs,
-		"stream":   req.Stream,
+		"stream":   upstreamStream,
 	}
-	if req.Stream {
+	if upstreamStream {
 		includeUsage := true
-		if req.StreamOptions != nil {
+		if req.Stream && req.StreamOptions != nil {
 			includeUsage = req.StreamOptions.IncludeUsage
 		}
 		if includeUsage {
@@ -244,13 +316,25 @@ func ParseResponsesInputItems(raw json.RawMessage, rs *ResponseStore) ([]map[str
 	return out, nil
 }
 
-// NormalizeResponsesRequestForSciX builds the exact stateless payload for Bohrium's native /api/v1/scix/llm/responses endpoint.
-func NormalizeResponsesRequestForSciX(req *ResponsesRequest, model bohrium.SciXModel, allInputItems []map[string]any, effectiveInstructions *string) (map[string]any, string, error) {
+// NormalizeResponsesRequestForSciX builds the exact stateless payload for Bohrium's native /api/v1/scix/llm/responses endpoint,
+// matching brain.mjs (system/developer instruction placed as input[0], store=false, prompt_cache_key, stream=true).
+func NormalizeResponsesRequestForSciX(req *ResponsesRequest, model bohrium.SciXModel, allInputItems []map[string]any, effectiveInstructions *string, opts SciXRequestOptions) (map[string]any, string, error) {
 	if req.Background != nil && *req.Background {
 		return nil, "", fmt.Errorf("background mode is not supported by Bohrium SciX Responses")
 	}
 
-	normalizedInput := make([]map[string]any, 0, len(allInputItems))
+	instructionRole := "system"
+	if model.SupportsReasoning() {
+		// Mirrors brain.mjs convertResponsesMessages: model.reasoning && supportsDeveloperRole !== false ? "developer" : "system"
+		instructionRole = "developer"
+	}
+
+	var leadingSysParts []string
+	if effectiveInstructions != nil && strings.TrimSpace(*effectiveInstructions) != "" {
+		leadingSysParts = append(leadingSysParts, strings.TrimSpace(*effectiveInstructions))
+	}
+
+	normalizedInput := make([]map[string]any, 0, len(allInputItems)+1)
 	question := ""
 	hasImage := false
 
@@ -259,28 +343,31 @@ func NormalizeResponsesRequestForSciX(req *ResponsesRequest, model bohrium.SciXM
 		switch typ {
 		case "message", "":
 			role, _ := item["role"].(string)
-			if role == "" {
-				role = "user"
+			roleLower := strings.ToLower(strings.TrimSpace(role))
+			if roleLower == "" {
+				roleLower = "user"
 			}
-			parts, textVal, imgFound := normalizeResponsesMessageContent(item["content"], role)
+			if (roleLower == "system" || roleLower == "developer") && len(normalizedInput) == 0 {
+				if txt := strings.TrimSpace(flattenContentToText(item["content"])); txt != "" {
+					leadingSysParts = append(leadingSysParts, txt)
+				}
+				continue
+			}
+			parts, textVal, imgFound := normalizeResponsesMessageContent(item["content"], roleLower)
 			if imgFound {
 				hasImage = true
 			}
-			if role == "user" && textVal != "" {
+			if roleLower == "user" && textVal != "" {
 				question = textVal
 			}
 			normalizedInput = append(normalizedInput, map[string]any{
 				"type":    "message",
-				"role":    role,
+				"role":    roleLower,
 				"content": parts,
 			})
 		default:
 			// function_call, function_call_output, reasoning, etc.
 			cp := cloneMap(item)
-			// Strip fields that stateless upstream does not need or may reject on replay
-			if typ == "reasoning" {
-				// Keep summary/content/encrypted_content/id as provided
-			}
 			normalizedInput = append(normalizedInput, cp)
 		}
 	}
@@ -289,20 +376,35 @@ func NormalizeResponsesRequestForSciX(req *ResponsesRequest, model bohrium.SciXM
 		return nil, "", fmt.Errorf("model %q does not support image inputs; use kimi-k3, kimi-k3.1-pro, advanced, or vision", model.ID)
 	}
 
+	callerSysText := strings.Join(leadingSysParts, "\n\n")
+	if question == "" && callerSysText != "" {
+		question = callerSysText
+	}
+	finalSysText := callerSysText
+	if shouldInjectSciMasterPrompt(model.ID, opts.SciMasterPrompt) {
+		finalSysText = prependSciMasterText(finalSysText)
+	}
+	if strings.TrimSpace(finalSysText) != "" {
+		sysItem := map[string]any{
+			"role":    instructionRole,
+			"content": finalSysText,
+		}
+		normalizedInput = append([]map[string]any{sysItem}, normalizedInput...)
+	}
+
+	upstreamStream := req.Stream || opts.ForceStream
 	payload := map[string]any{
 		"model":  model.ID,
 		"input":  normalizedInput,
-		"stream": req.Stream,
+		"stream": upstreamStream,
 		"store":  false, // Bohrium SciX Responses enforces stateless requests
 	}
-	if effectiveInstructions != nil && *effectiveInstructions != "" {
-		payload["instructions"] = *effectiveInstructions
-		if question == "" {
-			question = *effectiveInstructions
-		}
-	}
 	if req.MaxOutputTokens != nil && *req.MaxOutputTokens > 0 {
-		payload["max_output_tokens"] = *req.MaxOutputTokens
+		maxOut := *req.MaxOutputTokens
+		if maxOut < 16 {
+			maxOut = 16
+		}
+		payload["max_output_tokens"] = maxOut
 	}
 	if req.Temperature != nil {
 		payload["temperature"] = *req.Temperature
@@ -360,8 +462,10 @@ func NormalizeResponsesRequestForSciX(req *ResponsesRequest, model bohrium.SciXM
 	if req.Truncation != "" {
 		payload["truncation"] = req.Truncation
 	}
-	if req.PromptCacheKey != "" {
-		payload["prompt_cache_key"] = req.PromptCacheKey
+	if cacheKey := clampCacheKey(req.PromptCacheKey); cacheKey != "" {
+		payload["prompt_cache_key"] = cacheKey
+	} else if cacheKey := clampCacheKey(opts.SessionID); cacheKey != "" {
+		payload["prompt_cache_key"] = cacheKey
 	}
 	if req.PromptCacheRet != "" {
 		payload["prompt_cache_retention"] = req.PromptCacheRet
@@ -377,7 +481,7 @@ func NormalizeResponsesRequestForSciX(req *ResponsesRequest, model bohrium.SciXM
 
 // ResponsesToChatRequest bridges an OpenAI /v1/responses request to Bohrium's native /api/v1/scix/llm/chat/completions
 // for chat_completions-native models (dspro-high, dsflash-high, kimi-k3, kimi-k3.1-pro, standard, advanced).
-func ResponsesToChatRequest(req *ResponsesRequest, model bohrium.SciXModel, allInputItems []map[string]any, effectiveInstructions *string) (map[string]any, string, error) {
+func ResponsesToChatRequest(req *ResponsesRequest, model bohrium.SciXModel, allInputItems []map[string]any, effectiveInstructions *string, opts SciXRequestOptions) (map[string]any, string, error) {
 	if req.Background != nil && *req.Background {
 		return nil, "", fmt.Errorf("background mode is not supported")
 	}
@@ -541,12 +645,15 @@ func ResponsesToChatRequest(req *ResponsesRequest, model bohrium.SciXModel, allI
 		question = *effectiveInstructions
 	}
 
+	messages = injectSciMasterIntoChatMessages(messages, model.ID, opts.SciMasterPrompt)
+
+	upstreamStream := req.Stream || opts.ForceStream
 	payload := map[string]any{
 		"model":    model.ID,
 		"messages": messages,
-		"stream":   req.Stream,
+		"stream":   upstreamStream,
 	}
-	if req.Stream {
+	if upstreamStream {
 		payload["stream_options"] = map[string]any{"include_usage": true}
 	}
 	if req.MaxOutputTokens != nil && *req.MaxOutputTokens > 0 {
@@ -605,8 +712,8 @@ func ResponsesToChatRequest(req *ResponsesRequest, model bohrium.SciXModel, allI
 }
 
 // ChatToResponsesRequest bridges an OpenAI /v1/chat/completions request to Bohrium's native /api/v1/scix/llm/responses
-// for responses-native models (vision, title, summary, etc.).
-func ChatToResponsesRequest(req *ChatCompletionRequest, model bohrium.SciXModel) (map[string]any, string, error) {
+// for responses-native models (vision, title, summary, etc.), placing system prompt in input[0] matching brain.mjs.
+func ChatToResponsesRequest(req *ChatCompletionRequest, model bohrium.SciXModel, opts SciXRequestOptions) (map[string]any, string, error) {
 	if len(req.Messages) == 0 {
 		return nil, "", fmt.Errorf("messages array is required and cannot be empty")
 	}
@@ -693,18 +800,31 @@ func ChatToResponsesRequest(req *ChatCompletionRequest, model bohrium.SciXModel)
 		return nil, "", fmt.Errorf("model %q does not support image inputs", model.ID)
 	}
 
+	instructionRole := "system"
+	if model.SupportsReasoning() {
+		instructionRole = "developer"
+	}
+	callerSysText := strings.Join(instructionsParts, "\n\n")
+	if question == "" && callerSysText != "" {
+		question = callerSysText
+	}
+	finalSysText := callerSysText
+	if shouldInjectSciMasterPrompt(model.ID, opts.SciMasterPrompt) {
+		finalSysText = prependSciMasterText(finalSysText)
+	}
+	if strings.TrimSpace(finalSysText) != "" {
+		inputItems = append([]map[string]any{{
+			"role":    instructionRole,
+			"content": finalSysText,
+		}}, inputItems...)
+	}
+
+	upstreamStream := req.Stream || opts.ForceStream
 	payload := map[string]any{
 		"model":  model.ID,
 		"input":  inputItems,
-		"stream": req.Stream,
+		"stream": upstreamStream,
 		"store":  false,
-	}
-	if len(instructionsParts) > 0 {
-		instr := strings.Join(instructionsParts, "\n\n")
-		payload["instructions"] = instr
-		if question == "" {
-			question = instr
-		}
 	}
 	if maxTok := pickMaxTokens(req.MaxTokens, req.MaxCompletionTokens); maxTok > 0 {
 		if maxTok < 16 {
@@ -721,8 +841,10 @@ func ChatToResponsesRequest(req *ChatCompletionRequest, model bohrium.SciXModel)
 	if req.User != "" {
 		payload["user"] = req.User
 	}
-	if req.PromptCacheKey != "" {
-		payload["prompt_cache_key"] = req.PromptCacheKey
+	if cacheKey := clampCacheKey(req.PromptCacheKey); cacheKey != "" {
+		payload["prompt_cache_key"] = cacheKey
+	} else if cacheKey := clampCacheKey(opts.SessionID); cacheKey != "" {
+		payload["prompt_cache_key"] = cacheKey
 	}
 	if effort := model.ClampReasoningEffort(req.ReasoningEffort); effort != "" {
 		payload["reasoning"] = map[string]any{"effort": effort}
@@ -1414,12 +1536,22 @@ func normalizeChatTools(tools []json.RawMessage, legacyFuncs []json.RawMessage) 
 	for _, raw := range tools {
 		var m map[string]any
 		if json.Unmarshal(raw, &m) == nil && m != nil {
+			if m["type"] == "function" {
+				if fn, ok := m["function"].(map[string]any); ok {
+					if _, hasStrict := fn["strict"]; !hasStrict {
+						fn["strict"] = false // Mirrors brain.mjs convertTools$2 default strict: false
+					}
+				}
+			}
 			out = append(out, m)
 		}
 	}
 	for _, raw := range legacyFuncs {
 		var fn map[string]any
 		if json.Unmarshal(raw, &fn) == nil && fn != nil {
+			if _, hasStrict := fn["strict"]; !hasStrict {
+				fn["strict"] = false
+			}
 			out = append(out, map[string]any{
 				"type":     "function",
 				"function": fn,
@@ -1468,8 +1600,14 @@ func normalizeResponsesTools(tools []json.RawMessage) []any {
 				for k, v := range fn {
 					flat[k] = v
 				}
+				if _, hasStrict := flat["strict"]; !hasStrict {
+					flat["strict"] = false
+				}
 				out = append(out, flat)
 				continue
+			}
+			if _, hasStrict := m["strict"]; !hasStrict {
+				m["strict"] = false
 			}
 		}
 		out = append(out, m)
@@ -1486,7 +1624,10 @@ func responsesToolsToChatTools(tools []json.RawMessage) []any {
 		}
 		typ, _ := m["type"].(string)
 		if typ == "function" {
-			if _, hasNested := m["function"].(map[string]any); hasNested {
+			if fn, hasNested := m["function"].(map[string]any); hasNested {
+				if _, hasStrict := fn["strict"]; !hasStrict {
+					fn["strict"] = false
+				}
 				out = append(out, m)
 				continue
 			}
@@ -1502,6 +1643,8 @@ func responsesToolsToChatTools(tools []json.RawMessage) []any {
 			}
 			if strict, ok := m["strict"]; ok {
 				fn["strict"] = strict
+			} else {
+				fn["strict"] = false
 			}
 			out = append(out, map[string]any{
 				"type":     "function",

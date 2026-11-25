@@ -271,6 +271,7 @@ Configuration is stored atomically in `data/config.json` (editable in the Dashbo
 | `BOHRIUM_GATEWAY_ALLOW_NO_AUTH` | `false` | Allow unauthenticated `/v1/*` requests (trusted LAN only) |
 | `BOHRIUM_GATEWAY_CORS_ORIGINS` | `*` | `Access-Control-Allow-Origin` header value on `/v1/*` |
 | `BOHRIUM_GATEWAY_PREFLIGHT` | `true` | Run `/billing/preflight` on new user turns (matches Bohrium desktop client; skips mid-loop tool continuations) |
+| `BOHRIUM_GATEWAY_SCIMASTER_PROMPT` | `true` | Prepend Bohrium desktop client's native SciMaster system prompt on main agent models (toggleable in Console; skips `title`/`summary`) |
 
 Additional runtime fields in `data/config.json` (see [`config/config.example.json`](config/config.example.json)):
 

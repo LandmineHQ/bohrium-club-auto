@@ -194,6 +194,32 @@ func (rs *ResponseStore) BuildChainItems(prevID string) ([]map[string]any, *stri
 	return items, lastInstr, true
 }
 
+// RootResponseID walks the previous_response_id chain back to the earliest stored response ID,
+// allowing multi-turn Responses API chains to share a stable SciX sessionId.
+func (rs *ResponseStore) RootResponseID(id string) string {
+	if rs == nil || id == "" {
+		return id
+	}
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	visited := make(map[string]bool)
+	cur := id
+	root := id
+	for cur != "" && !visited[cur] {
+		visited[cur] = true
+		rec, ok := rs.records[cur]
+		if !ok {
+			break
+		}
+		root = rec.ID
+		if rec.PreviousResponseID == "" {
+			break
+		}
+		cur = rec.PreviousResponseID
+	}
+	return root
+}
+
 // FindItemByID resolves an item_reference against stored response input/output items.
 func (rs *ResponseStore) FindItemByID(itemID string) (map[string]any, bool) {
 	rs.mu.RLock()

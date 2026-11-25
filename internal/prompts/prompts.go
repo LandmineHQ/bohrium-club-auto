@@ -6,10 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"strings"
 	"sync"
 )
 
-//go:embed data/science_space_prompts.json data/academic_writing_prompts.json data/literature_reading_prompts.json data/playground_prompts.json data/papers_catalog.json
+//go:embed data/science_space_prompts.json data/academic_writing_prompts.json data/literature_reading_prompts.json data/playground_prompts.json data/papers_catalog.json data/scimaster_system_prompt.txt
 var embeddedFS embed.FS
 
 // Paper represents one real open-access scientific paper PDF in the pre-collected 100-paper catalog.
@@ -44,6 +45,7 @@ var (
 	literatureReadingPrompts []string
 	playgroundPrompts        []string
 	papersCatalog            []Paper
+	sciMasterSystemPrompt    string
 )
 
 func ensureLoaded() error {
@@ -68,6 +70,12 @@ func ensureLoaded() error {
 			loadErr = err
 			return
 		}
+		rawPrompt, err := embeddedFS.ReadFile("data/scimaster_system_prompt.txt")
+		if err != nil {
+			loadErr = fmt.Errorf("read embedded scimaster_system_prompt.txt: %w", err)
+			return
+		}
+		sciMasterSystemPrompt = strings.TrimSpace(string(rawPrompt))
 	})
 	return loadErr
 }
@@ -103,6 +111,12 @@ func PlaygroundPrompts() ([]string, error) {
 	out := make([]string, len(playgroundPrompts))
 	copy(out, playgroundPrompts)
 	return out, nil
+}
+
+// SciMasterSystemPrompt returns Bohrium desktop client's native SciMaster persona system prompt.
+func SciMasterSystemPrompt() string {
+	_ = ensureLoaded()
+	return sciMasterSystemPrompt
 }
 
 // RandomPlaygroundPrompt picks a random prompt from the 100-item playground pool.

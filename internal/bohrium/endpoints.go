@@ -25,6 +25,8 @@ const (
 	SciXModelCatalogTag   = "shrimp-brain-v2"
 	SciXExecutionScenario = "local_agent"
 	SciXExecutionHeader   = "x-scix-execution"
+	SciXRuntimeHeader     = "x-scix-runtime"
+	SciXRuntimeValue      = "scix_local"
 
 	PublisherCommunity        = "bohrium-user-community"
 	PlazaGatewayHeader        = "X-Plaza-Daily-Task-Gateway"

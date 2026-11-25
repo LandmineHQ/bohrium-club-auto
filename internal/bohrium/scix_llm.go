@@ -258,16 +258,28 @@ func (c *Client) GetSciXModelCatalog(ctx context.Context, forceRefresh bool) (*S
 	}
 
 	rawURL := c.endpoints.SigmaLLMBase + "/models?tag=" + url.QueryEscape(SciXModelCatalogTag)
-	headers := map[string]string{
-		"Authorization": "Bearer " + auth.Token,
-		"Accept":        "application/json",
-		"traceparent":   NewTraceparent(),
+	doCatalog := func(tok string) ([]byte, int, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		if err != nil {
+			return nil, 0, err
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("traceparent", NewTraceparent())
+		req.Header.Set(SciXRuntimeHeader, SciXRuntimeValue)
+		resp, err := c.http.DoNative(req)
+		if err != nil {
+			return nil, 0, err
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		return body, resp.StatusCode, err
 	}
-	resp, err := c.http.DoJSON(ctx, http.MethodGet, rawURL, nil, headers)
-	if err == nil && resp.StatusCode == http.StatusUnauthorized {
+
+	body, statusCode, err := doCatalog(auth.Token)
+	if err == nil && statusCode == http.StatusUnauthorized {
 		if refreshed, rErr := c.RefreshToken(ctx, "system"); rErr == nil && refreshed.Token != "" {
-			headers["Authorization"] = "Bearer " + refreshed.Token
-			resp, err = c.http.DoJSON(ctx, http.MethodGet, rawURL, nil, headers)
+			body, statusCode, err = doCatalog(refreshed.Token)
 		}
 	}
 	if err != nil {
@@ -276,15 +288,15 @@ func (c *Client) GetSciXModelCatalog(ctx context.Context, forceRefresh bool) (*S
 		}
 		return nil, fmt.Errorf("fetch SciX model catalog: %w", err)
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		if cached != nil && cachedUID == auth.UserID && resp.StatusCode >= 500 {
+	if statusCode < 200 || statusCode >= 300 {
+		if cached != nil && cachedUID == auth.UserID && statusCode >= 500 {
 			return cached.Clone(), nil
 		}
-		return nil, fmt.Errorf("SciX model catalog returned HTTP %d: %s", resp.StatusCode, truncateText(string(resp.Body), 240))
+		return nil, fmt.Errorf("SciX model catalog returned HTTP %d: %s", statusCode, truncateText(string(body), 240))
 	}
 
 	var cat SciXModelCatalog
-	if err := json.Unmarshal(resp.Body, &cat); err != nil {
+	if err := json.Unmarshal(body, &cat); err != nil {
 		return nil, fmt.Errorf("parse SciX model catalog: %w", err)
 	}
 	if cat.Object == "" {
@@ -302,7 +314,7 @@ func (c *Client) GetSciXModelCatalog(ctx context.Context, forceRefresh bool) (*S
 			cat.Data[i].Created = nowUnix
 		}
 	}
-	digest := sha256.Sum256(resp.Body)
+	digest := sha256.Sum256(body)
 	cat.SciXCatalog = &SciXCatalogVersion{
 		ScopeGeneration: fmt.Sprintf("u%d-o%d", auth.UserID, auth.OrgID),
 		ContentVersion:  hex.EncodeToString(digest[:8]),
@@ -345,12 +357,17 @@ func (c *Client) ResolveSciXModel(ctx context.Context, requested string) (SciXMo
 
 // SciXExecOptions controls the x-scix-execution envelope generated for Bohrium desktop compatibility.
 type SciXExecOptions struct {
-	IncomingHeader string
-	SessionSeed    string
-	Purpose        string
-	Question       string
-	ToolCallID     string
-	ModelID        string
+	IncomingHeader   string
+	SessionSeed      string
+	SessionID        string
+	RootSessionID    string
+	RunID            string
+	RootRunID        string
+	SessionCreatedAt string
+	Purpose          string
+	Question         string
+	ToolCallID       string
+	ModelID          string
 }
 
 // SciXExecutionPayload mirrors the exact JSON schema sent in the x-scix-execution header by scix.exe v0.10.25.
@@ -411,7 +428,9 @@ func (c *Client) BuildSciXExecutionHeader(opts SciXExecOptions) string {
 	}
 	sessionID := strings.TrimSpace(p.SessionID)
 	if !isCanonicalUUID(sessionID) {
-		if strings.TrimSpace(opts.SessionSeed) != "" {
+		if isCanonicalUUID(opts.SessionID) {
+			sessionID = strings.ToLower(strings.TrimSpace(opts.SessionID))
+		} else if strings.TrimSpace(opts.SessionSeed) != "" {
 			sessionID = deterministicUUID("scix-session:" + opts.SessionSeed)
 		} else {
 			sessionID = newUUIDv4()
@@ -419,7 +438,11 @@ func (c *Client) BuildSciXExecutionHeader(opts SciXExecOptions) string {
 	}
 	p.SessionID = sessionID
 	if !isCanonicalUUID(p.RootSessionID) {
-		p.RootSessionID = sessionID
+		if isCanonicalUUID(opts.RootSessionID) {
+			p.RootSessionID = strings.ToLower(strings.TrimSpace(opts.RootSessionID))
+		} else {
+			p.RootSessionID = sessionID
+		}
 	}
 	if !isCanonicalUUID(p.CallID) {
 		p.CallID = newUUIDv4()
@@ -432,17 +455,29 @@ func (c *Client) BuildSciXExecutionHeader(opts SciXExecOptions) string {
 	}
 	runID := strings.TrimSpace(p.RunID)
 	if !isCanonicalUUID(runID) {
-		runID = newUUIDv4()
+		if isCanonicalUUID(opts.RunID) {
+			runID = strings.ToLower(strings.TrimSpace(opts.RunID))
+		} else {
+			runID = newUUIDv4()
+		}
 	}
 	p.RunID = runID
 	if !isCanonicalUUID(p.RootRunID) {
-		p.RootRunID = runID
+		if isCanonicalUUID(opts.RootRunID) {
+			p.RootRunID = strings.ToLower(strings.TrimSpace(opts.RootRunID))
+		} else {
+			p.RootRunID = runID
+		}
 	}
 	if p.ToolCallID == "" && strings.TrimSpace(opts.ToolCallID) != "" {
 		p.ToolCallID = strings.TrimSpace(opts.ToolCallID)
 	}
 	if strings.TrimSpace(p.SessionCreatedAt) == "" {
-		p.SessionCreatedAt = time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
+		if strings.TrimSpace(opts.SessionCreatedAt) != "" {
+			p.SessionCreatedAt = strings.TrimSpace(opts.SessionCreatedAt)
+		} else {
+			p.SessionCreatedAt = time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
+		}
 	}
 	if p.Question == "" && strings.TrimSpace(opts.Question) != "" {
 		p.Question = clampRunes(strings.TrimSpace(opts.Question), 512)
@@ -450,6 +485,19 @@ func (c *Client) BuildSciXExecutionHeader(opts SciXExecOptions) string {
 
 	b, _ := json.Marshal(p)
 	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// DeterministicSessionUUID converts a stable conversation seed into a canonical lowercase UUIDv5.
+func DeterministicSessionUUID(seed string) string {
+	if strings.TrimSpace(seed) == "" {
+		return newUUIDv4()
+	}
+	return deterministicUUID("scix-session:" + seed)
+}
+
+// NewCanonicalUUID returns a fresh canonical lowercase RFC 4122 UUIDv4.
+func NewCanonicalUUID() string {
+	return newUUIDv4()
 }
 
 // NewTraceparent returns a valid W3C traceparent header ("00-<32hex>-<16hex>-01"), matching scix.exe.
@@ -465,8 +513,14 @@ func NewTraceparent() string {
 }
 
 // SciXBillingPreflight calls POST /api/v1/scix/llm/billing/preflight to verify account admission for a model,
-// mirroring Bohrium desktop client's preflight_brain_model check before starting a new turn.
+// mirroring Bohrium desktop client's preflight_brain_model check (Authorization + traceparent + x-scix-runtime,
+// without browser headers or synthetic x-scix-execution).
 func (c *Client) SciXBillingPreflight(ctx context.Context, modelID, traceparent string) (bool, string, error) {
+	auth := c.store.GetAuth()
+	token := strings.TrimSpace(auth.Token)
+	if token == "" {
+		return false, "", ErrBohriumNotLoggedIn
+	}
 	bodyBytes, err := json.Marshal(map[string]string{"model": modelID})
 	if err != nil {
 		return false, "", err
@@ -474,8 +528,27 @@ func (c *Client) SciXBillingPreflight(ctx context.Context, modelID, traceparent 
 	if strings.TrimSpace(traceparent) == "" {
 		traceparent = NewTraceparent()
 	}
-	execHdr := c.BuildSciXExecutionHeader(SciXExecOptions{ModelID: modelID, Question: "preflight"})
-	resp, err := c.DoSciXLLM(ctx, "/billing/preflight", bodyBytes, false, execHdr, traceparent)
+	targetURL := c.endpoints.SigmaLLMBase + "/billing/preflight"
+	doPreflight := func(tok string) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("traceparent", traceparent)
+		req.Header.Set(SciXRuntimeHeader, SciXRuntimeValue)
+		return c.http.DoNative(req)
+	}
+	resp, err := doPreflight(token)
+	if err == nil && resp.StatusCode == http.StatusUnauthorized {
+		if refreshed, rErr := c.RefreshToken(ctx, "system"); rErr == nil && refreshed.Token != "" && refreshed.Token != token {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			_ = resp.Body.Close()
+			resp, err = doPreflight(refreshed.Token)
+		}
+	}
 	if err != nil {
 		return false, "", err
 	}
@@ -560,7 +633,8 @@ func (c *Client) DoSciXLLM(ctx context.Context, subPath string, payload []byte, 
 		}
 		req.Header.Set("traceparent", traceparent)
 		req.Header.Set(SciXExecutionHeader, execHeader)
-		return c.http.DoStream(req)
+		req.Header.Set(SciXRuntimeHeader, SciXRuntimeValue)
+		return c.http.DoNativeStream(req)
 	}
 
 	resp, err := doReq(token)

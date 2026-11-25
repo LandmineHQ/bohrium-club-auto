@@ -820,6 +820,7 @@
     $("gw-set-enabled").checked = !!cfg.enabled;
     $("gw-set-noauth").checked = !!cfg.allowNoAuth;
     $("gw-set-preflight").checked = !!cfg.preflightMode;
+    if ($("gw-set-scimaster")) $("gw-set-scimaster").checked = cfg.sciMasterPrompt !== false;
     $("gw-set-default-model").value = cfg.defaultModel || "dspro-high";
     $("gw-set-cors").value = cfg.corsOrigins || "*";
 
@@ -1350,6 +1351,7 @@
             enabled: $("gw-set-enabled").checked,
             allowNoAuth: $("gw-set-noauth").checked,
             preflightMode: $("gw-set-preflight").checked,
+            sciMasterPrompt: $("gw-set-scimaster") ? $("gw-set-scimaster").checked : true,
             defaultModel: $("gw-set-default-model").value.trim() || "dspro-high",
             corsOrigins: $("gw-set-cors").value.trim() || "*",
           }),

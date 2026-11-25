@@ -318,6 +318,10 @@
                     <input type="checkbox" id="gw-set-preflight" />
                     <span><strong>新轮次前执行 Billing Preflight（与客户端一致）</strong><small>默认开启：每轮新对话前调用 /billing/preflight 校验额度；工具续跑步骤自动跳过，运行中余额不足由上游直接返回 402</small></span>
                   </label>
+                  <label class="toggle-row">
+                    <input type="checkbox" id="gw-set-scimaster" />
+                    <span><strong>注入 SciMaster 系统提示词（与客户端一致）</strong><small>默认开启：主模型自动前置 Bohrium 客户端原生 SciMaster 系统提示词（title/summary 及已含 SciMaster 前缀的请求不重复注入）；关闭后纯透传调用方原始 Prompt</small></span>
+                  </label>
                 </div>
 
                 <div class="form-grid">

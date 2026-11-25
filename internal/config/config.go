@@ -27,13 +27,14 @@ type APIKey struct {
 
 // GatewayConfig configures the Bohrium desktop-compatible OpenAI /v1/* API gateway.
 type GatewayConfig struct {
-	Enabled       bool     `json:"enabled"`
-	APIKeys       []APIKey `json:"apiKeys"`
-	DefaultModel  string   `json:"defaultModel"`
-	AllowNoAuth   bool     `json:"allowNoAuth"`
-	CORSOrigins   string   `json:"corsOrigins"`
-	PreflightMode bool     `json:"preflightMode"`
-	StoreID       string   `json:"storeId"`
+	Enabled         bool     `json:"enabled"`
+	APIKeys         []APIKey `json:"apiKeys"`
+	DefaultModel    string   `json:"defaultModel"`
+	AllowNoAuth     bool     `json:"allowNoAuth"`
+	CORSOrigins     string   `json:"corsOrigins"`
+	PreflightMode   bool     `json:"preflightMode"`
+	SciMasterPrompt bool     `json:"sciMasterPrompt"`
+	StoreID         string   `json:"storeId"`
 }
 
 // Config holds persisted and environment-overridden application settings.
@@ -164,6 +165,9 @@ func Load() (*Manager, error) {
 	if v := strings.TrimSpace(os.Getenv("BOHRIUM_GATEWAY_PREFLIGHT")); v != "" {
 		cfg.Gateway.PreflightMode = parseBool(v, cfg.Gateway.PreflightMode)
 	}
+	if v := strings.TrimSpace(os.Getenv("BOHRIUM_GATEWAY_SCIMASTER_PROMPT")); v != "" {
+		cfg.Gateway.SciMasterPrompt = parseBool(v, cfg.Gateway.SciMasterPrompt)
+	}
 	if v := strings.TrimSpace(os.Getenv("BOHRIUM_API_KEYS")); v != "" {
 		var envKeys []APIKey
 		nowISO := time.Now().UTC().Format(time.RFC3339)
@@ -254,11 +258,12 @@ func defaultConfig(dataDir string) Config {
 			AutoRefresh:   true,
 		},
 		Gateway: GatewayConfig{
-			Enabled:       true,
-			DefaultModel:  "dspro-high",
-			AllowNoAuth:   false,
-			CORSOrigins:   "*",
-			PreflightMode: true,
+			Enabled:         true,
+			DefaultModel:    "dspro-high",
+			AllowNoAuth:     false,
+			CORSOrigins:     "*",
+			PreflightMode:   true,
+			SciMasterPrompt: true,
 		},
 	}
 }
@@ -302,6 +307,7 @@ func fillMissingDefaults(cfg *Config, dataDir string) {
 	if cfg.Gateway.DefaultModel == "" && cfg.Gateway.StoreID == "" && len(cfg.Gateway.APIKeys) == 0 {
 		cfg.Gateway.Enabled = def.Gateway.Enabled
 		cfg.Gateway.PreflightMode = def.Gateway.PreflightMode
+		cfg.Gateway.SciMasterPrompt = def.Gateway.SciMasterPrompt
 	}
 	if strings.TrimSpace(cfg.Gateway.DefaultModel) == "" {
 		cfg.Gateway.DefaultModel = def.Gateway.DefaultModel

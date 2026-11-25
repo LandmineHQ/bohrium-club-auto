@@ -29,13 +29,31 @@ type Options struct {
 }
 
 // Client wraps net/http.Client and automatically injects realistic Chrome browser headers
-// on every outgoing request so the Go default User-Agent is never leaked.
+// on web requests, while also providing native (non-browser) HTTP transports for desktop
+// protocol endpoints (such as Bohrium SciX /scix/llm/*) that should not send Chrome headers.
 type Client struct {
-	httpClient   *http.Client
-	streamClient *http.Client
-	userAgent    string
-	secCHUA      string
-	proxyURL     string
+	httpClient         *http.Client
+	streamClient       *http.Client
+	nativeClient       *http.Client
+	nativeStreamClient *http.Client
+	userAgent          string
+	secCHUA            string
+	proxyURL           string
+}
+
+// nativeTransport forwards requests without browser Sec-CH-UA / Accept-Language / Chrome UA headers,
+// and suppresses Go's default "Go-http-client/1.1" User-Agent (matching Rust reqwest in scix.exe).
+type nativeTransport struct {
+	base http.RoundTripper
+}
+
+func (t *nativeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	clone := req.Clone(req.Context())
+	if _, exists := clone.Header["User-Agent"]; !exists {
+		// Empty slice tells Go's net/http transport to omit the User-Agent header completely.
+		clone.Header["User-Agent"] = []string{}
+	}
+	return t.base.RoundTrip(clone)
 }
 
 // chromeTransport wraps an http.RoundTripper to enforce Chrome headers.
@@ -105,6 +123,13 @@ func New(opts Options) (*Client, error) {
 		secCHUA:   secCH,
 	}
 
+	nativeTr := &nativeTransport{
+		base: baseTransport,
+	}
+	nativeStreamTr := &nativeTransport{
+		base: streamTransport,
+	}
+
 	return &Client{
 		httpClient: &http.Client{
 			Transport: tr,
@@ -113,6 +138,14 @@ func New(opts Options) (*Client, error) {
 		streamClient: &http.Client{
 			Transport: streamTr,
 			Timeout:   0, // Streaming requests rely on request context and ResponseHeaderTimeout
+		},
+		nativeClient: &http.Client{
+			Transport: nativeTr,
+			Timeout:   timeout,
+		},
+		nativeStreamClient: &http.Client{
+			Transport: nativeStreamTr,
+			Timeout:   0,
 		},
 		userAgent: ua,
 		secCHUA:   secCH,
@@ -165,6 +198,17 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 // Callers are responsible for closing resp.Body and cancelling req.Context().
 func (c *Client) DoStream(req *http.Request) (*http.Response, error) {
 	return c.streamClient.Do(req)
+}
+
+// DoNative executes an HTTP request without Chrome browser headers (and without Go's default User-Agent),
+// matching Bohrium desktop client's Rust reqwest transport for /scix/llm/* endpoints.
+func (c *Client) DoNative(req *http.Request) (*http.Response, error) {
+	return c.nativeClient.Do(req)
+}
+
+// DoNativeStream executes a streaming HTTP request without Chrome browser headers or total body timeout.
+func (c *Client) DoNativeStream(req *http.Request) (*http.Response, error) {
+	return c.nativeStreamClient.Do(req)
 }
 
 // Response holds a fully read HTTP response.

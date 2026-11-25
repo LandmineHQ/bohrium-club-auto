@@ -23,6 +23,7 @@
 | `BOHRIUM_GATEWAY_ALLOW_NO_AUTH` | `false` | 是否允许免 Key 访问 `/v1/*`（仅限可信内网） |
 | `BOHRIUM_GATEWAY_CORS_ORIGINS` | `*` | `/v1/*` 响应的 `Access-Control-Allow-Origin` |
 | `BOHRIUM_GATEWAY_PREFLIGHT` | `true` | 是否在新用户轮次前调用 `/billing/preflight`（与客户端一致，工具续跑步骤自动跳过） |
+| `BOHRIUM_GATEWAY_SCIMASTER_PROMPT` | `true` | 是否在主模型请求中自动前置 Bohrium 客户端原生 SciMaster 系统提示词（关闭后纯透传原始 Prompt） |
 
 ## `data/config.json` 示例
 

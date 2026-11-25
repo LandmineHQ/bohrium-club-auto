@@ -9,20 +9,35 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"bohrium-club-auto/internal/bohrium"
 	"bohrium-club-auto/internal/config"
 )
 
-const maxRequestBodyBytes = 32 * 1024 * 1024 // 32 MiB to accommodate multimodal base64 images
+const (
+	maxRequestBodyBytes = 32 * 1024 * 1024 // 32 MiB to accommodate multimodal base64 images
+	maxTrackedSessions  = 256
+)
+
+type trackedSession struct {
+	sessionID        string
+	rootSessionID    string
+	runID            string
+	rootRunID        string
+	sessionCreatedAt string
+	updatedAt        time.Time
+}
 
 // Gateway exposes full OpenAI-compatible /v1/models, /v1/chat/completions, and /v1/responses endpoints
 // backed faithfully by Bohrium desktop client's native Sigma LLM protocol.
 type Gateway struct {
-	cfg     *config.Manager
-	client  *bohrium.Client
-	respDir *ResponseStore
+	cfg      *config.Manager
+	client   *bohrium.Client
+	respDir  *ResponseStore
+	sessMu   sync.Mutex
+	sessions map[string]*trackedSession
 }
 
 // NewGateway constructs a new OpenAI-compatible Bohrium gateway.
@@ -32,9 +47,10 @@ func NewGateway(cfg *config.Manager, client *bohrium.Client) *Gateway {
 		dataDir = cfg.Get().DataDir
 	}
 	return &Gateway{
-		cfg:     cfg,
-		client:  client,
-		respDir: OpenResponseStore(dataDir),
+		cfg:      cfg,
+		client:   client,
+		respDir:  OpenResponseStore(dataDir),
+		sessions: make(map[string]*trackedSession),
 	}
 }
 
@@ -363,11 +379,34 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 }
 
 func (g *Gateway) execChatViaChatUpstream(w http.ResponseWriter, r *http.Request, req *ChatCompletionRequest, model bohrium.SciXModel, traceparent string, start time.Time) {
-	payloadMap, question, err := NormalizeChatRequestForSciX(req, model)
+	isToolCont := isChatToolContinuation(req)
+	sessionID, execHdr := g.resolveExecEnvelope(
+		r.Header.Get(bohrium.SciXExecutionHeader),
+		sessionSeedForChat(req),
+		model.ID,
+		"",
+		lastChatToolCallID(req),
+		isToolCont,
+	)
+
+	payloadMap, question, err := NormalizeChatRequestForSciX(req, model, SciXRequestOptions{
+		SciMasterPrompt: g.sciMasterPromptEnabled(),
+		ForceStream:     true, // Match brain.mjs which always streams SSE from Bohrium Sigma
+		SessionID:       sessionID,
+	})
 	if err != nil {
 		WriteError(w, http.StatusBadRequest, "invalid_request_error", "invalid_request", err.Error())
 		g.recordFailure("/v1/chat/completions", "chat_completions", model.ID, req.Stream, http.StatusBadRequest, start, err.Error())
 		return
+	}
+	if question != "" {
+		_, execHdr = g.resolveExecEnvelopeWithQuestion(
+			r.Header.Get(bohrium.SciXExecutionHeader),
+			sessionID,
+			model.ID,
+			question,
+			lastChatToolCallID(req),
+		)
 	}
 	payloadBytes, err := json.Marshal(payloadMap)
 	if err != nil {
@@ -375,14 +414,7 @@ func (g *Gateway) execChatViaChatUpstream(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	execHdr := g.client.BuildSciXExecutionHeader(bohrium.SciXExecOptions{
-		IncomingHeader: r.Header.Get(bohrium.SciXExecutionHeader),
-		SessionSeed:    sessionSeedForChat(req),
-		Question:       question,
-		ModelID:        model.ID,
-	})
-
-	upResp, err := g.client.DoSciXLLM(r.Context(), "/chat/completions", payloadBytes, req.Stream, execHdr, traceparent)
+	upResp, err := g.client.DoSciXLLM(r.Context(), "/chat/completions", payloadBytes, true, execHdr, traceparent)
 	if err != nil {
 		WriteError(w, http.StatusBadGateway, "upstream_error", "upstream_transport_error", err.Error())
 		g.recordFailure("/v1/chat/completions", "chat_completions", model.ID, req.Stream, http.StatusBadGateway, start, err.Error())
@@ -420,21 +452,45 @@ func (g *Gateway) execChatViaChatUpstream(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	rawResp, err := io.ReadAll(io.LimitReader(upResp.Body, 32*1024*1024))
-	if err != nil {
-		WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", err.Error())
-		g.recordFailure("/v1/chat/completions", "chat_completions", model.ID, false, http.StatusBadGateway, start, err.Error())
-		return
+	var parsed *ChatCompletionResponse
+	if isSSEContentType(upResp) {
+		parsed, err = AggregateChatSSE(upResp.Body, model.ID)
+		if err != nil {
+			WriteError(w, http.StatusBadGateway, "upstream_error", "stream_aggregate_error", err.Error())
+			g.recordFailure("/v1/chat/completions", "chat_completions", model.ID, false, http.StatusBadGateway, start, err.Error())
+			return
+		}
+	} else {
+		rawResp, rErr := io.ReadAll(io.LimitReader(upResp.Body, 32*1024*1024))
+		if rErr != nil {
+			WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", rErr.Error())
+			g.recordFailure("/v1/chat/completions", "chat_completions", model.ID, false, http.StatusBadGateway, start, rErr.Error())
+			return
+		}
+		var direct ChatCompletionResponse
+		if json.Unmarshal(rawResp, &direct) != nil {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(rawResp)
+			g.respDir.RecordRequest(RequestLogEntry{
+				Endpoint:    "/v1/chat/completions",
+				UpstreamAPI: "chat_completions",
+				Model:       model.ID,
+				Stream:      false,
+				Status:      http.StatusOK,
+				DurationMs:  time.Since(start).Milliseconds(),
+			})
+			return
+		}
+		parsed = &direct
 	}
-	var parsed ChatCompletionResponse
+
 	var usage UsageMetrics
-	if json.Unmarshal(rawResp, &parsed) == nil && parsed.Usage != nil {
+	if parsed != nil && parsed.Usage != nil {
 		usage = usageFromChat(parsed.Usage)
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(rawResp)
+	WriteJSON(w, http.StatusOK, parsed)
 
 	g.respDir.RecordRequest(RequestLogEntry{
 		Endpoint:         "/v1/chat/completions",
@@ -451,11 +507,34 @@ func (g *Gateway) execChatViaChatUpstream(w http.ResponseWriter, r *http.Request
 }
 
 func (g *Gateway) execChatViaResponsesUpstream(w http.ResponseWriter, r *http.Request, req *ChatCompletionRequest, model bohrium.SciXModel, traceparent string, start time.Time) {
-	payloadMap, question, err := ChatToResponsesRequest(req, model)
+	isToolCont := isChatToolContinuation(req)
+	sessionID, execHdr := g.resolveExecEnvelope(
+		r.Header.Get(bohrium.SciXExecutionHeader),
+		sessionSeedForChat(req),
+		model.ID,
+		"",
+		lastChatToolCallID(req),
+		isToolCont,
+	)
+
+	payloadMap, question, err := ChatToResponsesRequest(req, model, SciXRequestOptions{
+		SciMasterPrompt: g.sciMasterPromptEnabled(),
+		ForceStream:     true,
+		SessionID:       sessionID,
+	})
 	if err != nil {
 		WriteError(w, http.StatusBadRequest, "invalid_request_error", "invalid_request", err.Error())
 		g.recordFailure("/v1/chat/completions", "responses", model.ID, req.Stream, http.StatusBadRequest, start, err.Error())
 		return
+	}
+	if question != "" {
+		_, execHdr = g.resolveExecEnvelopeWithQuestion(
+			r.Header.Get(bohrium.SciXExecutionHeader),
+			sessionID,
+			model.ID,
+			question,
+			lastChatToolCallID(req),
+		)
 	}
 	payloadBytes, err := json.Marshal(payloadMap)
 	if err != nil {
@@ -463,14 +542,7 @@ func (g *Gateway) execChatViaResponsesUpstream(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	execHdr := g.client.BuildSciXExecutionHeader(bohrium.SciXExecOptions{
-		IncomingHeader: r.Header.Get(bohrium.SciXExecutionHeader),
-		SessionSeed:    sessionSeedForChat(req),
-		Question:       question,
-		ModelID:        model.ID,
-	})
-
-	upResp, err := g.client.DoSciXLLM(r.Context(), "/responses", payloadBytes, req.Stream, execHdr, traceparent)
+	upResp, err := g.client.DoSciXLLM(r.Context(), "/responses", payloadBytes, true, execHdr, traceparent)
 	if err != nil {
 		WriteError(w, http.StatusBadGateway, "upstream_error", "upstream_transport_error", err.Error())
 		g.recordFailure("/v1/chat/completions", "responses", model.ID, req.Stream, http.StatusBadGateway, start, err.Error())
@@ -509,16 +581,25 @@ func (g *Gateway) execChatViaResponsesUpstream(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	rawResp, err := io.ReadAll(io.LimitReader(upResp.Body, 32*1024*1024))
-	if err != nil {
-		WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", err.Error())
-		g.recordFailure("/v1/chat/completions", "responses", model.ID, false, http.StatusBadGateway, start, err.Error())
-		return
-	}
 	var respMap map[string]any
-	if err := json.Unmarshal(rawResp, &respMap); err != nil {
-		WriteError(w, http.StatusBadGateway, "upstream_error", "invalid_upstream_json", err.Error())
-		return
+	if isSSEContentType(upResp) {
+		respMap, err = AggregateResponsesSSE(upResp.Body, nil, model.ID)
+		if err != nil {
+			WriteError(w, http.StatusBadGateway, "upstream_error", "stream_aggregate_error", err.Error())
+			g.recordFailure("/v1/chat/completions", "responses", model.ID, false, http.StatusBadGateway, start, err.Error())
+			return
+		}
+	} else {
+		rawResp, rErr := io.ReadAll(io.LimitReader(upResp.Body, 32*1024*1024))
+		if rErr != nil {
+			WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", rErr.Error())
+			g.recordFailure("/v1/chat/completions", "responses", model.ID, false, http.StatusBadGateway, start, rErr.Error())
+			return
+		}
+		if err := json.Unmarshal(rawResp, &respMap); err != nil {
+			WriteError(w, http.StatusBadGateway, "upstream_error", "invalid_upstream_json", err.Error())
+			return
+		}
 	}
 	chatResp := OpenAIResponseToChatResponse(respMap, model.ID)
 	usage := usageFromChat(chatResp.Usage)
@@ -628,11 +709,35 @@ func (g *Gateway) handleCreateResponse(w http.ResponseWriter, r *http.Request) {
 }
 
 func (g *Gateway) execResponsesViaResponsesUpstream(w http.ResponseWriter, r *http.Request, req *ResponsesRequest, model bohrium.SciXModel, turnItems, allItems []map[string]any, effectiveInstr *string, shouldStore bool, traceparent string, start time.Time) {
-	payloadMap, question, err := NormalizeResponsesRequestForSciX(req, model, allItems, effectiveInstr)
+	isToolCont := isResponsesToolContinuation(turnItems)
+	toolCallID := lastResponsesToolCallID(turnItems)
+	sessionID, execHdr := g.resolveExecEnvelope(
+		r.Header.Get(bohrium.SciXExecutionHeader),
+		sessionSeedForResponses(req, g.respDir, allItems),
+		model.ID,
+		"",
+		toolCallID,
+		isToolCont,
+	)
+
+	payloadMap, question, err := NormalizeResponsesRequestForSciX(req, model, allItems, effectiveInstr, SciXRequestOptions{
+		SciMasterPrompt: g.sciMasterPromptEnabled(),
+		ForceStream:     true,
+		SessionID:       sessionID,
+	})
 	if err != nil {
 		WriteError(w, http.StatusBadRequest, "invalid_request_error", "invalid_request", err.Error())
 		g.recordFailure("/v1/responses", "responses", model.ID, req.Stream, http.StatusBadRequest, start, err.Error())
 		return
+	}
+	if question != "" {
+		_, execHdr = g.resolveExecEnvelopeWithQuestion(
+			r.Header.Get(bohrium.SciXExecutionHeader),
+			sessionID,
+			model.ID,
+			question,
+			toolCallID,
+		)
 	}
 	payloadBytes, err := json.Marshal(payloadMap)
 	if err != nil {
@@ -640,14 +745,7 @@ func (g *Gateway) execResponsesViaResponsesUpstream(w http.ResponseWriter, r *ht
 		return
 	}
 
-	execHdr := g.client.BuildSciXExecutionHeader(bohrium.SciXExecOptions{
-		IncomingHeader: r.Header.Get(bohrium.SciXExecutionHeader),
-		SessionSeed:    sessionSeedForResponses(req),
-		Question:       question,
-		ModelID:        model.ID,
-	})
-
-	upResp, err := g.client.DoSciXLLM(r.Context(), "/responses", payloadBytes, req.Stream, execHdr, traceparent)
+	upResp, err := g.client.DoSciXLLM(r.Context(), "/responses", payloadBytes, true, execHdr, traceparent)
 	if err != nil {
 		WriteError(w, http.StatusBadGateway, "upstream_error", "upstream_transport_error", err.Error())
 		g.recordFailure("/v1/responses", "responses", model.ID, req.Stream, http.StatusBadGateway, start, err.Error())
@@ -698,18 +796,27 @@ func (g *Gateway) execResponsesViaResponsesUpstream(w http.ResponseWriter, r *ht
 		return
 	}
 
-	rawResp, err := io.ReadAll(io.LimitReader(upResp.Body, 32*1024*1024))
-	if err != nil {
-		WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", err.Error())
-		g.recordFailure("/v1/responses", "responses", model.ID, false, http.StatusBadGateway, start, err.Error())
-		return
-	}
 	var respMap map[string]any
-	if err := json.Unmarshal(rawResp, &respMap); err != nil {
-		WriteError(w, http.StatusBadGateway, "upstream_error", "invalid_upstream_json", err.Error())
-		return
+	if isSSEContentType(upResp) {
+		respMap, err = AggregateResponsesSSE(upResp.Body, req, model.ID)
+		if err != nil {
+			WriteError(w, http.StatusBadGateway, "upstream_error", "stream_aggregate_error", err.Error())
+			g.recordFailure("/v1/responses", "responses", model.ID, false, http.StatusBadGateway, start, err.Error())
+			return
+		}
+	} else {
+		rawResp, rErr := io.ReadAll(io.LimitReader(upResp.Body, 32*1024*1024))
+		if rErr != nil {
+			WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", rErr.Error())
+			g.recordFailure("/v1/responses", "responses", model.ID, false, http.StatusBadGateway, start, rErr.Error())
+			return
+		}
+		if err := json.Unmarshal(rawResp, &respMap); err != nil {
+			WriteError(w, http.StatusBadGateway, "upstream_error", "invalid_upstream_json", err.Error())
+			return
+		}
+		patchClientResponseMeta(respMap, req)
 	}
-	patchClientResponseMeta(respMap, req)
 	usage := usageFromResponseMap(respMap)
 	if shouldStore {
 		if id, _ := respMap["id"].(string); id != "" {
@@ -741,11 +848,35 @@ func (g *Gateway) execResponsesViaResponsesUpstream(w http.ResponseWriter, r *ht
 }
 
 func (g *Gateway) execResponsesViaChatUpstream(w http.ResponseWriter, r *http.Request, req *ResponsesRequest, model bohrium.SciXModel, turnItems, allItems []map[string]any, effectiveInstr *string, shouldStore bool, traceparent string, start time.Time) {
-	payloadMap, question, err := ResponsesToChatRequest(req, model, allItems, effectiveInstr)
+	isToolCont := isResponsesToolContinuation(turnItems)
+	toolCallID := lastResponsesToolCallID(turnItems)
+	sessionID, execHdr := g.resolveExecEnvelope(
+		r.Header.Get(bohrium.SciXExecutionHeader),
+		sessionSeedForResponses(req, g.respDir, allItems),
+		model.ID,
+		"",
+		toolCallID,
+		isToolCont,
+	)
+
+	payloadMap, question, err := ResponsesToChatRequest(req, model, allItems, effectiveInstr, SciXRequestOptions{
+		SciMasterPrompt: g.sciMasterPromptEnabled(),
+		ForceStream:     true,
+		SessionID:       sessionID,
+	})
 	if err != nil {
 		WriteError(w, http.StatusBadRequest, "invalid_request_error", "invalid_request", err.Error())
 		g.recordFailure("/v1/responses", "chat_completions", model.ID, req.Stream, http.StatusBadRequest, start, err.Error())
 		return
+	}
+	if question != "" {
+		_, execHdr = g.resolveExecEnvelopeWithQuestion(
+			r.Header.Get(bohrium.SciXExecutionHeader),
+			sessionID,
+			model.ID,
+			question,
+			toolCallID,
+		)
 	}
 	payloadBytes, err := json.Marshal(payloadMap)
 	if err != nil {
@@ -753,14 +884,7 @@ func (g *Gateway) execResponsesViaChatUpstream(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	execHdr := g.client.BuildSciXExecutionHeader(bohrium.SciXExecOptions{
-		IncomingHeader: r.Header.Get(bohrium.SciXExecutionHeader),
-		SessionSeed:    sessionSeedForResponses(req),
-		Question:       question,
-		ModelID:        model.ID,
-	})
-
-	upResp, err := g.client.DoSciXLLM(r.Context(), "/chat/completions", payloadBytes, req.Stream, execHdr, traceparent)
+	upResp, err := g.client.DoSciXLLM(r.Context(), "/chat/completions", payloadBytes, true, execHdr, traceparent)
 	if err != nil {
 		WriteError(w, http.StatusBadGateway, "upstream_error", "upstream_transport_error", err.Error())
 		g.recordFailure("/v1/responses", "chat_completions", model.ID, req.Stream, http.StatusBadGateway, start, err.Error())
@@ -812,21 +936,32 @@ func (g *Gateway) execResponsesViaChatUpstream(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	rawResp, err := io.ReadAll(io.LimitReader(upResp.Body, 32*1024*1024))
-	if err != nil {
-		WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", err.Error())
-		g.recordFailure("/v1/responses", "chat_completions", model.ID, false, http.StatusBadGateway, start, err.Error())
-		return
-	}
-	var chatResp ChatCompletionResponse
-	if err := json.Unmarshal(rawResp, &chatResp); err != nil {
-		WriteError(w, http.StatusBadGateway, "upstream_error", "invalid_upstream_json", err.Error())
-		return
+	var chatResp *ChatCompletionResponse
+	if isSSEContentType(upResp) {
+		chatResp, err = AggregateChatSSE(upResp.Body, model.ID)
+		if err != nil {
+			WriteError(w, http.StatusBadGateway, "upstream_error", "stream_aggregate_error", err.Error())
+			g.recordFailure("/v1/responses", "chat_completions", model.ID, false, http.StatusBadGateway, start, err.Error())
+			return
+		}
+	} else {
+		rawResp, rErr := io.ReadAll(io.LimitReader(upResp.Body, 32*1024*1024))
+		if rErr != nil {
+			WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", rErr.Error())
+			g.recordFailure("/v1/responses", "chat_completions", model.ID, false, http.StatusBadGateway, start, rErr.Error())
+			return
+		}
+		var direct ChatCompletionResponse
+		if err := json.Unmarshal(rawResp, &direct); err != nil {
+			WriteError(w, http.StatusBadGateway, "upstream_error", "invalid_upstream_json", err.Error())
+			return
+		}
+		chatResp = &direct
 	}
 	if chatResp.ID != "" && !strings.HasPrefix(chatResp.ID, "resp_") {
 		respID = "resp_" + strings.ReplaceAll(chatResp.ID, "-", "")
 	}
-	openAIResp := ChatResponseToOpenAIResponse(&chatResp, req, model.ID, respID)
+	openAIResp := ChatResponseToOpenAIResponse(chatResp, req, model.ID, respID)
 	usage := usageFromChat(chatResp.Usage)
 
 	if shouldStore {
@@ -967,25 +1102,190 @@ func copyUpstreamRequestID(w http.ResponseWriter, resp *http.Response) {
 	}
 }
 
+func (g *Gateway) sciMasterPromptEnabled() bool {
+	if g.cfg == nil {
+		return true
+	}
+	return g.cfg.Get().Gateway.SciMasterPrompt
+}
+
+// resolveExecEnvelope maintains authentic Bohrium desktop-client session & run affinity:
+// - same conversation keeps stable sessionId/rootSessionId/sessionCreatedAt;
+// - new user turn starts a fresh runId/rootRunId;
+// - tool continuation turn reuses the active runId/rootRunId and attaches toolCallId.
+func (g *Gateway) resolveExecEnvelope(incomingHeader, sessionSeed, modelID, question, toolCallID string, isToolContinuation bool) (string, string) {
+	sessionID := bohrium.DeterministicSessionUUID(sessionSeed)
+
+	g.sessMu.Lock()
+	if g.sessions == nil {
+		g.sessions = make(map[string]*trackedSession)
+	}
+	now := time.Now().UTC()
+	st, exists := g.sessions[sessionID]
+	if !exists {
+		if len(g.sessions) >= maxTrackedSessions {
+			var oldestKey string
+			var oldestTime time.Time
+			for k, v := range g.sessions {
+				if oldestKey == "" || v.updatedAt.Before(oldestTime) {
+					oldestKey = k
+					oldestTime = v.updatedAt
+				}
+			}
+			if oldestKey != "" {
+				delete(g.sessions, oldestKey)
+			}
+		}
+		runID := bohrium.NewCanonicalUUID()
+		st = &trackedSession{
+			sessionID:        sessionID,
+			rootSessionID:    sessionID,
+			runID:            runID,
+			rootRunID:        runID,
+			sessionCreatedAt: now.Format("2006-01-02T15:04:05.000Z"),
+			updatedAt:        now,
+		}
+		g.sessions[sessionID] = st
+	} else {
+		if !isToolContinuation || st.runID == "" {
+			runID := bohrium.NewCanonicalUUID()
+			st.runID = runID
+			st.rootRunID = runID
+		}
+		st.updatedAt = now
+	}
+	cp := *st
+	g.sessMu.Unlock()
+
+	hdr := g.client.BuildSciXExecutionHeader(bohrium.SciXExecOptions{
+		IncomingHeader:   incomingHeader,
+		SessionID:        cp.sessionID,
+		RootSessionID:    cp.rootSessionID,
+		RunID:            cp.runID,
+		RootRunID:        cp.rootRunID,
+		SessionCreatedAt: cp.sessionCreatedAt,
+		Question:         question,
+		ToolCallID:       toolCallID,
+		ModelID:          modelID,
+	})
+	return cp.sessionID, hdr
+}
+
+func (g *Gateway) resolveExecEnvelopeWithQuestion(incomingHeader, sessionID, modelID, question, toolCallID string) (string, string) {
+	g.sessMu.Lock()
+	var cp trackedSession
+	if g.sessions != nil {
+		if st, ok := g.sessions[sessionID]; ok {
+			cp = *st
+		}
+	}
+	g.sessMu.Unlock()
+	hdr := g.client.BuildSciXExecutionHeader(bohrium.SciXExecOptions{
+		IncomingHeader:   incomingHeader,
+		SessionID:        cp.sessionID,
+		RootSessionID:    cp.rootSessionID,
+		RunID:            cp.runID,
+		RootRunID:        cp.rootRunID,
+		SessionCreatedAt: cp.sessionCreatedAt,
+		Question:         question,
+		ToolCallID:       toolCallID,
+		ModelID:          modelID,
+	})
+	return sessionID, hdr
+}
+
 func sessionSeedForChat(req *ChatCompletionRequest) string {
+	if req == nil {
+		return ""
+	}
 	if req.PromptCacheKey != "" {
 		return "pck:" + req.PromptCacheKey
 	}
 	if req.User != "" {
 		return "user:" + req.User
+	}
+	// Derive a deterministic conversation seed from the earliest user message (plus optional leading system prompt)
+	// so multi-turn follow-ups and tool-call loops stay bound to the same SciX sessionId.
+	var firstSys, firstUser string
+	for _, m := range req.Messages {
+		role := strings.ToLower(strings.TrimSpace(m.Role))
+		if (role == "system" || role == "developer") && firstSys == "" {
+			firstSys = strings.TrimSpace(flattenContentToText(m.Content))
+		}
+		if role == "user" && firstUser == "" {
+			firstUser = strings.TrimSpace(flattenContentToText(m.Content))
+			break
+		}
+	}
+	if firstUser != "" {
+		if len(firstSys) > 256 {
+			firstSys = firstSys[:256]
+		}
+		if len(firstUser) > 512 {
+			firstUser = firstUser[:512]
+		}
+		return "chat:" + firstSys + "\x00" + firstUser
 	}
 	return ""
 }
 
-func sessionSeedForResponses(req *ResponsesRequest) string {
+func sessionSeedForResponses(req *ResponsesRequest, rs *ResponseStore, allItems []map[string]any) string {
+	if req == nil {
+		return ""
+	}
 	if req.PromptCacheKey != "" {
 		return "pck:" + req.PromptCacheKey
 	}
-	if req.PreviousResponseID != "" {
-		return "prev:" + req.PreviousResponseID
+	if strings.TrimSpace(req.PreviousResponseID) != "" {
+		rootID := strings.TrimSpace(req.PreviousResponseID)
+		if rs != nil {
+			rootID = rs.RootResponseID(rootID)
+		}
+		return "resp-chain:" + rootID
 	}
 	if req.User != "" {
 		return "user:" + req.User
+	}
+	for _, it := range allItems {
+		typ, _ := it["type"].(string)
+		role, _ := it["role"].(string)
+		if (typ == "message" || typ == "") && strings.EqualFold(role, "user") {
+			txt := strings.TrimSpace(flattenContentToText(it["content"]))
+			if txt != "" {
+				if len(txt) > 512 {
+					txt = txt[:512]
+				}
+				return "resp-first:" + txt
+			}
+		}
+	}
+	return ""
+}
+
+func lastChatToolCallID(req *ChatCompletionRequest) string {
+	if req == nil || len(req.Messages) == 0 {
+		return ""
+	}
+	last := req.Messages[len(req.Messages)-1]
+	role := strings.ToLower(strings.TrimSpace(last.Role))
+	if role == "tool" || role == "function" {
+		if last.ToolCallID != "" {
+			return last.ToolCallID
+		}
+		if last.Name != "" {
+			return "call_" + last.Name
+		}
+	}
+	return ""
+}
+
+func lastResponsesToolCallID(turnItems []map[string]any) string {
+	for i := len(turnItems) - 1; i >= 0; i-- {
+		if typ, _ := turnItems[i]["type"].(string); typ == "function_call_output" {
+			if cid, _ := turnItems[i]["call_id"].(string); cid != "" {
+				return cid
+			}
+		}
 	}
 	return ""
 }

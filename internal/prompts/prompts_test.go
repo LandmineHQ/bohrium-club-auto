@@ -36,6 +36,10 @@ func TestEmbeddedCorpusAndPapers(t *testing.T) {
 	if q, err := RandomPlaygroundPrompt(); err != nil || len(q) < 6 {
 		t.Fatalf("RandomPlaygroundPrompt failed: %v %q", err, q)
 	}
+	sciPrompt := SciMasterSystemPrompt()
+	if !strings.HasPrefix(sciPrompt, "You are SciMaster,") || len(sciPrompt) < 500 {
+		t.Fatalf("expected authentic SciMaster system prompt, got len=%d prefix=%q", len(sciPrompt), sciPrompt[:min(40, len(sciPrompt))])
+	}
 
 	papers, err := Papers()
 	if err != nil {
