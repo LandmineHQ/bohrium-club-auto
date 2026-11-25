@@ -1,0 +1,51 @@
+# ---------------------------------------------------------------------------
+# Bohrium Club Auto — 预构建极简镜像（GHCR）
+#
+#   export GHCR_IMAGE=ghcr.io/<your-github-user>/bohrium-club-auto:latest
+#   docker compose -f docker-compose.ghcr.yml up -d
+#
+# 镜像由 .github/workflows/publish-docker-image.yml 手动发布。
+# ---------------------------------------------------------------------------
+
+services:
+  bohrium-club-auto:
+    image: ${GHCR_IMAGE:-ghcr.io/owner/bohrium-club-auto:latest}
+    container_name: bohrium-club-auto
+    restart: unless-stopped
+
+    ports:
+      - "${BOHRIUM_HOST_PORT:-8788}:8788"
+
+    environment:
+      BOHRIUM_HOST: "0.0.0.0"
+      BOHRIUM_PORT: "8788"
+      BOHRIUM_DATA_DIR: "/data"
+      BOHRIUM_RECON_DIR: "/data/recon/bohrium-web"
+      TZ: "Asia/Shanghai"
+      BOHRIUM_ADMIN_PASSWORD: "${BOHRIUM_ADMIN_PASSWORD:-}"
+      BOHRIUM_SCHEDULE_ENABLED: "${BOHRIUM_SCHEDULE_ENABLED:-true}"
+      BOHRIUM_SCHEDULE_TIME: "${BOHRIUM_SCHEDULE_TIME:-08:15}"
+      BOHRIUM_SCHEDULE_TZ: "${BOHRIUM_SCHEDULE_TZ:-Asia/Shanghai}"
+      BOHRIUM_USER_AGENT: "${BOHRIUM_USER_AGENT:-}"
+      BOHRIUM_PROXY: "${BOHRIUM_PROXY:-}"
+
+    volumes:
+      - bohrium-club-auto-data:/data
+
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - -O
+        - /dev/null
+        - "http://127.0.0.1:8788/healthz"
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+    stop_grace_period: 15s
+
+volumes:
+  bohrium-club-auto-data:

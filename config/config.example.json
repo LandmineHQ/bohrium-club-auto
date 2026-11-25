@@ -1,0 +1,19 @@
+{
+  "host": "0.0.0.0",
+  "port": 8788,
+  "dataDir": "data",
+  "adminPassword": "change-me-strong-password",
+  "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+  "proxyUrl": "",
+  "schedule": {
+    "enabled": true,
+    "timeHHMM": "08:15",
+    "timezone": "Asia/Shanghai",
+    "jitterMinutes": 15,
+    "autoClaim": true,
+    "autoRefresh": true
+  },
+  "taskDelaySec": 3,
+  "cancelAfterMs": 450,
+  "maxPdfSizeBytes": 26214400
+}

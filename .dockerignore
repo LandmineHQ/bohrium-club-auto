@@ -1,0 +1,14 @@
+.git
+.github
+/recon
+/data
+/dist
+/bin
+*.exe
+*.tar.gz
+*.zip
+*.log
+.env
+.env.*
+.DS_Store
+Thumbs.db

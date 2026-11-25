@@ -1,0 +1,60 @@
+name: recon-check
+
+# 手动抓取线上 Bohrium 前端静态源码并验证关键 API 契约标记（不提交 recon/ 至仓库）。
+on:
+  workflow_dispatch:
+    inputs:
+      max_assets:
+        description: "最多抓取静态资源数"
+        required: false
+        default: "120"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  recon:
+    name: Bohrium Frontend Recon Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build CLI
+        run: CGO_ENABLED=0 go build -o ./bohrium-club-auto ./cmd/bohrium-club-auto
+
+      - name: Pull live Bohrium frontend snapshot & inspect contract markers
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./bohrium-club-auto recon pull --out recon/bohrium-web --max-assets "${{ inputs.max_assets }}" --tolerant --json > recon-summary.json
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          with open("recon-summary.json", "r", encoding="utf-8") as f:
+              m = json.load(f)
+          mk = m.get("markers", {})
+          print("### Bohrium Frontend Recon Report\n")
+          print(f"- fetchedAt: `{m.get('fetchedAt')}`")
+          print(f"- assets crawled: `{len(m.get('assets', []))}` ({m.get('totalBytes', 0)} bytes)")
+          print(f"- `/api/plaza/tasks`: `{mk.get('plazaTasksEndpoint')}`")
+          print(f"- `/api/plaza/tasks/claim`: `{mk.get('plazaClaimEndpoint')}`")
+          print(f"- `X-Plaza-Daily-Task-Gateway`: `{mk.get('gatewayHeader')}`")
+          print(f"- WeChat QR login endpoint: `{mk.get('wechatQrEndpoint')}`")
+          for u in mk.get("dailyTaskBundleUrls", []):
+              print(f"- daily-task bundle: `{u}`")
+          PY
+
+      - name: Upload recon manifest artifact (non-committed)
+        uses: actions/upload-artifact@v4
+        with:
+          name: bohrium-recon-manifest
+          path: recon/bohrium-web/manifest.json
+          retention-days: 14

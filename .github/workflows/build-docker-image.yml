@@ -1,0 +1,57 @@
+name: build-docker-image
+
+# 参考 LandmineHQ/duckai-cpa：手动构建极简 Alpine 镜像，启动容器做真实 HTTP 冒烟并输出镜像大小（不推送 registry）。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-image:
+    name: Build + smoke minimal image
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build minimal image
+        run: |
+          docker build --build-arg APP_VERSION=ci-${GITHUB_SHA::7} -f Dockerfile -t bohrium-club-auto:ci .
+
+      - name: Show image size
+        run: |
+          SIZE=$(docker image inspect bohrium-club-auto:ci -f '{{.Size}}')
+          echo "image size: $((SIZE/1024/1024)) MiB uncompressed"
+          {
+            echo "### bohrium-club-auto:ci"
+            echo ""
+            echo "- uncompressed image size: $((SIZE/1024/1024)) MiB"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run container + HTTP smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name bohrium-club-auto-ci -p 8788:8788 bohrium-club-auto:ci
+          cleanup() { docker logs bohrium-club-auto-ci || true; docker rm -f bohrium-club-auto-ci || true; }
+          trap cleanup EXIT
+
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -fsS -m 3 http://127.0.0.1:8788/healthz >/dev/null 2>&1; then ok=1; break; fi
+            sleep 1
+          done
+          test "$ok" = 1
+
+          curl -fsS http://127.0.0.1:8788/healthz | grep -q '"ok":true'
+          curl -fsS http://127.0.0.1:8788/healthz | grep -q 'Chrome/'
+          curl -fsS http://127.0.0.1:8788/ | grep -q 'Bohrium Club Auto'
+
+          PW=$(docker exec bohrium-club-auto-ci cat /data/config.json | python3 -c 'import json,sys;print(json.load(sys.stdin)["adminPassword"])')
+          curl -fsS -H "X-Admin-Password: $PW" http://127.0.0.1:8788/api/overview | grep -q '"ok":true'
+          curl -fsS -H "X-Admin-Password: $PW" http://127.0.0.1:8788/api/prompts/catalog | grep -q '"paperCatalogCount":100'
+
+          echo "container smoke PASS"

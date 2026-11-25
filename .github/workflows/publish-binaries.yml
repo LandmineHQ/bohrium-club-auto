@@ -1,0 +1,216 @@
+name: publish-binaries
+
+# 参考 LandmineHQ/duckai-cpa：手动构建多平台静态单文件二进制并发布到 GitHub Release。
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag/version（如 v0.1.0）"
+        required: true
+        type: string
+      prerelease:
+        description: "标记为 pre-release"
+        required: false
+        default: false
+        type: boolean
+      draft:
+        description: "创建为 draft（发布前可人工检查）"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-binaries-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build-${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            goos: windows
+            goarch: amd64
+            dir: windows-x64
+            asset: bohrium-club-auto-windows-x64.zip
+          - name: linux-x64
+            os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            dir: linux-x64
+            asset: bohrium-club-auto-linux-x64.tar.gz
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            dir: linux-arm64
+            asset: bohrium-club-auto-linux-arm64.tar.gz
+          - name: darwin-x64
+            os: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            dir: darwin-x64
+            asset: bohrium-club-auto-darwin-x64.tar.gz
+          - name: darwin-arm64
+            os: macos-15
+            goos: darwin
+            goarch: arm64
+            dir: darwin-arm64
+            asset: bohrium-club-auto-darwin-arm64.tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Compile static binary (${{ matrix.name }})
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          mkdir -p "dist/${{ matrix.dir }}"
+          EXT=""
+          if [ "${{ matrix.goos }}" = "windows" ]; then EXT=".exe"; fi
+          go build -trimpath -ldflags="-s -w -X main.Version=${VERSION}" \
+            -o "dist/${{ matrix.dir }}/bohrium-club-auto${EXT}" ./cmd/bohrium-club-auto
+          cat > "dist/${{ matrix.dir }}/RUN-README.txt" <<'EOF'
+          Bohrium Club Auto — Quick Start
+          1. Run ./bohrium-club-auto (or bohrium-club-auto.exe on Windows).
+          2. Check the printed first-boot admin password (or set BOHRIUM_ADMIN_PASSWORD).
+          3. Open http://127.0.0.1:8788/ to scan WeChat QR and manage daily tasks.
+          EOF
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/${{ matrix.dir }}/bohrium-club-auto.exe", "dist/${{ matrix.dir }}/RUN-README.txt" `
+            -DestinationPath "${{ matrix.asset }}"
+
+      - name: Package (Linux / macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          tar -C "dist/${{ matrix.dir }}" -czf "${{ matrix.asset }}" bohrium-club-auto RUN-README.txt
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.name }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Create / update GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          merge-multiple: true
+          path: assets
+
+      - name: Validate inputs
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ ! "$VERSION" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "::error::invalid version '$VERSION'"
+            exit 1
+          fi
+          test -n "$(ls -A assets)" || { echo "::error::no assets built"; exit 1; }
+          ls -lh assets
+
+      - name: Generate release body
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}"
+          cat > release-body.md <<EOF
+          ## Downloads
+
+          Static single-file Go binaries (\`CGO_ENABLED=0\`, works on both glibc & Alpine/musl Linux).
+
+          | Platform | Download |
+          | --- | --- |
+          | Windows x64 | [bohrium-club-auto-windows-x64.zip](${BASE}/bohrium-club-auto-windows-x64.zip) |
+          | Linux x64 (static) | [bohrium-club-auto-linux-x64.tar.gz](${BASE}/bohrium-club-auto-linux-x64.tar.gz) |
+          | Linux arm64 (static) | [bohrium-club-auto-linux-arm64.tar.gz](${BASE}/bohrium-club-auto-linux-arm64.tar.gz) |
+          | macOS Intel | [bohrium-club-auto-darwin-x64.tar.gz](${BASE}/bohrium-club-auto-darwin-x64.tar.gz) |
+          | macOS Apple Silicon | [bohrium-club-auto-darwin-arm64.tar.gz](${BASE}/bohrium-club-auto-darwin-arm64.tar.gz) |
+
+          ## Quick start
+
+          - Set \`BOHRIUM_ADMIN_PASSWORD\` or read the auto-generated first-boot password from logs / \`data/config.json\`.
+          - Open \`http://127.0.0.1:8788/\` and use WeChat QR scan for remote server login.
+          - Docker is recommended for servers — see \`docker-compose.yml\` & \`docker-compose.ghcr.yml\`.
+          EOF
+
+      - name: Create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          DRAFT: ${{ inputs.draft }}
+        run: |
+          set -euxo pipefail
+          release_exists=0
+          if gh api "repos/${GH_REPO}/releases/tags/${VERSION}" >/dev/null 2>&1; then
+            release_exists=1
+          fi
+
+          if [[ "$release_exists" == "1" ]]; then
+            gh release upload "$VERSION" assets/* --clobber --repo "$GH_REPO"
+            gh release edit "$VERSION" --notes-file release-body.md --repo "$GH_REPO"
+          else
+            args=(--repo "$GH_REPO" --title "$VERSION" --notes-file release-body.md)
+            if git ls-remote --exit-code --tags origin "refs/tags/$VERSION" >/dev/null 2>&1; then
+              args+=(--verify-tag)
+            else
+              args+=(--target "$GITHUB_SHA")
+            fi
+            if [[ "$PRERELEASE" == "true" ]]; then args+=(--prerelease); fi
+            if [[ "$DRAFT" == "true" ]]; then args+=(--draft); fi
+            gh release create "$VERSION" "${args[@]}" assets/*
+          fi
+
+      - name: Summary
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          {
+            echo "### Binaries published"
+            echo ""
+            echo "- release: \`$VERSION\`"
+            echo "- page: https://github.com/${{ github.repository }}/releases/tag/$VERSION"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,22 @@
+# Local recon snapshots (comparable to duckai-cpa: never vendor upstream web bundles)
+/recon/
+
+# Runtime data at repo root only (do NOT ignore internal/prompts/data/)
+/data/
+.env
+.env.*
+
+# Build outputs
+/dist/
+/bin/
+*.exe
+/bohrium-club-auto
+*.tar.gz
+*.zip
+*.log
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

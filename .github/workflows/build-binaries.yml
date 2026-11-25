@@ -1,0 +1,140 @@
+name: build-binaries
+
+# 参考 LandmineHQ/duckai-cpa：手动构建多平台静态单文件二进制并在对应架构 runner 上做原生 HTTP 冒烟测试。
+# 注意：使用 macos-15-intel / macos-15（macos-13 / macos-14 已从 GitHub Actions 下线）。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-binaries-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build-${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            goos: windows
+            goarch: amd64
+            artifact: bohrium-club-auto-windows-x64
+            binary: dist/windows-x64/bohrium-club-auto.exe
+          - name: linux-x64
+            os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            artifact: bohrium-club-auto-linux-x64
+            binary: dist/linux-x64/bohrium-club-auto
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            artifact: bohrium-club-auto-linux-arm64
+            binary: dist/linux-arm64/bohrium-club-auto
+          - name: darwin-x64
+            os: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            artifact: bohrium-club-auto-darwin-x64
+            binary: dist/darwin-x64/bohrium-club-auto
+          - name: darwin-arm64
+            os: macos-15
+            goos: darwin
+            goarch: arm64
+            artifact: bohrium-club-auto-darwin-arm64
+            binary: dist/darwin-arm64/bohrium-club-auto
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run unit tests
+        run: go test ./...
+
+      - name: Compile static binary (${{ matrix.name }})
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p "dist/${{ matrix.name }}"
+          go build -trimpath -ldflags="-s -w -X main.Version=ci-${GITHUB_SHA::7}" \
+            -o "${{ matrix.binary }}" ./cmd/bohrium-club-auto
+          cat > "dist/${{ matrix.name }}/RUN-README.txt" <<'EOF'
+          Bohrium Club Auto — Quick Start
+          1. Run ./bohrium-club-auto (or bohrium-club-auto.exe on Windows).
+          2. Set BOHRIUM_ADMIN_PASSWORD env or check first-boot generated password in console / data/config.json.
+          3. Open http://127.0.0.1:8788/ in your browser.
+          4. Run `./bohrium-club-auto recon pull` and `./bohrium-club-auto recon diff` to track upstream frontend changes.
+          EOF
+
+      - name: Check binary (size + version)
+        shell: bash
+        run: |
+          ls -lh "${{ matrix.binary }}"
+          "${{ matrix.binary }}" version
+
+      - name: Smoke test binary (HTTP /healthz & auth)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TMPDATA=$(mktemp -d)
+          BOHRIUM_HOST=127.0.0.1 BOHRIUM_PORT=18788 BOHRIUM_DATA_DIR="$TMPDATA" BOHRIUM_ADMIN_PASSWORD="ci-smoke-password" \
+            "${{ matrix.binary }}" serve &
+          PID=$!
+          trap 'kill $PID 2>/dev/null || true; rm -rf "$TMPDATA"' EXIT
+
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -fsS -m 2 http://127.0.0.1:18788/healthz >/dev/null 2>&1; then ok=1; break; fi
+            sleep 1
+          done
+          test "$ok" = 1
+
+          curl -fsS http://127.0.0.1:18788/healthz | grep -q '"ok":true'
+          curl -fsS http://127.0.0.1:18788/healthz | grep -q 'Chrome/'
+          curl -fsS http://127.0.0.1:18788/ | grep -q 'Bohrium Club Auto'
+          # Protected API must reject unauthenticated call with 401
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18788/api/settings)
+          test "$CODE" = "401"
+          # Authenticated call via X-Admin-Password must succeed
+          curl -fsS -H "X-Admin-Password: ci-smoke-password" http://127.0.0.1:18788/api/settings | grep -q '"ok":true'
+          echo "Native binary smoke PASS"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.binary }}
+            dist/${{ matrix.name }}/RUN-README.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Build summary
+        shell: bash
+        run: |
+          {
+            echo "### Binary: ${{ matrix.name }}"
+            echo ""
+            echo "- commit: \`${GITHUB_SHA}\`"
+            echo "- artifact: \`${{ matrix.artifact }}\`"
+            echo "- binary: \`${{ matrix.binary }}\`"
+            echo "- size: $(du -h "${{ matrix.binary }}" | cut -f1)"
+            echo "- runtime smoke: PASS"
+          } >> "$GITHUB_STEP_SUMMARY"

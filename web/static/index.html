@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bohrium Club Auto · 玻尔社区每日任务控制台</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <!-- Toast Container -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <!-- Admin Login Gate -->
+  <div id="login-gate" class="login-gate hidden">
+    <div class="login-card">
+      <div class="brand-badge">BOHRIUM AUTO</div>
+      <h1>玻尔社区自动化控制台</h1>
+      <p class="muted">请输入管理员密码解锁仪表盘与任务操作</p>
+      <form id="admin-login-form">
+        <div class="field">
+          <label for="admin-password-input">管理员密码</label>
+          <input id="admin-password-input" type="password" placeholder="输入 BOHRIUM_ADMIN_PASSWORD 或首次启动生成的密码" autocomplete="current-password" required />
+        </div>
+        <div id="admin-login-error" class="error-banner hidden"></div>
+        <button type="submit" id="admin-login-btn" class="btn btn-primary btn-block">登录控制台</button>
+      </form>
+      <div class="login-hint">
+        首次启动密码可在容器日志 <code>docker compose logs</code> 或 <code>data/config.json</code> 中查看。
+      </div>
+    </div>
+  </div>
+
+  <!-- Main Dashboard Shell -->
+  <div id="app-shell" class="app-shell hidden">
+    <header class="topbar">
+      <div class="topbar-left">
+        <div class="logo-dot"></div>
+        <div>
+          <div class="topbar-title">Bohrium Club Auto <span id="app-version" class="version-pill">dev</span></div>
+          <div class="topbar-sub">玻尔用户社区 · 每日任务自动化与积分容量监控</div>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <div id="bohrium-account-pill" class="account-pill offline">
+          <span class="status-dot"></span>
+          <span id="bohrium-account-text">未登录玻尔账号</span>
+        </div>
+        <button id="btn-open-login" class="btn btn-primary btn-sm">远程登录玻尔</button>
+        <button id="btn-refresh-token" class="btn btn-ghost btn-sm hidden" title="调用 refresh_token 延长登录有效期">续期 Token</button>
+        <button id="btn-refresh-all" class="btn btn-ghost btn-sm">刷新数据</button>
+        <button id="btn-admin-logout" class="btn btn-ghost btn-sm">退出管理</button>
+      </div>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab active" data-tab="overview">总览与每日任务</button>
+      <button class="tab" data-tab="assets">积分明细与容量</button>
+      <button class="tab" data-tab="logs">执行日志</button>
+      <button class="tab" data-tab="recon">前端 Recon 监控</button>
+      <button class="tab" data-tab="settings">定时与系统设置</button>
+    </nav>
+
+    <main class="container">
+      <!-- Warning Banner when Bohrium is not logged in -->
+      <div id="not-logged-in-banner" class="alert-banner hidden">
+        <div>
+          <strong>尚未绑定玻尔账号：</strong>请点击右侧「远程登录玻尔」，直接在服务器端使用微信扫码或导入 <code>brmToken</code> 完成远程登录。
+        </div>
+        <button id="btn-banner-login" class="btn btn-primary btn-sm">立即扫码登录</button>
+      </div>
+
+      <!-- TAB 1: OVERVIEW & DAILY TASKS -->
+      <section id="tab-overview" class="tab-panel active">
+        <!-- KPI Cards -->
+        <div class="kpi-grid">
+          <div class="card kpi-card">
+            <div class="kpi-label">剩余光子积分</div>
+            <div id="kpi-photons" class="kpi-value">--</div>
+            <div id="kpi-photons-sub" class="kpi-sub">组织额度 -- · 钱包 --</div>
+          </div>
+          <div class="card kpi-card">
+            <div class="kpi-label">知识库剩余存储容量</div>
+            <div id="kpi-storage" class="kpi-value">--</div>
+            <div class="progress-track"><div id="kpi-storage-bar" class="progress-fill" style="width:0%"></div></div>
+            <div id="kpi-storage-sub" class="kpi-sub">已用 -- / 总计 --</div>
+          </div>
+          <div class="card kpi-card">
+            <div class="kpi-label">会员等级与功能配额</div>
+            <div id="kpi-membership" class="kpi-value">--</div>
+            <div id="kpi-membership-sub" class="kpi-sub">文献 -- · 知识库对话 -- · 深度研究 --</div>
+          </div>
+          <div class="card kpi-card">
+            <div class="kpi-label">今日 Web 任务进度</div>
+            <div id="kpi-tasks" class="kpi-value">--</div>
+            <div id="kpi-tasks-sub" class="kpi-sub">下次定时：--</div>
+          </div>
+        </div>
+
+        <!-- Daily Tasks Panel -->
+        <div class="card section-card">
+          <div class="section-header">
+            <div>
+              <h2>每日任务面板 <span id="task-date-badge" class="pill pill-muted">--</span></h2>
+              <p class="muted small">第 2 项客户端任务自动跳过；其余 3 项 Web 任务随机抽取内置科研题库/100 篇 arXiv 文献发起真实 API 提问并在提交后立即终止请求。</p>
+            </div>
+            <div class="action-group">
+              <button id="btn-claim-all" class="btn btn-secondary">一键领取每日任务</button>
+              <button id="btn-run-all" class="btn btn-primary">一键执行全部 Web 任务</button>
+            </div>
+          </div>
+
+          <div id="tasks-error" class="error-banner hidden"></div>
+          <div id="tasks-grid" class="tasks-grid">
+            <div class="empty-state">加载中...</div>
+          </div>
+        </div>
+
+        <!-- Corpus & Runtime Footer Cards -->
+        <div class="two-col">
+          <div class="card section-card">
+            <h3>内置随机题库与 100 篇文献池</h3>
+            <div id="corpus-stats" class="stat-list">
+              <div class="stat-row"><span>科学空间 Web 题库</span><strong id="stat-scispace">--</strong></div>
+              <div class="stat-row"><span>学术写作题库</span><strong id="stat-writing">--</strong></div>
+              <div class="stat-row"><span>文献阅读提问库</span><strong id="stat-reading">--</strong></div>
+              <div class="stat-row"><span>预收录 arXiv 文献目录</span><strong id="stat-papers">--</strong></div>
+              <div class="stat-row"><span>本地已缓存 / 自定义 PDF</span><strong id="stat-pdf-cache">--</strong></div>
+            </div>
+          </div>
+          <div class="card section-card">
+            <h3>出口浏览器指纹与运行状态</h3>
+            <div class="stat-list">
+              <div class="stat-row"><span>调度状态</span><strong id="stat-sched-state">--</strong></div>
+              <div class="stat-row"><span>上次定时完成</span><strong id="stat-last-day">--</strong></div>
+              <div class="stat-row"><span>旧版 200 光子签到</span><strong class="text-ok">已彻底禁用（遵循规范）</strong></div>
+              <div class="stat-row ua-row"><span>Chrome User-Agent</span><code id="stat-ua" class="ua-code">--</code></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 2: ASSETS & CAPACITY DETAILS -->
+      <section id="tab-assets" class="tab-panel">
+        <div class="card section-card">
+          <div class="section-header">
+            <div>
+              <h2>积分、配额与存储容量详情</h2>
+              <p class="muted small">覆盖光子余额、7 日即将过期批次、近期流水、会员权益配额及文献知识库存储空间。</p>
+            </div>
+            <button id="btn-refresh-assets" class="btn btn-ghost btn-sm">刷新资产数据</button>
+          </div>
+          <div id="assets-warnings" class="warn-banner hidden"></div>
+
+          <div class="quota-cards" id="quota-detail-grid"></div>
+        </div>
+
+        <div class="two-col">
+          <div class="card section-card">
+            <h3>即将过期光子批次</h3>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>剩余光子</th><th>来源</th><th>获取时间</th><th>过期时间</th></tr></thead>
+                <tbody id="expiring-lots-body"><tr><td colspan="4" class="empty-cell">暂无数据</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card section-card">
+            <h3>近期光子收支流水</h3>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>变动</th><th>说明</th><th>时间</th></tr></thead>
+                <tbody id="integral-history-body"><tr><td colspan="3" class="empty-cell">暂无数据</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 3: EXECUTION LOGS -->
+      <section id="tab-logs" class="tab-panel">
+        <div class="card section-card">
+          <div class="section-header">
+            <div>
+              <h2>执行与操作日志</h2>
+              <p class="muted small">记录最近 200 条任务领取、Web 任务提问+立即取消、Token 续期及 Recon 检查结果。</p>
+            </div>
+            <button id="btn-refresh-logs" class="btn btn-ghost btn-sm">刷新日志</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>触发方式</th>
+                  <th>动作 / 任务</th>
+                  <th>状态</th>
+                  <th>耗时</th>
+                  <th>详情</th>
+                </tr>
+              </thead>
+              <tbody id="logs-body"><tr><td colspan="6" class="empty-cell">暂无日志</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 4: RECON UPDATE CHECKER -->
+      <section id="tab-recon" class="tab-panel">
+        <div class="card section-card">
+          <div class="section-header">
+            <div>
+              <h2>前端 Recon 快照与变更查询</h2>
+              <p class="muted small">参考 <code>LandmineHQ/duckai-cpa</code> 设计：在本地 <code>recon/</code>（已 gitignore）建立基线，对比线上 Bohrium 前端静态资源 SHA-256 与关键 API 契约标记。</p>
+            </div>
+            <div class="action-group">
+              <button id="btn-recon-pull" class="btn btn-secondary">拉取 / 更新基线 (Pull)</button>
+              <button id="btn-recon-diff" class="btn btn-primary">检测线上更新 (Diff)</button>
+            </div>
+          </div>
+
+          <div id="recon-status-box" class="recon-box">加载基线状态...</div>
+          <div id="recon-diff-result" class="recon-diff hidden"></div>
+        </div>
+      </section>
+
+      <!-- TAB 5: SETTINGS -->
+      <section id="tab-settings" class="tab-panel">
+        <div class="card section-card">
+          <h2>定时任务与系统配置</h2>
+          <form id="settings-form" class="settings-grid">
+            <div class="field checkbox-field">
+              <label><input type="checkbox" id="set-sched-enabled" /> 启用每日定时自动执行（3 项 Web 任务）</label>
+            </div>
+            <div class="field checkbox-field">
+              <label><input type="checkbox" id="set-auto-claim" /> 执行前自动一键领取未领取任务</label>
+            </div>
+            <div class="field checkbox-field">
+              <label><input type="checkbox" id="set-auto-refresh" /> 后台自动续期 brmToken（防止远程登录过期）</label>
+            </div>
+
+            <div class="field">
+              <label for="set-time">每日执行时间 (HH:MM)</label>
+              <input id="set-time" type="text" placeholder="08:15" />
+            </div>
+            <div class="field">
+              <label for="set-tz">时区</label>
+              <input id="set-tz" type="text" placeholder="Asia/Shanghai" />
+            </div>
+            <div class="field">
+              <label for="set-jitter">随机延迟抖动（分钟，0-120）</label>
+              <input id="set-jitter" type="number" min="0" max="120" />
+            </div>
+            <div class="field">
+              <label for="set-task-delay">任务间间隔（秒）</label>
+              <input id="set-task-delay" type="number" min="0" max="60" />
+            </div>
+            <div class="field">
+              <label for="set-cancel-ms">提问提交后等待取消延迟（毫秒）</label>
+              <input id="set-cancel-ms" type="number" min="100" max="10000" />
+            </div>
+            <div class="field full-width">
+              <label for="set-ua">出口 Chrome User-Agent（修改后重启生效）</label>
+              <input id="set-ua" type="text" />
+            </div>
+            <div class="field full-width">
+              <label for="set-proxy">出站代理 URL（可选，例如 http://127.0.0.1:7890，修改后重启生效）</label>
+              <input id="set-proxy" type="text" placeholder="留空则直连" />
+            </div>
+            <div class="field full-width">
+              <label for="set-new-pw">修改控制台管理员密码（留空则不修改）</label>
+              <input id="set-new-pw" type="password" placeholder="至少 6 位字符" autocomplete="new-password" />
+            </div>
+
+            <div class="full-width settings-actions">
+              <button type="submit" id="btn-save-settings" class="btn btn-primary">保存配置</button>
+              <button type="button" id="btn-bohrium-logout" class="btn btn-danger">清除玻尔登录凭据</button>
+            </div>
+          </form>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Remote Bohrium Login Modal -->
+  <div id="login-modal" class="modal hidden">
+    <div class="modal-backdrop" data-close-modal="true"></div>
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <h3>远程登录玻尔账号</h3>
+        <button class="icon-btn" data-close-modal="true">&times;</button>
+      </div>
+      <div class="modal-tabs">
+        <button class="modal-tab active" data-mtab="wechat">微信扫码（推荐）</button>
+        <button class="modal-tab" data-mtab="token">导入 brmToken</button>
+        <button class="modal-tab" data-mtab="password">账号密码</button>
+      </div>
+
+      <!-- WeChat QR Tab -->
+      <div id="mtab-wechat" class="mtab-panel active">
+        <p class="muted small">服务端直接向 <code>platform.bohrium.com</code> 申请官方微信登录二维码，无图形验证码，适合部署在 Linux / Docker 服务器远程扫码。</p>
+        <div class="qr-stage">
+          <img id="wechat-qr-img" class="qr-img hidden" alt="微信扫码登录二维码" />
+          <div id="wechat-qr-placeholder" class="qr-placeholder">点击下方按钮获取登录二维码</div>
+        </div>
+        <div id="wechat-qr-status" class="qr-status">等待发起扫码</div>
+        <div class="modal-actions">
+          <button id="btn-gen-qr" class="btn btn-primary">获取 / 刷新二维码</button>
+        </div>
+      </div>
+
+      <!-- Manual Token Tab -->
+      <div id="mtab-token" class="mtab-panel">
+        <p class="muted small">在已登录 <code>club.bohrium.com</code> 或 <code>www.bohrium.com</code> 的浏览器中，复制 Cookie 里的 <code>brmToken</code> 值粘贴到下方即可。</p>
+        <div class="field">
+          <label for="import-token-input">brmToken JWT（支持直接粘贴整段 Cookie）</label>
+          <textarea id="import-token-input" rows="4" placeholder="eyJhbGciOi..."></textarea>
+        </div>
+        <div class="modal-actions">
+          <button id="btn-import-token" class="btn btn-primary">验证并保存 Token</button>
+        </div>
+      </div>
+
+      <!-- Password Tab -->
+      <div id="mtab-password" class="mtab-panel">
+        <p class="muted small">仅当目标账号无需腾讯图形验证码时可用；如触发图形验证码，请切换至「微信扫码」。</p>
+        <div class="field">
+          <label for="pw-account">手机号 / 邮箱</label>
+          <input id="pw-account" type="text" placeholder="手机号或邮箱" />
+        </div>
+        <div class="field">
+          <label for="pw-secret">密码</label>
+          <input id="pw-secret" type="password" placeholder="玻尔账号密码" />
+        </div>
+        <div class="modal-actions">
+          <button id="btn-pw-login" class="btn btn-primary">尝试密码登录</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

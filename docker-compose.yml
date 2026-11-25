@@ -1,0 +1,58 @@
+# ---------------------------------------------------------------------------
+# Bohrium Club Auto — 本地构建部署（Alpine + 静态 Go 单文件二进制）
+#
+#   docker compose up -d --build
+#   docker compose logs -f bohrium-club-auto   # 首次启动若未设密码会打印随机管理员密码
+#   # 浏览器访问 http://127.0.0.1:8788/
+# ---------------------------------------------------------------------------
+
+services:
+  bohrium-club-auto:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_VERSION: ${BOHRIUM_VERSION:-0.1.0}
+    image: bohrium-club-auto:${BOHRIUM_VERSION:-latest}
+    container_name: bohrium-club-auto
+    restart: unless-stopped
+
+    ports:
+      - "${BOHRIUM_HOST_PORT:-8788}:8788"
+
+    environment:
+      BOHRIUM_HOST: "0.0.0.0"
+      BOHRIUM_PORT: "8788"
+      BOHRIUM_DATA_DIR: "/data"
+      BOHRIUM_RECON_DIR: "/data/recon/bohrium-web"
+      TZ: "Asia/Shanghai"
+      # 强烈建议设置为强密码；留空则首次启动自动生成并写入 /data/config.json
+      BOHRIUM_ADMIN_PASSWORD: "${BOHRIUM_ADMIN_PASSWORD:-}"
+      # 定时配置（默认每日北京时间 08:15 + 随机抖动）
+      BOHRIUM_SCHEDULE_ENABLED: "${BOHRIUM_SCHEDULE_ENABLED:-true}"
+      BOHRIUM_SCHEDULE_TIME: "${BOHRIUM_SCHEDULE_TIME:-08:15}"
+      BOHRIUM_SCHEDULE_TZ: "${BOHRIUM_SCHEDULE_TZ:-Asia/Shanghai}"
+      # 可选：自定义 Chrome User-Agent 或出站代理
+      BOHRIUM_USER_AGENT: "${BOHRIUM_USER_AGENT:-}"
+      BOHRIUM_PROXY: "${BOHRIUM_PROXY:-}"
+
+    volumes:
+      - bohrium-club-auto-data:/data
+
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - -O
+        - /dev/null
+        - "http://127.0.0.1:8788/healthz"
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+    stop_grace_period: 15s
+
+volumes:
+  bohrium-club-auto-data:

@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-vet:
+    name: Go vet, test (-race) & build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Go test (-race)
+        run: go test -race -v ./...
+
+      - name: Build static binary
+        run: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.Version=ci-${GITHUB_SHA::7}" -o dist/bohrium-club-auto ./cmd/bohrium-club-auto
