@@ -210,8 +210,8 @@ func (c *Client) claimTasks(ctx context.Context, taskKey, trigger string) (*Clai
 	}, nil
 }
 
-// classifyTask maps an upstream plaza daily task to its Web automation handler,
-// explicitly marking the Desktop Client task (Task #2) as skipped.
+// classifyTask maps an upstream plaza daily task to its automation handler
+// (including Task #2 Desktop Client via authentic Bohrium SciX /scix/llm protocol).
 func classifyTask(t DailyTask) DailyTask {
 	switch t.Status {
 	case -1:
@@ -227,16 +227,15 @@ func classifyTask(t DailyTask) DailyTask {
 	keyLower := strings.ToLower(t.TaskKey)
 	titleLower := strings.ToLower(t.TitleZh + " " + t.TitleEn)
 
-	// Rule 1: Strictly skip Desktop Client task (Task #2: 体验玻尔科学空间「客户端」).
+	// Rule 1: Desktop Client task (Task #2: 体验玻尔科学空间「客户端」) — executed via native SciX desktop protocol.
 	if strings.Contains(keyLower, "client") ||
 		strings.Contains(keyLower, "desktop") ||
 		strings.Contains(t.TitleZh, "客户端") ||
 		strings.Contains(titleLower, "desktop") ||
 		strings.Contains(titleLower, "client") {
-		t.ActionKey = TaskKeyClientSkipped
-		t.Skipped = true
-		t.Executable = false
-		t.SkipReason = "客户端任务（已按配置自动跳过）"
+		t.ActionKey = TaskKeyScienceSpaceClient
+		t.Skipped = false
+		t.Executable = true
 		t.TargetURL = "scix://"
 		return t
 	}
@@ -283,8 +282,8 @@ func classifyTask(t DailyTask) DailyTask {
 	return t
 }
 
-// IsClientSkippedTask reports whether a taskKey or actionKey corresponds to the skipped desktop client task.
-func IsClientSkippedTask(key string) bool {
+// IsClientTask reports whether a taskKey or actionKey corresponds to Task #2 (Desktop Client).
+func IsClientTask(key string) bool {
 	k := strings.ToLower(strings.TrimSpace(key))
-	return k == TaskKeyClientSkipped || strings.Contains(k, "client") || strings.Contains(k, "desktop")
+	return k == TaskKeyScienceSpaceClient || strings.Contains(k, "client") || strings.Contains(k, "desktop")
 }

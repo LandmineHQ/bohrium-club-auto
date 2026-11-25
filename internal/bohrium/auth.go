@@ -571,41 +571,16 @@ func (c *Client) CompleteLogin(ctx context.Context, rawToken, method string) (*s
 		LoginMethod:   method,
 	}
 
-	// Fetch account profile from www.bohrium.com
-	if infoResp, err := c.http.DoJSON(ctx, http.MethodGet, c.endpoints.WWWBase+"/bohrapi/v1/account/info", nil, c.wwwHeaders(token, "")); err == nil && infoResp.StatusCode == http.StatusOK {
-		var body map[string]any
-		if json.Unmarshal(infoResp.Body, &body) == nil && int(asInt64(body["code"])) == 0 {
-			if data := asMap(body["data"]); data != nil {
-				if uid := asInt64(data["user_id"]); uid > 0 && auth.UserID == 0 {
-					auth.UserID = uid
-				}
-				if uid := asInt64(data["userId"]); uid > 0 && auth.UserID == 0 {
-					auth.UserID = uid
-				}
-				if oid := asInt64(data["org_id"]); oid > 0 && auth.OrgID == 0 {
-					auth.OrgID = oid
-				}
-				if oid := asInt64(data["orgId"]); oid > 0 && auth.OrgID == 0 {
-					auth.OrgID = oid
-				}
-				if n := asString(data["name"]); n != "" {
-					auth.Nickname = n
-				} else if n := asString(data["nickname"]); n != "" {
-					auth.Nickname = n
-				}
-				auth.Phone = asString(data["phone"])
-				auth.Email = asString(data["email"])
-				auth.Avatar = asString(data["avatar"])
-			}
-		}
-	}
+	// Fetch account profile from www.bohrium.com (/bohrapi/v1/account/info)
+	_, explicitNick, _ := c.fetchAccountProfile(ctx, token, &auth)
 
 	// Check club.bohrium.com session & auto-enroll binding if logged in but not yet bound.
-	clubLoggedIn, clubBound, clubNick, err := c.checkClubSession(ctx, token)
+	clubInfo, err := c.checkClubSession(ctx, token)
+	clubLoggedIn := false
 	if err == nil {
-		if clubNick != "" && auth.Nickname == "" {
-			auth.Nickname = clubNick
-		}
+		clubLoggedIn = clubInfo.LoggedIn
+		applyClubSessionProfile(&auth, clubInfo, explicitNick)
+		clubBound := clubInfo.Bound
 		if clubLoggedIn && !clubBound {
 			if enrollErr := c.enrollClub(ctx, token); enrollErr == nil {
 				clubBound = true
@@ -685,6 +660,9 @@ func (c *Client) RefreshToken(ctx context.Context, trigger string) (*store.AuthS
 		auth.ExpiresAt = claims.ExpiresAt
 	}
 	auth.LastRefreshAt = time.Now().UTC()
+	if auth.Nickname == "" {
+		_, _, _ = c.fetchAccountProfile(ctx, newToken, &auth)
+	}
 
 	if err := c.store.SetAuth(auth); err != nil {
 		return nil, err
@@ -699,7 +677,34 @@ func (c *Client) RefreshToken(ctx context.Context, trigger string) (*store.AuthS
 	return &auth, nil
 }
 
-// CheckSession checks whether the currently persisted token is valid on club.bohrium.com.
+// SyncProfile refreshes the persisted account profile (nickname, avatar, email, phone) from Bohrium upstream APIs.
+func (c *Client) SyncProfile(ctx context.Context) (*store.AuthState, bool, error) {
+	auth := c.store.GetAuth()
+	if auth.Token == "" {
+		return nil, false, fmt.Errorf("尚未登录 Bohrium 账号")
+	}
+	ok, explicitNick, changed := c.fetchAccountProfile(ctx, auth.Token, &auth)
+	if !ok || auth.Nickname == "" || !explicitNick {
+		if clubInfo, err := c.checkClubSession(ctx, auth.Token); err == nil && clubInfo.LoggedIn {
+			if applyClubSessionProfile(&auth, clubInfo, explicitNick) {
+				changed = true
+			}
+			if clubInfo.Bound && !auth.ClubBound {
+				auth.ClubBound = true
+				changed = true
+			}
+		}
+	}
+	if changed {
+		if err := c.store.SetAuth(auth); err != nil {
+			return &auth, false, err
+		}
+	}
+	return &auth, changed, nil
+}
+
+// CheckSession checks whether the currently persisted token is valid on club.bohrium.com
+// and automatically backfills missing profile fields (such as nickname) from Bohrium APIs.
 func (c *Client) CheckSession(ctx context.Context) SessionStatus {
 	auth := c.store.GetAuth()
 	st := SessionStatus{
@@ -712,23 +717,40 @@ func (c *Client) CheckSession(ctx context.Context) SessionStatus {
 	if auth.Token == "" {
 		return st
 	}
-	loggedIn, bound, nick, err := c.checkClubSession(ctx, auth.Token)
+	clubInfo, err := c.checkClubSession(ctx, auth.Token)
 	if err != nil {
 		st.Error = err.Error()
 		return st
 	}
-	st.ClubLoggedIn = loggedIn
-	st.ClubBound = bound
-	st.Valid = loggedIn
-	if loggedIn && !bound {
+	st.ClubLoggedIn = clubInfo.LoggedIn
+	st.ClubBound = clubInfo.Bound
+	st.Valid = clubInfo.LoggedIn
+
+	dirty := false
+	if clubInfo.LoggedIn && !clubInfo.Bound {
 		if c.enrollClub(ctx, auth.Token) == nil {
 			st.ClubBound = true
 			auth.ClubBound = true
-			_ = c.store.SetAuth(auth)
+			dirty = true
+		}
+	} else if clubInfo.Bound && !auth.ClubBound {
+		auth.ClubBound = true
+		dirty = true
+	}
+
+	explicitNick := false
+	if clubInfo.LoggedIn && (strings.TrimSpace(auth.Nickname) == "" || (auth.Email == "" && auth.Phone == "")) {
+		if _, exp, changed := c.fetchAccountProfile(ctx, auth.Token, &auth); changed {
+			dirty = true
+			explicitNick = exp
+		} else {
+			explicitNick = exp
 		}
 	}
-	if nick != "" && auth.Nickname != nick {
-		auth.Nickname = nick
+	if clubInfo.LoggedIn && applyClubSessionProfile(&auth, clubInfo, explicitNick) {
+		dirty = true
+	}
+	if dirty {
 		_ = c.store.SetAuth(auth)
 		st.Auth = redactedAuth(auth)
 	}
@@ -750,27 +772,181 @@ func redactedAuth(a store.AuthState) store.AuthState {
 	return out
 }
 
-func (c *Client) checkClubSession(ctx context.Context, token string) (loggedIn bool, bound bool, nickname string, err error) {
+type clubSessionInfo struct {
+	LoggedIn     bool
+	Bound        bool
+	ExplicitNick string // binding.nickname (custom Club nickname, nullable upstream)
+	FallbackName string // binding.name / binding.platform_username / profile.name / profile.username
+	Email        string
+	Phone        string
+}
+
+func (ci clubSessionInfo) bestNickname() string {
+	if s := strings.TrimSpace(ci.ExplicitNick); s != "" {
+		return s
+	}
+	return strings.TrimSpace(ci.FallbackName)
+}
+
+func firstNonEmptyString(vals ...string) string {
+	for _, v := range vals {
+		if s := strings.TrimSpace(v); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// applyAccountInfo maps /bohrapi/v1/account/info's real Bohrium response schema onto auth.
+// Bohrium returns nested extend.nickName (custom display name), userName (primary username, e.g. "bohr68859c"),
+// weChatNickname, userNameEn, userExtId, and avatarUrl (not top-level name/nickname/avatar).
+func applyAccountInfo(auth *store.AuthState, data map[string]any) (explicitNick bool, changed bool) {
+	if auth == nil || data == nil {
+		return false, false
+	}
+	if uid := asInt64(data["user_id"]); uid > 0 && auth.UserID == 0 {
+		auth.UserID = uid
+		changed = true
+	}
+	if uid := asInt64(data["userId"]); uid > 0 && auth.UserID == 0 {
+		auth.UserID = uid
+		changed = true
+	}
+	if oid := asInt64(data["org_id"]); oid > 0 && auth.OrgID == 0 {
+		auth.OrgID = oid
+		changed = true
+	}
+	if oid := asInt64(data["orgId"]); oid > 0 && auth.OrgID == 0 {
+		auth.OrgID = oid
+		changed = true
+	}
+
+	ext := asMap(data["extend"])
+	nick := ""
+	if ext != nil {
+		nick = firstNonEmptyString(asString(ext["nickName"]), asString(ext["nickname"]))
+	}
+	if nick == "" {
+		nick = firstNonEmptyString(asString(data["nickName"]), asString(data["nickname"]))
+	}
+	if nick != "" {
+		explicitNick = true
+	} else {
+		nick = firstNonEmptyString(
+			asString(data["userName"]),
+			asString(data["name"]),
+			asString(data["weChatNickname"]),
+			asString(data["userNameEn"]),
+			asString(data["userExtId"]),
+		)
+	}
+	if nick != "" && auth.Nickname != nick {
+		auth.Nickname = nick
+		changed = true
+	}
+	if phone := strings.TrimSpace(asString(data["phone"])); phone != "" && auth.Phone != phone {
+		auth.Phone = phone
+		changed = true
+	}
+	if email := strings.TrimSpace(asString(data["email"])); email != "" && auth.Email != email {
+		auth.Email = email
+		changed = true
+	}
+	if avatar := firstNonEmptyString(asString(data["avatarUrl"]), asString(data["avatar"])); avatar != "" && auth.Avatar != avatar {
+		auth.Avatar = avatar
+		changed = true
+	}
+	return explicitNick, changed
+}
+
+func applyClubSessionProfile(auth *store.AuthState, clubInfo clubSessionInfo, hasExplicitBohriumNick bool) bool {
+	if auth == nil {
+		return false
+	}
+	changed := false
+	if !hasExplicitBohriumNick && strings.TrimSpace(clubInfo.ExplicitNick) != "" && auth.Nickname != strings.TrimSpace(clubInfo.ExplicitNick) {
+		auth.Nickname = strings.TrimSpace(clubInfo.ExplicitNick)
+		changed = true
+	} else if strings.TrimSpace(auth.Nickname) == "" {
+		if n := clubInfo.bestNickname(); n != "" {
+			auth.Nickname = n
+			changed = true
+		}
+	}
+	if auth.Email == "" && strings.TrimSpace(clubInfo.Email) != "" {
+		auth.Email = strings.TrimSpace(clubInfo.Email)
+		changed = true
+	}
+	if auth.Phone == "" && strings.TrimSpace(clubInfo.Phone) != "" {
+		auth.Phone = strings.TrimSpace(clubInfo.Phone)
+		changed = true
+	}
+	return changed
+}
+
+func (c *Client) fetchAccountProfile(ctx context.Context, token string, auth *store.AuthState) (ok bool, explicitNick bool, changed bool) {
+	infoResp, err := c.http.DoJSON(ctx, http.MethodGet, c.endpoints.WWWBase+"/bohrapi/v1/account/info", nil, c.wwwHeaders(token, ""))
+	if err != nil || infoResp.StatusCode != http.StatusOK {
+		return false, false, false
+	}
+	var body map[string]any
+	if json.Unmarshal(infoResp.Body, &body) != nil || int(asInt64(body["code"])) != 0 {
+		return false, false, false
+	}
+	data := asMap(body["data"])
+	if data == nil {
+		return false, false, false
+	}
+	exp, ch := applyAccountInfo(auth, data)
+	return true, exp, ch
+}
+
+func (c *Client) checkClubSession(ctx context.Context, token string) (clubSessionInfo, error) {
+	var info clubSessionInfo
 	resp, err := c.http.DoJSON(ctx, http.MethodGet, c.endpoints.ClubBase+"/api/platform/session", nil, c.clubHeaders(token))
 	if err != nil {
-		return false, false, "", err
+		return info, err
 	}
 	if resp.StatusCode == http.StatusUnauthorized {
-		return false, false, "", nil
+		return info, nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		return false, false, "", fmt.Errorf("club session HTTP %d", resp.StatusCode)
+		return info, fmt.Errorf("club session HTTP %d", resp.StatusCode)
 	}
 	var parsed map[string]any
 	if err := json.Unmarshal(resp.Body, &parsed); err != nil {
-		return false, false, "", err
+		return info, err
 	}
-	loggedIn = asBool(parsed["logged_in"])
-	if binding := asMap(parsed["binding"]); binding != nil && len(binding) > 0 {
-		bound = true
-		nickname = asString(binding["nickname"])
+	info.LoggedIn = asBool(parsed["logged_in"])
+	binding := asMap(parsed["binding"])
+	profile := asMap(parsed["profile"])
+	if binding != nil && len(binding) > 0 {
+		info.Bound = true
+		info.ExplicitNick = strings.TrimSpace(asString(binding["nickname"]))
+		info.FallbackName = firstNonEmptyString(
+			asString(binding["name"]),
+			asString(binding["platform_username"]),
+		)
+		info.Phone = strings.TrimSpace(asString(binding["bohr_phone"]))
 	}
-	return loggedIn, bound, nickname, nil
+	if profile != nil {
+		if info.ExplicitNick == "" {
+			info.ExplicitNick = strings.TrimSpace(asString(profile["nickname"]))
+		}
+		if info.FallbackName == "" {
+			info.FallbackName = firstNonEmptyString(
+				asString(profile["name"]),
+				asString(profile["username"]),
+			)
+		}
+		if info.Email == "" {
+			info.Email = strings.TrimSpace(asString(profile["email"]))
+		}
+		if info.Phone == "" {
+			info.Phone = strings.TrimSpace(asString(profile["phone"]))
+		}
+	}
+	return info, nil
 }
 
 func (c *Client) enrollClub(ctx context.Context, token string) error {

@@ -2,10 +2,13 @@ package scheduler
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"log"
+	"math/big"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,50 +19,98 @@ import (
 	"bohrium-club-auto/internal/store"
 )
 
-// Status describes the live scheduler state for the Dashboard.
-type Status struct {
-	Enabled          bool      `json:"enabled"`
+const (
+	poolBalanceRefreshInterval = 15 * time.Minute
+	bindingPurgeInterval       = 1 * time.Hour
+	minInterAccountGapSec      = 20
+	maxInterAccountGapSec      = 60
+)
+
+// AccountScheduleInfo exposes a single account's randomized daily check-in slot and status.
+type AccountScheduleInfo struct {
+	AccountID        string    `json:"accountId"`
+	CheckinEnabled   bool      `json:"checkinEnabled"`
 	Running          bool      `json:"running"`
-	CurrentJob       string    `json:"currentJob,omitempty"`
-	TimeHHMM         string    `json:"timeHHMM"`
-	Timezone         string    `json:"timezone"`
-	JitterMinutes    int       `json:"jitterMinutes"`
-	AutoClaim        bool      `json:"autoClaim"`
-	AutoRefresh      bool      `json:"autoRefresh"`
+	PlannedTodayAt   string    `json:"plannedTodayAt,omitempty"`
 	NextRunAt        string    `json:"nextRunAt,omitempty"`
+	DoneToday        bool      `json:"doneToday"`
 	LastScheduledDay string    `json:"lastScheduledDay,omitempty"`
 	LastRunAt        time.Time `json:"lastRunAt,omitempty"`
 	LastRunSummary   string    `json:"lastRunSummary,omitempty"`
 }
 
-// Scheduler coordinates daily automatic task execution, periodic JWT refresh,
-// and mutual exclusion with manual dashboard triggers.
-type Scheduler struct {
-	client *bohrium.Client
-	cfg    *config.Manager
-	store  *store.Store
+// AccountRunResult captures the outcome of running Web check-in tasks for one account.
+type AccountRunResult struct {
+	AccountID   string                `json:"accountId"`
+	DisplayName string                `json:"displayName"`
+	Success     bool                  `json:"success"`
+	Error       string                `json:"error,omitempty"`
+	Result      *bohrium.RunAllResult `json:"result,omitempty"`
+}
 
-	execMu     sync.Mutex
-	stateMu    sync.RWMutex
-	running    bool
-	currentJob string
+// Status describes the live multi-account scheduler state for the Web Console.
+type Status struct {
+	Enabled          bool                           `json:"enabled"`
+	Running          bool                           `json:"running"`
+	CurrentJob       string                         `json:"currentJob,omitempty"`
+	ActiveAccountID  string                         `json:"activeAccountId,omitempty"`
+	TimeHHMM         string                         `json:"timeHHMM"`
+	Timezone         string                         `json:"timezone"`
+	JitterMinutes    int                            `json:"jitterMinutes"`
+	AutoClaim        bool                           `json:"autoClaim"`
+	AutoRefresh      bool                           `json:"autoRefresh"`
+	NextRunAt        string                         `json:"nextRunAt,omitempty"`
+	TotalAccounts    int                            `json:"totalAccounts"`
+	EnabledAccounts  int                            `json:"enabledAccounts"`
+	DoneTodayCount   int                            `json:"doneTodayCount"`
+	LastScheduledDay string                         `json:"lastScheduledDay,omitempty"`
+	LastRunAt        time.Time                      `json:"lastRunAt,omitempty"`
+	LastRunSummary   string                         `json:"lastRunSummary,omitempty"`
+	Accounts         map[string]AccountScheduleInfo `json:"accounts,omitempty"`
+}
+
+// Scheduler coordinates per-account jittered daily task execution, staggered anti-burst spacing,
+// background JWT token renewal, pooled balance refreshes, and hourly 7-day binding purges.
+type Scheduler struct {
+	mgr   *bohrium.Manager
+	cfg   *config.Manager
+	store *store.Store
+
+	checkinGate chan struct{} // serializes scheduled Web check-ins across accounts to avoid burst spikes
+
+	accLockMu sync.Mutex
+	accLocks  map[string]*sync.Mutex
+
+	stateMu         sync.RWMutex
+	running         bool
+	currentJob      string
+	activeAccountID string
+	runningAccounts map[string]bool
+
+	maintMu             sync.Mutex
+	lastPurgeAt         time.Time
+	lastBalanceSyncAt   time.Time
+	nextAllowedCheckinAt time.Time
 
 	stopCh chan struct{}
 	doneCh chan struct{}
 }
 
-// New creates a Scheduler instance.
-func New(client *bohrium.Client, cfg *config.Manager, st *store.Store) *Scheduler {
+// New creates a multi-account Scheduler instance.
+func New(mgr *bohrium.Manager, cfg *config.Manager, st *store.Store) *Scheduler {
 	return &Scheduler{
-		client: client,
-		cfg:    cfg,
-		store:  st,
-		stopCh: make(chan struct{}),
-		doneCh: make(chan struct{}),
+		mgr:             mgr,
+		cfg:             cfg,
+		store:           st,
+		checkinGate:     make(chan struct{}, 1),
+		accLocks:        make(map[string]*sync.Mutex),
+		runningAccounts: make(map[string]bool),
+		stopCh:          make(chan struct{}),
+		doneCh:          make(chan struct{}),
 	}
 }
 
-// Start launches the background schedule and token-refresh loop.
+// Start launches the background schedule, token-refresh, balance-sync, and TTL-purge loop.
 func (s *Scheduler) Start() {
 	go s.loop()
 }
@@ -79,7 +130,6 @@ func (s *Scheduler) loop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	// Check token refresh shortly after boot (non-blocking)
 	s.tick()
 
 	for {
@@ -93,155 +143,399 @@ func (s *Scheduler) loop() {
 }
 
 func (s *Scheduler) tick() {
+	nowUTC := time.Now().UTC()
 	cfg := s.cfg.Get()
-	auth := s.store.GetAuth()
-	if auth.Token == "" {
+
+	// 1. Periodic purge of expired (>7d) SQLite OpenAI session bindings.
+	s.maintMu.Lock()
+	doPurge := s.lastPurgeAt.IsZero() || nowUTC.Sub(s.lastPurgeAt) >= bindingPurgeInterval
+	if doPurge {
+		s.lastPurgeAt = nowUTC
+	}
+	doBalSync := s.lastBalanceSyncAt.IsZero() || nowUTC.Sub(s.lastBalanceSyncAt) >= poolBalanceRefreshInterval
+	if doBalSync {
+		s.lastBalanceSyncAt = nowUTC
+	}
+	s.maintMu.Unlock()
+
+	if doPurge {
+		if purged, err := s.store.PurgeExpiredSessionBindings(nowUTC); err == nil && purged > 0 {
+			log.Printf("[scheduler] purged %d expired OpenAI session binding(s) (>7d TTL)", purged)
+		}
+	}
+
+	accounts, err := s.store.ListAccounts()
+	if err != nil || len(accounts) == 0 {
 		return
 	}
 
-	// 1. Background auto-refresh of brmToken before expiration (keeps server login alive).
+	// 2. Background token auto-refresh across all accounts.
 	if cfg.Schedule.AutoRefresh {
-		needsRefresh := false
-		if !auth.ExpiresAt.IsZero() && time.Until(auth.ExpiresAt) < 48*time.Hour && time.Until(auth.ExpiresAt) > 0 {
-			needsRefresh = true
-		} else if !auth.LastRefreshAt.IsZero() && time.Since(auth.LastRefreshAt) > 24*time.Hour {
-			needsRefresh = true
-		}
-		if needsRefresh && time.Since(auth.LastRefreshAt) > 30*time.Minute {
-			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			if _, err := s.client.RefreshToken(ctx, "schedule"); err != nil {
-				log.Printf("[scheduler] auto refresh_token skipped/failed: %v", err)
+		for _, acc := range accounts {
+			if strings.TrimSpace(acc.Token) == "" {
+				continue
 			}
-			cancel()
+			needsRefresh := false
+			if !acc.ExpiresAt.IsZero() && time.Until(acc.ExpiresAt) < 48*time.Hour && time.Until(acc.ExpiresAt) > 0 {
+				needsRefresh = true
+			} else if !acc.LastRefreshAt.IsZero() && time.Since(acc.LastRefreshAt) > 24*time.Hour {
+				needsRefresh = true
+			}
+			if needsRefresh && time.Since(acc.LastRefreshAt) > 30*time.Minute {
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				if _, rErr := s.mgr.ForAccount(acc.ID).RefreshToken(ctx, "schedule"); rErr != nil {
+					log.Printf("[scheduler] auto refresh_token failed for %s: %v", acc.DisplayName(), rErr)
+					if !acc.ExpiresAt.IsZero() && !acc.ExpiresAt.After(nowUTC) {
+						_ = s.store.UpdateAccountHealth(acc.ID, "expired", rErr.Error(), time.Time{})
+					}
+				}
+				cancel()
+			}
 		}
 	}
 
-	// 2. Daily scheduled task run in configured timezone (default Asia/Shanghai).
+	// 3. Background balance refresh for pooled accounts (drives weighted-balance OpenAI routing).
+	if doBalSync {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer cancel()
+			s.mgr.RefreshStaleBalances(ctx, poolBalanceRefreshInterval)
+		}()
+	}
+
+	// 4. Per-account randomized daily check-in scheduling (staggered serial execution).
 	if !cfg.Schedule.Enabled {
 		return
 	}
 	loc := loadLocation(cfg.Schedule.Timezone)
-	now := time.Now().In(loc)
-	today := now.Format("2006-01-02")
-	if s.store.GetLastScheduledDay() == today {
+	nowLocal := time.Now().In(loc)
+	today := nowLocal.Format("2006-01-02")
+
+	// Respect inter-account anti-burst stagger gap.
+	s.maintMu.Lock()
+	waitUntil := s.nextAllowedCheckinAt
+	s.maintMu.Unlock()
+	if !waitUntil.IsZero() && nowUTC.Before(waitUntil) {
 		return
 	}
 
-	targetTime := plannedTimeForDay(now, cfg.Schedule.TimeHHMM, cfg.Schedule.JitterMinutes)
-	if now.Before(targetTime) {
-		return
+	// Find due accounts ordered by their randomized slot for today.
+	type dueItem struct {
+		acc     store.Account
+		planned time.Time
 	}
-
-	// Avoid overlapping with any manual execution.
-	if !s.execMu.TryLock() {
-		return
-	}
-	defer s.execMu.Unlock()
-
-	if s.store.GetLastScheduledDay() == today {
-		return
-	}
-
-	s.setRunning(true, "scheduled_daily_tasks")
-	defer s.setRunning(false, "")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	log.Printf("[scheduler] starting daily Bohrium Web tasks for %s", today)
-	res, err := s.client.RunAllWebTasks(ctx, "schedule", cfg.Schedule.AutoClaim)
-	if err != nil {
-		log.Printf("[scheduler] daily run failed for %s: %v", today, err)
-		_ = s.store.AppendLog(store.RunLog{
-			Trigger: "schedule",
-			Action:  "run_all",
-			Success: false,
-			Message: fmt.Sprintf("定时任务执行失败: %v", err),
-		})
-		// Mark today only if auth isn't missing, or wait next tick? Keep retryable on transient error by not marking day,
-		// unless error is 401/unauthenticated (avoid hammering every 30s).
-		if strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "登录") {
-			_ = s.store.SetLastScheduledDay(today, "跳过: "+err.Error())
+	var due []dueItem
+	for _, acc := range accounts {
+		if !acc.CheckinEnabled || strings.TrimSpace(acc.Token) == "" {
+			continue
 		}
+		if acc.LastScheduledDay == today {
+			continue
+		}
+		if !acc.ExpiresAt.IsZero() && !acc.ExpiresAt.After(nowUTC) {
+			continue
+		}
+		slot := PlannedTimeForAccount(nowLocal, acc.ID, cfg.Schedule.TimeHHMM, cfg.Schedule.JitterMinutes)
+		if !nowLocal.Before(slot) {
+			due = append(due, dueItem{acc: acc, planned: slot})
+		}
+	}
+	if len(due) == 0 {
 		return
 	}
-	_ = s.store.SetLastScheduledDay(today, res.Summary)
-	log.Printf("[scheduler] finished daily Bohrium Web tasks for %s: %s", today, res.Summary)
+	sort.Slice(due, func(i, j int) bool { return due[i].planned.Before(due[j].planned) })
+
+	// Pick the earliest due account and launch it under the serial check-in gate.
+	target := due[0].acc
+	select {
+	case s.checkinGate <- struct{}{}:
+	default:
+		return // another account is currently running scheduled check-in
+	}
+
+	go func(acc store.Account, day string) {
+		defer func() {
+			// Add randomized 20..60s cooldown spacing before the next account starts.
+			gap := randomRangeSec(minInterAccountGapSec, maxInterAccountGapSec)
+			s.maintMu.Lock()
+			s.nextAllowedCheckinAt = time.Now().UTC().Add(time.Duration(gap) * time.Second)
+			s.maintMu.Unlock()
+			<-s.checkinGate
+		}()
+
+		mu := s.accountMutex(acc.ID)
+		if !mu.TryLock() {
+			return
+		}
+		defer mu.Unlock()
+
+		// Re-check persisted state in case a manual run finished right before lock acquisition.
+		latest, ok, err := s.store.GetAccount(acc.ID)
+		if err != nil || !ok || latest.LastScheduledDay == day || !latest.CheckinEnabled {
+			return
+		}
+
+		s.markRunning(acc.ID, true, "scheduled:"+acc.DisplayName())
+		defer s.markRunning(acc.ID, false, "")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+
+		log.Printf("[scheduler] starting daily Bohrium Web tasks for %s (%s)", acc.DisplayName(), day)
+		cli := s.mgr.ForAccount(acc.ID)
+		res, runErr := cli.RunAllWebTasks(ctx, "schedule", cfg.Schedule.AutoClaim)
+		if runErr != nil {
+			log.Printf("[scheduler] daily run failed for %s (%s): %v", acc.DisplayName(), day, runErr)
+			_ = s.store.ForAccount(acc.ID).AppendLog(store.RunLog{
+				Trigger: "schedule",
+				Action:  "run_all",
+				Success: false,
+				Message: fmt.Sprintf("定时任务执行失败: %v", runErr),
+			})
+			if strings.Contains(runErr.Error(), "401") || strings.Contains(runErr.Error(), "登录") {
+				_ = s.store.UpdateAccountCheckin(acc.ID, day, "跳过: "+runErr.Error())
+				_ = s.store.UpdateAccountHealth(acc.ID, "expired", runErr.Error(), time.Time{})
+			}
+			return
+		}
+		_ = s.store.UpdateAccountCheckin(acc.ID, day, res.Summary)
+		// Immediately refresh photon balance so newly earned photons feed into OpenAI pool routing weights.
+		balCtx, balCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		_, _ = s.mgr.RefreshAccountBalance(balCtx, acc.ID)
+		balCancel()
+		log.Printf("[scheduler] finished daily Bohrium Web tasks for %s (%s): %s", acc.DisplayName(), day, res.Summary)
+	}(target, today)
 }
 
-// RunAllManual triggers all 3 Web tasks manually under the shared execution lock.
-func (s *Scheduler) RunAllManual(ctx context.Context) (*bohrium.RunAllResult, error) {
-	if !s.execMu.TryLock() {
-		return nil, fmt.Errorf("已有任务正在执行中，请稍候")
+// RunAccountManual triggers all 3 Web tasks manually for a specific account.
+func (s *Scheduler) RunAccountManual(ctx context.Context, accountID string) (*bohrium.RunAllResult, error) {
+	acc, ok, err := s.store.GetAccount(accountID)
+	if err != nil || !ok {
+		return nil, fmt.Errorf("账号不存在: %s", accountID)
 	}
-	defer s.execMu.Unlock()
-	s.setRunning(true, "manual_run_all")
-	defer s.setRunning(false, "")
+	mu := s.accountMutex(acc.ID)
+	if !mu.TryLock() {
+		return nil, fmt.Errorf("账号 %s 已有任务正在执行中，请稍候", acc.DisplayName())
+	}
+	defer mu.Unlock()
+
+	s.markRunning(acc.ID, true, "manual:"+acc.DisplayName())
+	defer s.markRunning(acc.ID, false, "")
 
 	cfg := s.cfg.Get()
-	res, err := s.client.RunAllWebTasks(ctx, "manual", cfg.Schedule.AutoClaim)
+	cli := s.mgr.ForAccount(acc.ID)
+	res, err := cli.RunAllWebTasks(ctx, "manual", cfg.Schedule.AutoClaim)
 	if err == nil && res != nil && res.AllWebDone {
 		loc := loadLocation(cfg.Schedule.Timezone)
 		today := time.Now().In(loc).Format("2006-01-02")
-		_ = s.store.SetLastScheduledDay(today, "手动执行完成: "+res.Summary)
+		_ = s.store.UpdateAccountCheckin(acc.ID, today, "手动执行完成: "+res.Summary)
+	}
+	// Refresh balance snapshot after manual execution.
+	balCtx, balCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	_, _ = s.mgr.RefreshAccountBalance(balCtx, acc.ID)
+	balCancel()
+	return res, err
+}
+
+// RunAccountSingleTaskManual triggers one specific Web task manually for a specific account.
+func (s *Scheduler) RunAccountSingleTaskManual(ctx context.Context, accountID, taskKey string) (*bohrium.TaskExecutionResult, error) {
+	acc, ok, err := s.store.GetAccount(accountID)
+	if err != nil || !ok {
+		return nil, fmt.Errorf("账号不存在: %s", accountID)
+	}
+	mu := s.accountMutex(acc.ID)
+	if !mu.TryLock() {
+		return nil, fmt.Errorf("账号 %s 已有任务正在执行中，请稍候", acc.DisplayName())
+	}
+	defer mu.Unlock()
+
+	s.markRunning(acc.ID, true, fmt.Sprintf("manual_task:%s:%s", acc.DisplayName(), taskKey))
+	defer s.markRunning(acc.ID, false, "")
+
+	res, err := s.mgr.ForAccount(acc.ID).ExecuteSingleTask(ctx, taskKey, "manual")
+	if err == nil && res != nil && res.Success {
+		balCtx, balCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		_, _ = s.mgr.RefreshAccountBalance(balCtx, acc.ID)
+		balCancel()
 	}
 	return res, err
 }
 
-// RunSingleManual triggers one specific Web task manually under the shared execution lock.
-func (s *Scheduler) RunSingleManual(ctx context.Context, taskKey string) (*bohrium.TaskExecutionResult, error) {
-	if !s.execMu.TryLock() {
-		return nil, fmt.Errorf("已有任务正在执行中，请稍候")
+// RunAllAccountsManual executes daily Web tasks sequentially across all check-in enabled accounts.
+func (s *Scheduler) RunAllAccountsManual(ctx context.Context) ([]AccountRunResult, error) {
+	accounts, err := s.store.ListAccounts()
+	if err != nil {
+		return nil, err
 	}
-	defer s.execMu.Unlock()
-	s.setRunning(true, "manual_task:"+taskKey)
-	defer s.setRunning(false, "")
-
-	return s.client.ExecuteSingleTask(ctx, taskKey, "manual")
+	results := make([]AccountRunResult, 0, len(accounts))
+	for i, acc := range accounts {
+		if ctx.Err() != nil {
+			break
+		}
+		if !acc.CheckinEnabled || strings.TrimSpace(acc.Token) == "" {
+			continue
+		}
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return results, ctx.Err()
+			case <-time.After(3 * time.Second):
+			}
+		}
+		res, runErr := s.RunAccountManual(ctx, acc.ID)
+		item := AccountRunResult{
+			AccountID:   acc.ID,
+			DisplayName: acc.DisplayName(),
+			Result:      res,
+		}
+		if runErr != nil {
+			item.Error = runErr.Error()
+		} else if res != nil {
+			item.Success = res.AllWebDone
+		}
+		results = append(results, item)
+	}
+	return results, nil
 }
 
-// Status returns the current scheduler configuration, execution status, and next planned run time.
+// RunAllManual runs all Web tasks for the primary/first account (backward compatibility).
+func (s *Scheduler) RunAllManual(ctx context.Context) (*bohrium.RunAllResult, error) {
+	accounts, err := s.store.ListAccounts()
+	if err != nil || len(accounts) == 0 {
+		return nil, fmt.Errorf("尚未登录任何 Bohrium 账号")
+	}
+	return s.RunAccountManual(ctx, accounts[0].ID)
+}
+
+// RunSingleManual runs one Web task for the primary/first account (backward compatibility).
+func (s *Scheduler) RunSingleManual(ctx context.Context, taskKey string) (*bohrium.TaskExecutionResult, error) {
+	accounts, err := s.store.ListAccounts()
+	if err != nil || len(accounts) == 0 {
+		return nil, fmt.Errorf("尚未登录任何 Bohrium 账号")
+	}
+	return s.RunAccountSingleTaskManual(ctx, accounts[0].ID, taskKey)
+}
+
+// Status returns global scheduler status plus each account's randomized daily check-in schedule.
 func (s *Scheduler) Status() Status {
 	cfg := s.cfg.Get()
 	s.stateMu.RLock()
 	running := s.running
 	curJob := s.currentJob
+	activeAcc := s.activeAccountID
+	runningMap := make(map[string]bool, len(s.runningAccounts))
+	for k, v := range s.runningAccounts {
+		runningMap[k] = v
+	}
 	s.stateMu.RUnlock()
 
-	lastDay, lastAt, summary := s.store.GetSummary()
+	loc := loadLocation(cfg.Schedule.Timezone)
+	nowLocal := time.Now().In(loc)
+	today := nowLocal.Format("2006-01-02")
+
+	accounts, _ := s.store.ListAccounts()
+	perAcc := make(map[string]AccountScheduleInfo, len(accounts))
+
+	var (
+		earliestNext time.Time
+		enabledCnt   int
+		doneTodayCnt int
+		latestRunAt  time.Time
+		latestDay    string
+		latestSum    string
+	)
+
+	for _, acc := range accounts {
+		doneToday := acc.LastScheduledDay == today
+		if acc.CheckinEnabled {
+			enabledCnt++
+		}
+		if doneToday {
+			doneTodayCnt++
+		}
+		if acc.LastRunAt.After(latestRunAt) {
+			latestRunAt = acc.LastRunAt
+			latestDay = acc.LastScheduledDay
+			latestSum = acc.LastRunSummary
+		}
+
+		info := AccountScheduleInfo{
+			AccountID:        acc.ID,
+			CheckinEnabled:   acc.CheckinEnabled,
+			Running:          runningMap[acc.ID],
+			DoneToday:        doneToday,
+			LastScheduledDay: acc.LastScheduledDay,
+			LastRunAt:        acc.LastRunAt,
+			LastRunSummary:   acc.LastRunSummary,
+		}
+		if cfg.Schedule.Enabled && acc.CheckinEnabled {
+			todaySlot := PlannedTimeForAccount(nowLocal, acc.ID, cfg.Schedule.TimeHHMM, cfg.Schedule.JitterMinutes)
+			info.PlannedTodayAt = todaySlot.Format("15:04:05")
+			nextSlot := todaySlot
+			if doneToday {
+				nextSlot = PlannedTimeForAccount(nowLocal.AddDate(0, 0, 1), acc.ID, cfg.Schedule.TimeHHMM, cfg.Schedule.JitterMinutes)
+			}
+			info.NextRunAt = nextSlot.Format("2006-01-02 15:04:05 MST")
+			if earliestNext.IsZero() || nextSlot.Before(earliestNext) {
+				earliestNext = nextSlot
+			}
+		}
+		perAcc[acc.ID] = info
+	}
+
 	st := Status{
 		Enabled:          cfg.Schedule.Enabled,
 		Running:          running,
 		CurrentJob:       curJob,
+		ActiveAccountID:  activeAcc,
 		TimeHHMM:         cfg.Schedule.TimeHHMM,
 		Timezone:         cfg.Schedule.Timezone,
 		JitterMinutes:    cfg.Schedule.JitterMinutes,
 		AutoClaim:        cfg.Schedule.AutoClaim,
 		AutoRefresh:      cfg.Schedule.AutoRefresh,
-		LastScheduledDay: lastDay,
-		LastRunAt:        lastAt,
-		LastRunSummary:   summary,
+		TotalAccounts:    len(accounts),
+		EnabledAccounts:  enabledCnt,
+		DoneTodayCount:   doneTodayCnt,
+		LastScheduledDay: latestDay,
+		LastRunAt:        latestRunAt,
+		LastRunSummary:   latestSum,
+		Accounts:         perAcc,
 	}
-
-	if cfg.Schedule.Enabled {
-		loc := loadLocation(cfg.Schedule.Timezone)
-		now := time.Now().In(loc)
-		today := now.Format("2006-01-02")
-		planned := plannedTimeForDay(now, cfg.Schedule.TimeHHMM, cfg.Schedule.JitterMinutes)
-		if lastDay == today || !now.Before(planned) && lastDay == today {
-			tomorrow := now.AddDate(0, 0, 1)
-			planned = plannedTimeForDay(tomorrow, cfg.Schedule.TimeHHMM, cfg.Schedule.JitterMinutes)
-		}
-		st.NextRunAt = planned.Format("2006-01-02 15:04:05 MST")
+	if !earliestNext.IsZero() {
+		st.NextRunAt = earliestNext.Format("2006-01-02 15:04:05 MST")
+	} else if cfg.Schedule.Enabled && len(accounts) == 0 {
+		st.NextRunAt = PlannedTimeForAccount(nowLocal, "default", cfg.Schedule.TimeHHMM, cfg.Schedule.JitterMinutes).Format("2006-01-02 15:04:05 MST")
 	}
 	return st
 }
 
-func (s *Scheduler) setRunning(v bool, job string) {
+func (s *Scheduler) accountMutex(accountID string) *sync.Mutex {
+	s.accLockMu.Lock()
+	defer s.accLockMu.Unlock()
+	if mu, ok := s.accLocks[accountID]; ok {
+		return mu
+	}
+	mu := &sync.Mutex{}
+	s.accLocks[accountID] = mu
+	return mu
+}
+
+func (s *Scheduler) markRunning(accountID string, active bool, job string) {
 	s.stateMu.Lock()
-	s.running = v
-	s.currentJob = job
-	s.stateMu.Unlock()
+	defer s.stateMu.Unlock()
+	if active {
+		s.runningAccounts[accountID] = true
+		s.running = true
+		s.currentJob = job
+		s.activeAccountID = accountID
+		return
+	}
+	delete(s.runningAccounts, accountID)
+	if len(s.runningAccounts) == 0 {
+		s.running = false
+		s.currentJob = ""
+		s.activeAccountID = ""
+	}
 }
 
 func loadLocation(tz string) *time.Location {
@@ -251,8 +545,9 @@ func loadLocation(tz string) *time.Location {
 	return time.FixedZone("CST", 8*3600)
 }
 
-// plannedTimeForDay computes HH:MM + deterministic per-day jitter so restarts within a day keep the same target slot.
-func plannedTimeForDay(dayRef time.Time, hhmm string, jitterMinutes int) time.Time {
+// PlannedTimeForAccount computes HH:MM + deterministic per-day, per-account jitter (minutes + seconds)
+// so each account executes at a distinct randomized time each day while staying stable across restarts.
+func PlannedTimeForAccount(dayRef time.Time, accountID, hhmm string, jitterMinutes int) time.Time {
 	h, m := 8, 15
 	parts := strings.Split(strings.TrimSpace(hhmm), ":")
 	if len(parts) == 2 {
@@ -264,10 +559,23 @@ func plannedTimeForDay(dayRef time.Time, hhmm string, jitterMinutes int) time.Ti
 		}
 	}
 	base := time.Date(dayRef.Year(), dayRef.Month(), dayRef.Day(), h, m, 0, 0, dayRef.Location())
+	sum := sha256.Sum256([]byte("bohrium-jitter:" + dayRef.Format("2006-01-02") + ":" + strings.TrimSpace(accountID)))
 	if jitterMinutes > 0 {
-		sum := sha256.Sum256([]byte("bohrium-jitter:" + dayRef.Format("2006-01-02")))
-		offset := int(binary.BigEndian.Uint32(sum[:4]) % uint32(jitterMinutes+1))
-		base = base.Add(time.Duration(offset) * time.Minute)
+		minOffset := int(binary.BigEndian.Uint32(sum[:4]) % uint32(jitterMinutes+1))
+		base = base.Add(time.Duration(minOffset) * time.Minute)
 	}
+	secOffset := int(binary.BigEndian.Uint32(sum[4:8]) % 60)
+	base = base.Add(time.Duration(secOffset) * time.Second)
 	return base
+}
+
+func randomRangeSec(minSec, maxSec int) int {
+	if maxSec <= minSec {
+		return minSec
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(maxSec-minSec+1)))
+	if err != nil {
+		return minSec
+	}
+	return minSec + int(n.Int64())
 }

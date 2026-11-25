@@ -20,13 +20,13 @@ import (
 	"bohrium-club-auto/web"
 )
 
-// Server exposes the admin-protected Web Dashboard, REST API, and OpenAI /v1/* gateway.
+// Server exposes the admin-protected Multi-Account Web Console, REST API, and OpenAI /v1/* gateway.
 type Server struct {
 	version   string
 	cfg       *config.Manager
 	store     *store.Store
 	httpCli   *chromehttp.Client
-	client    *bohrium.Client
+	mgr       *bohrium.Manager
 	scheduler *scheduler.Scheduler
 	gateway   *openai.Gateway
 	limiter   *loginRateLimiter
@@ -35,15 +35,15 @@ type Server struct {
 }
 
 // New builds the HTTP server and registers all routes.
-func New(version string, cfg *config.Manager, st *store.Store, httpCli *chromehttp.Client, client *bohrium.Client, sched *scheduler.Scheduler) *Server {
+func New(version string, cfg *config.Manager, st *store.Store, httpCli *chromehttp.Client, mgr *bohrium.Manager, sched *scheduler.Scheduler) *Server {
 	s := &Server{
 		version:   version,
 		cfg:       cfg,
 		store:     st,
 		httpCli:   httpCli,
-		client:    client,
+		mgr:       mgr,
 		scheduler: sched,
-		gateway:   openai.NewGateway(cfg, client),
+		gateway:   openai.NewGateway(cfg, mgr),
 		limiter:   newLoginRateLimiter(),
 		mux:       http.NewServeMux(),
 		startedAt: time.Now().UTC(),
@@ -69,8 +69,22 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/auth/login", s.handleAuthLogin)
 	s.mux.HandleFunc("POST /api/auth/logout", s.handleAuthLogout)
 
-	// Protected admin operational endpoints
+	// Overview & multi-account management endpoints
 	s.mux.HandleFunc("GET /api/overview", s.requireAdmin(s.handleOverview))
+	s.mux.HandleFunc("GET /api/accounts", s.requireAdmin(s.handleListAccounts))
+	s.mux.HandleFunc("POST /api/accounts/refresh-balances", s.requireAdmin(s.handleRefreshAllBalances))
+	s.mux.HandleFunc("POST /api/accounts/run-all", s.requireAdmin(s.handleRunAllAccounts))
+	s.mux.HandleFunc("GET /api/accounts/{id}/detail", s.requireAdmin(s.handleAccountDetail))
+	s.mux.HandleFunc("PATCH /api/accounts/{id}", s.requireAdmin(s.handleUpdateAccount))
+	s.mux.HandleFunc("DELETE /api/accounts/{id}", s.requireAdmin(s.handleDeleteAccount))
+	s.mux.HandleFunc("POST /api/accounts/{id}/refresh-token", s.requireAdmin(s.handleAccountRefreshToken))
+	s.mux.HandleFunc("POST /api/accounts/{id}/refresh-balance", s.requireAdmin(s.handleAccountRefreshBalance))
+	s.mux.HandleFunc("POST /api/accounts/{id}/tasks/claim-all", s.requireAdmin(s.handleAccountClaimAll))
+	s.mux.HandleFunc("POST /api/accounts/{id}/tasks/claim", s.requireAdmin(s.handleAccountClaimOne))
+	s.mux.HandleFunc("POST /api/accounts/{id}/tasks/run", s.requireAdmin(s.handleAccountRunOne))
+	s.mux.HandleFunc("POST /api/accounts/{id}/tasks/run-all", s.requireAdmin(s.handleAccountRunAll))
+
+	// Bohrium login endpoints (add new account or refresh existing account by UID; new accounts default to PoolEnabled=false)
 	s.mux.HandleFunc("GET /api/bohrium/session", s.requireAdmin(s.handleBohriumSession))
 	s.mux.HandleFunc("POST /api/bohrium/wechat/qr", s.requireAdmin(s.handleWeChatQR))
 	s.mux.HandleFunc("GET /api/bohrium/wechat/poll", s.requireAdmin(s.handleWeChatPoll))
@@ -80,14 +94,15 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/bohrium/login/code", s.requireAdmin(s.handleCodeLogin))
 	s.mux.HandleFunc("POST /api/bohrium/login/token", s.requireAdmin(s.handleImportToken))
 	s.mux.HandleFunc("POST /api/bohrium/login/password", s.requireAdmin(s.handlePasswordLogin))
-	s.mux.HandleFunc("POST /api/bohrium/refresh-token", s.requireAdmin(s.handleRefreshToken))
+	s.mux.HandleFunc("POST /api/bohrium/refresh-token", s.requireAdmin(s.handleAccountRefreshToken))
 	s.mux.HandleFunc("POST /api/bohrium/logout", s.requireAdmin(s.handleBohriumLogout))
 
+	// Backward-compatible task/asset endpoints (accept ?accountId=... or body.accountId, defaulting to first account)
 	s.mux.HandleFunc("GET /api/tasks", s.requireAdmin(s.handleGetTasks))
-	s.mux.HandleFunc("POST /api/tasks/claim-all", s.requireAdmin(s.handleClaimAll))
-	s.mux.HandleFunc("POST /api/tasks/claim", s.requireAdmin(s.handleClaimOne))
-	s.mux.HandleFunc("POST /api/tasks/run", s.requireAdmin(s.handleRunOne))
-	s.mux.HandleFunc("POST /api/tasks/run-all", s.requireAdmin(s.handleRunAll))
+	s.mux.HandleFunc("POST /api/tasks/claim-all", s.requireAdmin(s.handleAccountClaimAll))
+	s.mux.HandleFunc("POST /api/tasks/claim", s.requireAdmin(s.handleAccountClaimOne))
+	s.mux.HandleFunc("POST /api/tasks/run", s.requireAdmin(s.handleAccountRunOne))
+	s.mux.HandleFunc("POST /api/tasks/run-all", s.requireAdmin(s.handleAccountRunAll))
 
 	s.mux.HandleFunc("GET /api/assets", s.requireAdmin(s.handleGetAssets))
 	s.mux.HandleFunc("GET /api/logs", s.requireAdmin(s.handleGetLogs))
@@ -99,8 +114,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/recon/pull", s.requireAdmin(s.handleReconPull))
 	s.mux.HandleFunc("POST /api/recon/diff", s.requireAdmin(s.handleReconDiff))
 
-	// Admin OpenAI Gateway management endpoints
+	// Admin OpenAI Gateway, Routing Pool & 7-Day Session Binding endpoints
 	s.mux.HandleFunc("GET /api/gateway/status", s.requireAdmin(s.handleGatewayStatus))
+	s.mux.HandleFunc("PUT /api/gateway/pool", s.requireAdmin(s.handleGatewaySetPool))
+	s.mux.HandleFunc("GET /api/gateway/bindings", s.requireAdmin(s.handleGatewayListBindings))
+	s.mux.HandleFunc("DELETE /api/gateway/bindings/{hash}", s.requireAdmin(s.handleGatewayDeleteBinding))
+	s.mux.HandleFunc("DELETE /api/gateway/bindings", s.requireAdmin(s.handleGatewayClearBindings))
 	s.mux.HandleFunc("POST /api/gateway/models/refresh", s.requireAdmin(s.handleGatewayRefreshModels))
 	s.mux.HandleFunc("POST /api/gateway/keys", s.requireAdmin(s.handleGatewayCreateKey))
 	s.mux.HandleFunc("PATCH /api/gateway/keys/{id}", s.requireAdmin(s.handleGatewayUpdateKey))
@@ -112,17 +131,54 @@ func (s *Server) routes() {
 	// OpenAI-compatible /v1/* endpoints (authenticated via Gateway API key)
 	s.gateway.RegisterRoutes(s.mux)
 
-	// Embedded Web Dashboard SPA
-	staticSub, err := fs.Sub(web.FS, "static")
-	if err == nil {
-		fileServer := http.FileServer(http.FS(staticSub))
-		s.mux.Handle("GET /", fileServer)
+	// Embedded Vite/React Web Dashboard SPA (web/dist)
+	s.mux.Handle("GET /", spaHandler(web.FS))
+}
+
+func spaHandler(embedded fs.FS) http.Handler {
+	distFS, err := fs.Sub(embedded, "dist")
+	if err != nil {
+		return unbuiltSPAHandler()
 	}
+	indexBytes, err := fs.ReadFile(distFS, "index.html")
+	if err != nil || len(indexBytes) == 0 {
+		return unbuiltSPAHandler()
+	}
+	fileServer := http.FileServer(http.FS(distFS))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqPath := strings.TrimPrefix(r.URL.Path, "/")
+		if reqPath != "" {
+			if f, err := distFS.Open(reqPath); err == nil {
+				stat, statErr := f.Stat()
+				_ = f.Close()
+				if statErr == nil && !stat.IsDir() {
+					if strings.HasPrefix(reqPath, "assets/") {
+						w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+					}
+					fileServer.ServeHTTP(w, r)
+					return
+				}
+			}
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(indexBytes)
+	})
+}
+
+func unbuiltSPAHandler() http.Handler {
+	const fallbackHTML = `<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8" /><title>Bohrium Club Auto</title></head><body style="font-family:system-ui,sans-serif;padding:32px;max-width:640px;margin:0 auto;"><h1>Bohrium Club Auto</h1><p>前端尚未构建，请先在项目根目录执行 <code>npm ci --prefix web &amp;&amp; npm run build --prefix web</code> 后重新编译 Go 二进制。</p></body></html>`
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(fallbackHTML))
+	})
 }
 
 func (s *Server) isAdminAuthenticated(r *http.Request) bool {
 	cfg := s.cfg.Get()
-	// Allow X-Admin-Password header for automation/CI scripts.
 	if hdr := strings.TrimSpace(r.Header.Get("X-Admin-Password")); hdr != "" {
 		return verifyPasswordConstantTime(hdr, cfg.AdminPassword)
 	}
@@ -147,14 +203,17 @@ func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
-	auth := s.store.GetAuth()
+	allAccs, _ := s.store.ListAccounts()
+	poolAccs, _ := s.store.ListPoolAccounts()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":             true,
-		"service":        "bohrium-club-auto",
-		"version":        s.version,
-		"uptimeSec":      int64(time.Since(s.startedAt).Seconds()),
-		"bohriumLoggedIn": auth.Token != "",
-		"userAgent":      s.httpCli.UserAgent(),
+		"ok":               true,
+		"service":          "bohrium-club-auto",
+		"version":          s.version,
+		"uptimeSec":        int64(time.Since(s.startedAt).Seconds()),
+		"bohriumLoggedIn":  len(allAccs) > 0,
+		"accountCount":     len(allAccs),
+		"poolAccountCount": len(poolAccs),
+		"userAgent":        s.httpCli.UserAgent(),
 	})
 }
 
@@ -222,63 +281,82 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
 	defer cancel()
 
-	session := s.client.CheckSession(ctx)
+	views, summary := s.buildAccountViews()
+	selectedID := strings.TrimSpace(r.URL.Query().Get("accountId"))
+	if selectedID == "" && len(views) > 0 {
+		selectedID = views[0].ID
+	}
+
 	var (
+		session    bohrium.SessionStatus
 		tasksResp  *bohrium.DailyTasksResponse
 		tasksErr   string
 		assetsResp *bohrium.PointsAndCapacity
 		assetsErr  string
 	)
-	if session.HasToken {
-		t, err := s.client.ListDailyTasks(ctx)
-		if err != nil {
-			tasksErr = err.Error()
-		} else {
-			tasksResp = t
+	if selectedID != "" {
+		cli := s.mgr.ForAccount(selectedID)
+		session = cli.CheckSession(ctx)
+		if session.HasToken {
+			if t, err := cli.ListDailyTasks(ctx); err != nil {
+				tasksErr = err.Error()
+			} else {
+				tasksResp = t
+			}
+			if a, err := s.mgr.RefreshAccountBalance(ctx, selectedID); err != nil {
+				assetsErr = err.Error()
+			} else {
+				assetsResp = a
+			}
 		}
-		a, err := s.client.GetPointsAndCapacity(ctx)
-		if err != nil {
-			assetsErr = err.Error()
-		} else {
-			assetsResp = a
-		}
+		// Always recompute account views so any nickname/profile/balance sync from CheckSession or RefreshAccountBalance is reflected immediately.
+		views, summary = s.buildAccountViews()
 	}
 
-	cachedPDFs, customPDFs := s.client.CountCachedPDFs()
+	cachedPDFs, customPDFs := s.mgr.Ephemeral().CountCachedPDFs()
 	cfg := s.cfg.Get()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":          true,
-		"version":     s.version,
-		"userAgent":   s.httpCli.UserAgent(),
-		"session":     session,
-		"tasks":       tasksResp,
-		"tasksError":  tasksErr,
-		"assets":      assetsResp,
-		"assetsError": assetsErr,
-		"scheduler":   s.scheduler.Status(),
-		"promptStats": prompts.GetStats(),
+		"ok":                true,
+		"version":           s.version,
+		"userAgent":         s.httpCli.UserAgent(),
+		"selectedAccountId": selectedID,
+		"accounts":          views,
+		"accountSummary":    summary,
+		"session":           session,
+		"tasks":             tasksResp,
+		"tasksError":        tasksErr,
+		"assets":            assetsResp,
+		"assetsError":       assetsErr,
+		"scheduler":         s.scheduler.Status(),
+		"promptStats":       prompts.GetStats(),
 		"pdfStats": map[string]int{
 			"cached": cachedPDFs,
 			"custom": customPDFs,
 		},
 		"reconDir": cfg.ReconDir,
-		"logs":     s.store.GetLogs(30),
+		"logs":     s.store.GetLogs(40),
 	})
 }
 
 func (s *Server) handleBohriumSession(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
+	id := s.resolveTargetAccountID(r, "")
+	var session bohrium.SessionStatus
+	if id != "" {
+		session = s.mgr.ForAccount(id).CheckSession(ctx)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"session": s.client.CheckSession(ctx),
+		"ok":        true,
+		"accountId": id,
+		"session":   session,
 	})
 }
 
 func (s *Server) handleWeChatQR(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	qr, err := s.client.StartWeChatQR(ctx)
+	qr, err := s.mgr.Ephemeral().StartWeChatQR(ctx)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
 		return
@@ -288,18 +366,42 @@ func (s *Server) handleWeChatQR(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleWeChatPoll(w http.ResponseWriter, r *http.Request) {
 	sceneID := r.URL.Query().Get("sceneId")
+	label := r.URL.Query().Get("label")
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	res, err := s.client.PollWeChatQR(ctx, sceneID)
+	cli, scope := s.mgr.ForLogin(label)
+	res, err := cli.PollWeChatQR(ctx, sceneID)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	if res.Auth != nil {
-		redacted := s.client.RedactedAuth()
-		res.Auth = &redacted
+	var addedAcc *store.Account
+	var isNew bool
+	if res.LoggedIn || res.Status == "confirmed" {
+		if acc, created := scope.Result(); acc != nil {
+			balCtx, bCancel := context.WithTimeout(ctx, 8*time.Second)
+			_, _ = s.mgr.RefreshAccountBalance(balCtx, acc.ID)
+			bCancel()
+			if fresh, ok, _ := s.store.GetAccount(acc.ID); ok && fresh != nil {
+				cp := fresh.Redacted()
+				addedAcc = &cp
+			} else {
+				cp := acc.Redacted()
+				addedAcc = &cp
+			}
+			isNew = created
+		}
+		if res.Auth != nil {
+			redacted := cli.RedactedAuth()
+			res.Auth = &redacted
+		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "data": res})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"data":    res,
+		"account": addedAcc,
+		"isNew":   isNew,
+	})
 }
 
 func (s *Server) handleOAuthURL(w http.ResponseWriter, r *http.Request) {
@@ -312,7 +414,7 @@ func (s *Server) handleOAuthURL(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	res, err := s.client.GetOAuthURL(ctx, body.Provider)
+	res, err := s.mgr.Ephemeral().GetOAuthURL(ctx, body.Provider)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
 		return
@@ -324,6 +426,7 @@ func (s *Server) handleOAuthVerify(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Provider      string `json:"provider"`
 		CallbackInput string `json:"callbackInput"`
+		Label         string `json:"label"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "无效请求体"})
@@ -331,14 +434,12 @@ func (s *Server) handleOAuthVerify(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
-	if _, err := s.client.VerifyOAuthCallback(ctx, body.Provider, body.CallbackInput); err != nil {
+	cli, scope := s.mgr.ForLogin(body.Label)
+	if _, err := cli.VerifyOAuthCallback(ctx, body.Provider, body.CallbackInput); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"session": s.client.CheckSession(ctx),
-	})
+	s.finalizeLoginResponse(ctx, w, scope)
 }
 
 func (s *Server) handleSendCode(w http.ResponseWriter, r *http.Request) {
@@ -353,7 +454,7 @@ func (s *Server) handleSendCode(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	if err := s.client.SendVerifyCode(ctx, body.Kind, body.Target, body.CountryCode); err != nil {
+	if err := s.mgr.Ephemeral().SendVerifyCode(ctx, body.Kind, body.Target, body.CountryCode); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
@@ -366,6 +467,7 @@ func (s *Server) handleCodeLogin(w http.ResponseWriter, r *http.Request) {
 		Target      string `json:"target"`
 		CountryCode string `json:"countryCode"`
 		Code        string `json:"code"`
+		Label       string `json:"label"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "无效请求体"})
@@ -373,19 +475,18 @@ func (s *Server) handleCodeLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
-	if _, err := s.client.LoginWithCode(ctx, body.Kind, body.Target, body.CountryCode, body.Code); err != nil {
+	cli, scope := s.mgr.ForLogin(body.Label)
+	if _, err := cli.LoginWithCode(ctx, body.Kind, body.Target, body.CountryCode, body.Code); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"session": s.client.CheckSession(ctx),
-	})
+	s.finalizeLoginResponse(ctx, w, scope)
 }
 
 func (s *Server) handleImportToken(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Token string `json:"token"`
+		Label string `json:"label"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "无效请求体"})
@@ -393,20 +494,19 @@ func (s *Server) handleImportToken(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
-	if _, err := s.client.ImportToken(ctx, body.Token); err != nil {
+	cli, scope := s.mgr.ForLogin(body.Label)
+	if _, err := cli.ImportToken(ctx, body.Token); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"session": s.client.CheckSession(ctx),
-	})
+	s.finalizeLoginResponse(ctx, w, scope)
 }
 
 func (s *Server) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Account  string `json:"account"`
 		Password string `json:"password"`
+		Label    string `json:"label"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "无效请求体"})
@@ -414,31 +514,25 @@ func (s *Server) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
-	if _, err := s.client.LoginWithPassword(ctx, body.Account, body.Password); err != nil {
+	cli, scope := s.mgr.ForLogin(body.Label)
+	if _, err := cli.LoginWithPassword(ctx, body.Account, body.Password); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"session": s.client.CheckSession(ctx),
-	})
-}
-
-func (s *Server) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
-	defer cancel()
-	if _, err := s.client.RefreshToken(ctx, "manual"); err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"session": s.client.CheckSession(ctx),
-	})
+	s.finalizeLoginResponse(ctx, w, scope)
 }
 
 func (s *Server) handleBohriumLogout(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.ClearAuth(); err != nil {
+	var body struct {
+		AccountID string `json:"accountId"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	id := s.resolveTargetAccountID(r, body.AccountID)
+	if id == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+	if err := s.mgr.DeleteAccount(id); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
@@ -446,110 +540,54 @@ func (s *Server) handleBohriumLogout(w http.ResponseWriter, r *http.Request) {
 		Trigger: "manual",
 		Action:  "logout",
 		Success: true,
-		Message: "已清除本地保存的 Bohrium 登录凭据",
+		Message: "已清除账号登录凭据: " + id,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleGetTasks(w http.ResponseWriter, r *http.Request) {
+	id := s.resolveTargetAccountID(r, "")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "尚未登录任何账号"})
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
-	tasks, err := s.client.ListDailyTasks(ctx)
+	tasks, err := s.mgr.ForAccount(id).ListDailyTasks(ctx)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "data": tasks})
-}
-
-func (s *Server) handleClaimAll(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
-	defer cancel()
-	res, err := s.client.ClaimAllTasks(ctx, "manual")
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "data": res})
-}
-
-func (s *Server) handleClaimOne(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		TaskKey string `json:"taskKey"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.TaskKey) == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "taskKey 不能为空"})
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
-	defer cancel()
-	res, err := s.client.ClaimTask(ctx, body.TaskKey, "manual")
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "data": res})
-}
-
-func (s *Server) handleRunOne(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		TaskKey string `json:"taskKey"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.TaskKey) == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "taskKey 不能为空"})
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
-	defer cancel()
-	res, err := s.scheduler.RunSingleManual(ctx, body.TaskKey)
-	if err != nil {
-		writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "error": err.Error()})
-		return
-	}
-	after, _ := s.client.ListDailyTasks(ctx)
-	respBody := map[string]any{
-		"ok":         res.Success,
-		"data":       res,
-		"tasksAfter": after,
-	}
-	if !res.Success {
-		respBody["error"] = res.Message
-	}
-	writeJSON(w, http.StatusOK, respBody)
-}
-
-func (s *Server) handleRunAll(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
-	defer cancel()
-	res, err := s.scheduler.RunAllManual(ctx)
-	if err != nil {
-		writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "data": res})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accountId": id, "data": tasks})
 }
 
 func (s *Server) handleGetAssets(w http.ResponseWriter, r *http.Request) {
+	id := s.resolveTargetAccountID(r, "")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "尚未登录任何账号"})
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
 	defer cancel()
-	assets, err := s.client.GetPointsAndCapacity(ctx)
+	assets, err := s.mgr.RefreshAccountBalance(ctx, id)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "data": assets})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accountId": id, "data": assets})
 }
 
 func (s *Server) handleGetLogs(w http.ResponseWriter, r *http.Request) {
-	limit := 50
+	limit := 80
 	if q := r.URL.Query().Get("limit"); q != "" {
-		if n, err := strconv.Atoi(q); err == nil && n > 0 && n <= 200 {
+		if n, err := strconv.Atoi(q); err == nil && n > 0 && n <= 500 {
 			limit = n
 		}
 	}
+	accID := strings.TrimSpace(r.URL.Query().Get("accountId"))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":   true,
-		"data": s.store.GetLogs(limit),
+		"data": s.store.GetLogsFiltered(accID, limit),
 	})
 }
 
@@ -607,7 +645,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			if body.Schedule.Timezone != "" {
 				c.Schedule.Timezone = body.Schedule.Timezone
 			}
-			if body.Schedule.JitterMinutes >= 0 && body.Schedule.JitterMinutes <= 120 {
+			if body.Schedule.JitterMinutes >= 0 && body.Schedule.JitterMinutes <= 720 {
 				c.Schedule.JitterMinutes = body.Schedule.JitterMinutes
 			}
 			c.Schedule.AutoClaim = body.Schedule.AutoClaim
@@ -627,7 +665,6 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Re-issue cookie if admin password was updated so current browser stays signed in.
 	if pwChanged {
 		exp := time.Now().Add(7 * 24 * time.Hour)
 		tok := signAdminSession(updated.SessionSecret, passwordFingerprint(updated.AdminPassword), exp)
@@ -645,13 +682,13 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":        true,
 		"scheduler": s.scheduler.Status(),
-		"message":   "配置已保存（修改代理或 UA 需重启容器生效）",
+		"message":   "配置已保存（修改代理或 UA 需重启服务生效）",
 	})
 }
 
 func (s *Server) handlePromptCatalog(w http.ResponseWriter, r *http.Request) {
 	papers, _ := prompts.Papers()
-	cached, custom := s.client.CountCachedPDFs()
+	cached, custom := s.mgr.Ephemeral().CountCachedPDFs()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":     true,
 		"stats":  prompts.GetStats(),

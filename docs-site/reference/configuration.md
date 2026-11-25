@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | `BOHRIUM_HOST` | `0.0.0.0` | HTTP 服务监听地址 |
 | `BOHRIUM_PORT` | `8788` | HTTP 服务监听端口 |
-| `BOHRIUM_DATA_DIR` | `data`（容器内 `/data`） | 持久化数据目录（配置、登录态、日志、PDF 缓存） |
+| `BOHRIUM_DATA_DIR` | `data`（容器内 `/data`） | 持久化数据目录（`config.json`、`bohrium.db` SQLite 数据库、PDF 缓存；启动时自动无损迁移旧版 `state.json`/`responses.json`） |
 | `BOHRIUM_ADMIN_PASSWORD` | 首次启动自动随机生成 | 管理后台登录密码（也兼容 `ADMIN_PASSWORD`） |
 | `BOHRIUM_SESSION_SECRET` | 首次启动自动随机生成 | 管理员 Cookie HMAC-SHA256 签名密钥 |
 | `BOHRIUM_SCHEDULE_ENABLED` | `true` | 是否开启每日定时自动执行 |

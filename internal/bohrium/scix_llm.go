@@ -393,7 +393,10 @@ type SciXExecutionPayload struct {
 // scenario="local_agent" and canonical UUIDs, mirroring scix.exe's src/llm/execution.rs behavior.
 func (c *Client) BuildSciXExecutionHeader(opts SciXExecOptions) string {
 	storeID := ""
-	if c.cfg != nil {
+	if c.store != nil {
+		storeID = strings.TrimSpace(c.store.StoreID())
+	}
+	if !isCanonicalUUID(storeID) && c.cfg != nil {
 		storeID = strings.TrimSpace(c.cfg.Get().Gateway.StoreID)
 	}
 	if !isCanonicalUUID(storeID) {

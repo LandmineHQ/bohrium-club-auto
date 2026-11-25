@@ -3,13 +3,13 @@ package openai
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"bohrium-club-auto/internal/bohrium"
@@ -18,40 +18,58 @@ import (
 
 const (
 	maxRequestBodyBytes = 32 * 1024 * 1024 // 32 MiB to accommodate multimodal base64 images
-	maxTrackedSessions  = 256
+	maxFailoverAttempts = 3
 )
 
-type trackedSession struct {
-	sessionID        string
-	rootSessionID    string
-	runID            string
-	rootRunID        string
-	sessionCreatedAt string
-	updatedAt        time.Time
+type ctxKey string
+
+const (
+	ctxKeyExplicitAccount ctxKey = "bohrium_explicit_account_id"
+	ctxKeyAPIKeyID        ctxKey = "bohrium_api_key_id"
+)
+
+// WithExplicitAccountID attaches an internal-only account override (used by Admin Playground).
+// External /v1/* callers cannot set this context value and always use the weighted OpenAI routing pool.
+func WithExplicitAccountID(ctx context.Context, accountID string) context.Context {
+	return context.WithValue(ctx, ctxKeyExplicitAccount, strings.TrimSpace(accountID))
 }
 
-// Gateway exposes full OpenAI-compatible /v1/models, /v1/chat/completions, and /v1/responses endpoints
-// backed faithfully by Bohrium desktop client's native Sigma LLM protocol.
+func explicitAccountFromCtx(ctx context.Context) string {
+	if v, ok := ctx.Value(ctxKeyExplicitAccount).(string); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
+func apiKeyScopeFromCtx(ctx context.Context) string {
+	if v, ok := ctx.Value(ctxKeyAPIKeyID).(string); ok {
+		return v
+	}
+	return "default"
+}
+
+// Gateway exposes full OpenAI-compatible /v1/models, /v1/balance, /v1/chat/completions, and /v1/responses endpoints
+// backed by a multi-account weighted-balance routing pool over Bohrium desktop client's native Sigma LLM protocol.
 type Gateway struct {
-	cfg      *config.Manager
-	client   *bohrium.Client
-	respDir  *ResponseStore
-	sessMu   sync.Mutex
-	sessions map[string]*trackedSession
+	cfg     *config.Manager
+	mgr     *bohrium.Manager
+	router  *PoolRouter
+	respDir *ResponseStore
 }
 
-// NewGateway constructs a new OpenAI-compatible Bohrium gateway.
-func NewGateway(cfg *config.Manager, client *bohrium.Client) *Gateway {
-	dataDir := ""
-	if cfg != nil {
-		dataDir = cfg.Get().DataDir
-	}
+// NewGateway constructs a multi-account OpenAI-compatible Bohrium gateway.
+func NewGateway(cfg *config.Manager, mgr *bohrium.Manager) *Gateway {
 	return &Gateway{
-		cfg:      cfg,
-		client:   client,
-		respDir:  OpenResponseStore(dataDir),
-		sessions: make(map[string]*trackedSession),
+		cfg:     cfg,
+		mgr:     mgr,
+		router:  NewPoolRouter(mgr),
+		respDir: OpenResponseStore(mgr.Store()),
 	}
+}
+
+// Router returns the underlying multi-account PoolRouter.
+func (g *Gateway) Router() *PoolRouter {
+	return g.router
 }
 
 // RegisterRoutes mounts all OpenAI /v1/* endpoints onto mux.
@@ -74,16 +92,42 @@ func (g *Gateway) Stats() StatsSnapshot {
 
 // ListCatalog returns the live Bohrium SciX model catalog (for Web Console & admin API).
 func (g *Gateway) ListCatalog(ctx context.Context, forceRefresh bool) (*bohrium.SciXModelCatalog, error) {
-	return g.client.GetSciXModelCatalog(ctx, forceRefresh)
+	cli, _, err := g.router.SelectCatalogClient(true)
+	if err != nil {
+		return nil, err
+	}
+	return cli.GetSciXModelCatalog(ctx, forceRefresh)
 }
 
-// Preflight runs Bohrium's /billing/preflight admission check for a model.
-func (g *Gateway) Preflight(ctx context.Context, modelID string) (bool, string, error) {
-	resolved, _, err := g.client.ResolveSciXModel(ctx, modelID)
-	if err != nil {
-		return false, "", err
+// Preflight runs Bohrium's /billing/preflight admission check for a model using either a specific account or a pooled account.
+func (g *Gateway) Preflight(ctx context.Context, accountID, modelID string) (bool, string, string, error) {
+	var (
+		cli     *bohrium.Client
+		accName string
+	)
+	if strings.TrimSpace(accountID) != "" {
+		acc, ok, err := g.mgr.Store().GetAccount(accountID)
+		if err != nil || !ok {
+			return false, "", "", fmt.Errorf("账号不存在: %s", accountID)
+		}
+		cli = g.mgr.ForAccount(acc.ID)
+		accName = acc.DisplayName()
+	} else {
+		c, acc, err := g.router.SelectCatalogClient(false)
+		if err != nil {
+			return false, "", "", err
+		}
+		cli = c
+		if acc != nil {
+			accName = acc.DisplayName()
+		}
 	}
-	return g.client.SciXBillingPreflight(ctx, resolved.ID, bohrium.NewTraceparent())
+	resolved, _, err := cli.ResolveSciXModel(ctx, modelID)
+	if err != nil {
+		return false, "", accName, err
+	}
+	allowed, reason, err := cli.SciXBillingPreflight(ctx, resolved.ID, bohrium.NewTraceparent())
+	return allowed, reason, accName, err
 }
 
 func (g *Gateway) applyCORS(w http.ResponseWriter) {
@@ -95,8 +139,8 @@ func (g *Gateway) applyCORS(w http.ResponseWriter) {
 	}
 	w.Header().Set("Access-Control-Allow-Origin", origins)
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, x-api-key, api-key, OpenAI-Beta, x-scix-execution, traceparent, X-Refresh-Models")
-	w.Header().Set("Access-Control-Expose-Headers", "x-request-id, openai-request-id")
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, x-api-key, api-key, OpenAI-Beta, x-scix-execution, x-session-id, traceparent, X-Refresh-Models")
+	w.Header().Set("Access-Control-Expose-Headers", "x-request-id, openai-request-id, x-bohrium-routing-mode")
 }
 
 func (g *Gateway) handleCORS(w http.ResponseWriter, r *http.Request) {
@@ -116,14 +160,17 @@ func (g *Gateway) withMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "gateway_disabled", "OpenAI gateway is disabled in configuration")
 			return
 		}
+		keyID := "public"
 		if !gwCfg.AllowNoAuth {
 			key := extractAPIKey(r)
-			if key == "" || !validateAPIKey(key, gwCfg.APIKeys) {
+			matchedID, ok := validateAPIKey(key, gwCfg.APIKeys)
+			if !ok {
 				WriteError(w, http.StatusUnauthorized, "authentication_error", "invalid_api_key", "Invalid or missing API key; provide Authorization: Bearer <sk-brm-...>")
 				return
 			}
+			keyID = matchedID
 		}
-		next(w, r)
+		next(w, r.WithContext(context.WithValue(r.Context(), ctxKeyAPIKeyID, keyID)))
 	}
 }
 
@@ -143,8 +190,12 @@ func extractAPIKey(r *http.Request) string {
 	return ""
 }
 
-func validateAPIKey(candidate string, keys []config.APIKey) bool {
+func validateAPIKey(candidate string, keys []config.APIKey) (string, bool) {
+	if candidate == "" {
+		return "", false
+	}
 	cBytes := []byte(candidate)
+	matchedID := ""
 	matched := false
 	for _, k := range keys {
 		if !k.Enabled || k.Key == "" {
@@ -152,9 +203,10 @@ func validateAPIKey(candidate string, keys []config.APIKey) bool {
 		}
 		if subtle.ConstantTimeCompare(cBytes, []byte(k.Key)) == 1 {
 			matched = true
+			matchedID = k.ID
 		}
 	}
-	return matched
+	return matchedID, matched
 }
 
 func (g *Gateway) handleListModels(w http.ResponseWriter, r *http.Request) {
@@ -162,12 +214,13 @@ func (g *Gateway) handleListModels(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
 
-	cat, err := g.client.GetSciXModelCatalog(ctx, force)
+	cli, _, err := g.router.SelectCatalogClient(false)
 	if err != nil {
-		if errors.Is(err, bohrium.ErrBohriumNotLoggedIn) {
-			WriteError(w, http.StatusServiceUnavailable, "authentication_error", "bohrium_not_logged_in", err.Error())
-			return
-		}
+		writePoolRouteError(w, err)
+		return
+	}
+	cat, err := cli.GetSciXModelCatalog(ctx, force)
+	if err != nil {
 		WriteError(w, http.StatusBadGateway, "upstream_error", "catalog_unavailable", err.Error())
 		return
 	}
@@ -179,19 +232,20 @@ func (g *Gateway) handleGetModel(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
 
-	m, _, err := g.client.ResolveSciXModel(ctx, id)
+	cli, _, err := g.router.SelectCatalogClient(false)
 	if err != nil {
-		if errors.Is(err, bohrium.ErrBohriumNotLoggedIn) {
-			WriteError(w, http.StatusServiceUnavailable, "authentication_error", "bohrium_not_logged_in", err.Error())
-			return
-		}
+		writePoolRouteError(w, err)
+		return
+	}
+	m, _, err := cli.ResolveSciXModel(ctx, id)
+	if err != nil {
 		WriteError(w, http.StatusNotFound, "invalid_request_error", "model_not_found", err.Error())
 		return
 	}
 	WriteJSON(w, http.StatusOK, m)
 }
 
-// BalanceResponse represents the OpenAI-gateway /v1/balance response payload.
+// BalanceResponse represents the OpenAI-gateway /v1/balance aggregated pool response payload.
 type BalanceResponse struct {
 	Object            string                `json:"object"`
 	IsAvailable       bool                  `json:"is_available"`
@@ -202,6 +256,9 @@ type BalanceResponse struct {
 	OrgBalanceLimit   float64               `json:"org_balance_limit"`
 	WalletBalanceCNY  float64               `json:"wallet_balance_cny"`
 	Expiring7DPhotons float64               `json:"expiring_7d_photons"`
+	PoolAccountCount  int                   `json:"pool_account_count"`
+	HealthyPoolCount  int                   `json:"healthy_pool_count"`
+	PoolAccounts      []PoolAccountView     `json:"pool_accounts"`
 	Membership        BalanceMembership     `json:"membership"`
 	Quotas            BalanceQuotas         `json:"quotas"`
 	Storage           BalanceStorage        `json:"storage"`
@@ -246,77 +303,112 @@ type BalanceCurrencyInfo struct {
 }
 
 func (g *Gateway) handleGetBalance(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
-	auth := g.client.RedactedAuth()
-	if auth.UserID == 0 && auth.ExpiresAt.IsZero() && auth.LoginMethod == "" {
-		// Check session accurately before querying assets.
-		sess := g.client.CheckSession(ctx)
-		if !sess.HasToken {
-			WriteError(w, http.StatusServiceUnavailable, "authentication_error", "bohrium_not_logged_in", bohrium.ErrBohriumNotLoggedIn.Error())
-			return
-		}
-	}
-
-	assets, err := g.client.GetPointsAndCapacity(ctx)
+	poolAccounts, err := g.mgr.Store().ListPoolAccounts()
 	if err != nil {
-		if strings.Contains(err.Error(), "请先登录") {
-			WriteError(w, http.StatusServiceUnavailable, "authentication_error", "bohrium_not_logged_in", bohrium.ErrBohriumNotLoggedIn.Error())
-			return
-		}
-		WriteError(w, http.StatusBadGateway, "upstream_error", "balance_query_failed", err.Error())
+		WriteError(w, http.StatusInternalServerError, "server_error", "store_error", err.Error())
+		return
+	}
+	if len(poolAccounts) == 0 {
+		WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "empty_pool", ErrEmptyPool.Error())
 		return
 	}
 
-	totalPhotons := assets.PhotonBalance + assets.OrgBalance
+	var (
+		totalPhotons    float64
+		totalOrg        float64
+		totalOrgLimit   float64
+		totalWalletCNY  float64
+		totalExpiring7D float64
+		allLots         []bohrium.ExpiringLot
+		warnings        []string
+		firstAssets     *bohrium.PointsAndCapacity
+	)
+
+	// Refresh live balances for every account in the OpenAI routing pool.
+	for _, acc := range poolAccounts {
+		assets, aErr := g.mgr.RefreshAccountBalance(ctx, acc.ID)
+		if aErr != nil {
+			warnings = append(warnings, fmt.Sprintf("%s: %v", acc.DisplayName(), aErr))
+			totalPhotons += acc.PhotonBalance
+			totalOrg += acc.OrgBalance
+			totalWalletCNY += acc.WalletBalanceCNY
+			continue
+		}
+		if firstAssets == nil {
+			firstAssets = assets
+		}
+		totalPhotons += assets.PhotonBalance
+		totalOrg += assets.OrgBalance
+		totalOrgLimit += assets.OrgBalanceLimit
+		totalWalletCNY += assets.WalletBalance
+		totalExpiring7D += assets.Expiring7DayPhotons
+		allLots = append(allLots, assets.ExpiringLots...)
+	}
+
+	views, _, _ := g.router.PoolSummary()
+	healthyCnt := 0
+	for _, v := range views {
+		if v.Healthy {
+			healthyCnt++
+		}
+	}
+
+	combinedPhotons := totalPhotons + totalOrg
 	resp := BalanceResponse{
 		Object:            "balance",
-		IsAvailable:       totalPhotons > 0 || assets.WalletBalance > 0,
+		IsAvailable:       healthyCnt > 0 && (combinedPhotons > 0 || totalWalletCNY > 0),
 		Currency:          "photon",
-		Balance:           assets.PhotonBalance,
-		PhotonBalance:     assets.PhotonBalance,
-		OrgBalance:        assets.OrgBalance,
-		OrgBalanceLimit:   assets.OrgBalanceLimit,
-		WalletBalanceCNY:  assets.WalletBalance,
-		Expiring7DPhotons: assets.Expiring7DayPhotons,
-		Membership: BalanceMembership{
-			Level:           assets.MembershipLevel,
-			ExpireAt:        assets.MembershipExpire,
-			Photons:         assets.MembershipPhotons,
-			NextBenefitDate: assets.NextBenefitDate,
-		},
-		Quotas: BalanceQuotas{
-			PaperSearch:   assets.PaperQuota,
-			KnowledgeChat: assets.KnowledgeChat,
-			DeepResearch:  assets.DeepResearch,
-		},
-		Storage: BalanceStorage{
-			RemainingBytes: assets.Storage.RemainingBytes,
-			UsedBytes:      assets.Storage.UsedBytes,
-			TotalBytes:     assets.Storage.TotalBytes,
-			UsedPercent:    assets.Storage.UsedPercent,
-			RemainingHuman: assets.Storage.RemainingHuman,
-			UsedHuman:      assets.Storage.UsedHuman,
-			TotalHuman:     assets.Storage.TotalHuman,
-		},
-		ExpiringLots: assets.ExpiringLots,
+		Balance:           totalPhotons,
+		PhotonBalance:     totalPhotons,
+		OrgBalance:        totalOrg,
+		OrgBalanceLimit:   totalOrgLimit,
+		WalletBalanceCNY:  totalWalletCNY,
+		Expiring7DPhotons: totalExpiring7D,
+		PoolAccountCount:  len(views),
+		HealthyPoolCount:  healthyCnt,
+		PoolAccounts:      views,
+		ExpiringLots:      allLots,
 		BalanceInfos: []BalanceCurrencyInfo{
 			{
 				Currency:        "PHOTON",
-				TotalBalance:    fmt.Sprintf("%.2f", totalPhotons),
-				GrantedBalance:  fmt.Sprintf("%.2f", assets.PhotonBalance),
-				ToppedUpBalance: fmt.Sprintf("%.2f", assets.OrgBalance),
+				TotalBalance:    fmt.Sprintf("%.2f", combinedPhotons),
+				GrantedBalance:  fmt.Sprintf("%.2f", totalPhotons),
+				ToppedUpBalance: fmt.Sprintf("%.2f", totalOrg),
 			},
 			{
 				Currency:        "CNY",
-				TotalBalance:    fmt.Sprintf("%.2f", assets.WalletBalance),
+				TotalBalance:    fmt.Sprintf("%.2f", totalWalletCNY),
 				GrantedBalance:  "0.00",
-				ToppedUpBalance: fmt.Sprintf("%.2f", assets.WalletBalance),
+				ToppedUpBalance: fmt.Sprintf("%.2f", totalWalletCNY),
 			},
 		},
-		FetchedAt: assets.FetchedAt.UTC().Format(time.RFC3339),
-		Warnings:  assets.Warnings,
+		FetchedAt: time.Now().UTC().Format(time.RFC3339),
+		Warnings:  warnings,
+	}
+	if firstAssets != nil {
+		resp.Membership = BalanceMembership{
+			Level:           firstAssets.MembershipLevel,
+			ExpireAt:        firstAssets.MembershipExpire,
+			Photons:         firstAssets.MembershipPhotons,
+			NextBenefitDate: firstAssets.NextBenefitDate,
+		}
+		resp.Quotas = BalanceQuotas{
+			PaperSearch:   firstAssets.PaperQuota,
+			KnowledgeChat: firstAssets.KnowledgeChat,
+			DeepResearch:  firstAssets.DeepResearch,
+		}
+		resp.Storage = BalanceStorage{
+			RemainingBytes: firstAssets.Storage.RemainingBytes,
+			UsedBytes:      firstAssets.Storage.UsedBytes,
+			TotalBytes:     firstAssets.Storage.TotalBytes,
+			UsedPercent:    firstAssets.Storage.UsedPercent,
+			RemainingHuman: firstAssets.Storage.RemainingHuman,
+			UsedHuman:      firstAssets.Storage.UsedHuman,
+			TotalHuman:     firstAssets.Storage.TotalHuman,
+		}
 	}
 	WriteJSON(w, http.StatusOK, resp)
 }
@@ -340,96 +432,165 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	}
 
 	ctx := r.Context()
-	model, _, err := g.client.ResolveSciXModel(ctx, req.Model)
-	if err != nil {
-		status := http.StatusBadRequest
-		errType := "invalid_request_error"
-		code := "model_not_found"
-		if errors.Is(err, bohrium.ErrBohriumNotLoggedIn) {
-			status = http.StatusServiceUnavailable
-			errType = "authentication_error"
-			code = "bohrium_not_logged_in"
-		}
-		WriteError(w, status, errType, code, err.Error())
-		g.recordFailure("/v1/chat/completions", "", req.Model, req.Stream, status, start, err.Error())
-		return
-	}
+	isToolCont := isChatToolContinuation(&req)
+	sessionHash := computeChatSessionHash(r, &req)
+	explicitAcc := explicitAccountFromCtx(ctx)
+	excluded := make(map[string]bool)
 
-	upstreamAPI := model.EffectiveAPI()
-	traceparent := strings.TrimSpace(r.Header.Get("traceparent"))
-	if traceparent == "" {
-		traceparent = bohrium.NewTraceparent()
-	}
-
-	// Mirror Bohrium desktop client: run /billing/preflight on new user turns,
-	// skipping redundant preflights during mid-loop tool continuation steps.
-	if !isChatToolContinuation(&req) {
-		if status, errType, code, reason, ok := g.runPreflightIfEnabled(ctx, model.ID, traceparent); !ok {
-			WriteError(w, status, errType, code, reason)
-			g.recordFailure("/v1/chat/completions", upstreamAPI, model.ID, req.Stream, status, start, reason)
-			return
-		}
-	}
-
-	if upstreamAPI == "chat_completions" {
-		g.execChatViaChatUpstream(w, r, &req, model, traceparent, start)
-		return
-	}
-	g.execChatViaResponsesUpstream(w, r, &req, model, traceparent, start)
-}
-
-func (g *Gateway) execChatViaChatUpstream(w http.ResponseWriter, r *http.Request, req *ChatCompletionRequest, model bohrium.SciXModel, traceparent string, start time.Time) {
-	isToolCont := isChatToolContinuation(req)
-	sessionID, execHdr := g.resolveExecEnvelope(
-		r.Header.Get(bohrium.SciXExecutionHeader),
-		sessionSeedForChat(req),
-		model.ID,
-		"",
-		lastChatToolCallID(req),
-		isToolCont,
+	var (
+		lastStatus  int
+		lastErrType string
+		lastErrCode string
+		lastErrMsg  string
 	)
 
-	payloadMap, question, err := NormalizeChatRequestForSciX(req, model, SciXRequestOptions{
-		SciMasterPrompt: g.sciMasterPromptEnabled(),
-		ForceStream:     true, // Match brain.mjs which always streams SSE from Bohrium Sigma
-		SessionID:       sessionID,
-	})
-	if err != nil {
-		WriteError(w, http.StatusBadRequest, "invalid_request_error", "invalid_request", err.Error())
-		g.recordFailure("/v1/chat/completions", "chat_completions", model.ID, req.Stream, http.StatusBadRequest, start, err.Error())
-		return
+	attempts := maxFailoverAttempts
+	if explicitAcc != "" {
+		attempts = 1
 	}
-	if question != "" {
-		_, execHdr = g.resolveExecEnvelopeWithQuestion(
-			r.Header.Get(bohrium.SciXExecutionHeader),
-			sessionID,
-			model.ID,
-			question,
-			lastChatToolCallID(req),
+
+	for attempt := 0; attempt < attempts; attempt++ {
+		decision, rErr := g.router.SelectAccount(ctx, RouteRequest{
+			SessionHash:        sessionHash,
+			ExplicitAccountID:  explicitAcc,
+			ModelHint:          req.Model,
+			IsToolContinuation: isToolCont,
+			ExcludeAccountIDs:  excluded,
+		})
+		if rErr != nil {
+			if attempt > 0 && lastStatus > 0 {
+				WriteError(w, lastStatus, lastErrType, lastErrCode, lastErrMsg)
+				g.recordFailure("/v1/chat/completions", "", req.Model, "", "", "", req.Stream, lastStatus, start, lastErrMsg)
+				return
+			}
+			status := writePoolRouteError(w, rErr)
+			g.recordFailure("/v1/chat/completions", "", req.Model, "", "", "", req.Stream, status, start, rErr.Error())
+			return
+		}
+
+		model, _, mErr := decision.Client.ResolveSciXModel(ctx, req.Model)
+		if mErr != nil {
+			if isAuthErrorText(mErr.Error()) && explicitAcc == "" {
+				g.markAccountExpired(decision.Account.ID, mErr.Error())
+				excluded[decision.Account.ID] = true
+				lastStatus, lastErrType, lastErrCode, lastErrMsg = http.StatusServiceUnavailable, "authentication_error", "account_expired", mErr.Error()
+				continue
+			}
+			WriteError(w, http.StatusBadRequest, "invalid_request_error", "model_not_found", mErr.Error())
+			g.recordFailure("/v1/chat/completions", "", req.Model, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, http.StatusBadRequest, start, mErr.Error())
+			return
+		}
+
+		upstreamAPI := model.EffectiveAPI()
+		traceparent := strings.TrimSpace(r.Header.Get("traceparent"))
+		if traceparent == "" {
+			traceparent = bohrium.NewTraceparent()
+		}
+
+		if !isToolCont {
+			if status, errType, code, reason, ok := g.runPreflightIfEnabled(ctx, decision.Client, model.ID, traceparent); !ok {
+				if status == http.StatusPaymentRequired && explicitAcc == "" {
+					g.markAccountInsufficient(decision.Account.ID, reason)
+					excluded[decision.Account.ID] = true
+					lastStatus, lastErrType, lastErrCode, lastErrMsg = status, errType, code, reason
+					continue
+				}
+				WriteError(w, status, errType, code, reason)
+				g.recordFailure("/v1/chat/completions", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, status, start, reason)
+				return
+			}
+		}
+
+		var (
+			payloadMap map[string]any
+			question   string
+			subPath    string
+			normErr    error
 		)
-	}
-	payloadBytes, err := json.Marshal(payloadMap)
-	if err != nil {
-		WriteError(w, http.StatusInternalServerError, "server_error", "marshal_error", err.Error())
+		opts := SciXRequestOptions{
+			SciMasterPrompt: g.sciMasterPromptEnabled(),
+			ForceStream:     true,
+			SessionID:       decision.SciXSessionID,
+		}
+		if upstreamAPI == "chat_completions" {
+			subPath = "/chat/completions"
+			payloadMap, question, normErr = NormalizeChatRequestForSciX(&req, model, opts)
+		} else {
+			subPath = "/responses"
+			payloadMap, question, normErr = ChatToResponsesRequest(&req, model, opts)
+		}
+		if normErr != nil {
+			WriteError(w, http.StatusBadRequest, "invalid_request_error", "invalid_request", normErr.Error())
+			g.recordFailure("/v1/chat/completions", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, http.StatusBadRequest, start, normErr.Error())
+			return
+		}
+		payloadBytes, err := json.Marshal(payloadMap)
+		if err != nil {
+			WriteError(w, http.StatusInternalServerError, "server_error", "marshal_error", err.Error())
+			return
+		}
+
+		execHdr := decision.Client.BuildSciXExecutionHeader(bohrium.SciXExecOptions{
+			IncomingHeader:   r.Header.Get(bohrium.SciXExecutionHeader),
+			SessionID:        decision.SciXSessionID,
+			RootSessionID:    decision.SciXSessionID,
+			RunID:            decision.SciXRunID,
+			RootRunID:        decision.SciXRunID,
+			SessionCreatedAt: decision.SessionCreatedAt,
+			Question:         question,
+			ToolCallID:       lastChatToolCallID(&req),
+			ModelID:          model.ID,
+		})
+
+		upResp, err := decision.Client.DoSciXLLM(ctx, subPath, payloadBytes, true, execHdr, traceparent)
+		if err != nil {
+			WriteError(w, http.StatusBadGateway, "upstream_error", "upstream_transport_error", err.Error())
+			g.recordFailure("/v1/chat/completions", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, http.StatusBadGateway, start, err.Error())
+			return
+		}
+
+		if upResp.StatusCode < 200 || upResp.StatusCode >= 300 {
+			errBody, _ := io.ReadAll(io.LimitReader(upResp.Body, 256*1024))
+			_ = upResp.Body.Close()
+
+			// Pre-first-byte failover on account auth expiry (401) or photon exhaustion (402 / insufficient_balance).
+			if explicitAcc == "" && shouldFailoverUpstreamStatus(upResp.StatusCode, errBody) {
+				errTxt := extractUpstreamErrorText(errBody, upResp.StatusCode)
+				if upResp.StatusCode == http.StatusUnauthorized {
+					g.markAccountExpired(decision.Account.ID, errTxt)
+					lastStatus, lastErrType, lastErrCode, lastErrMsg = http.StatusUnauthorized, "authentication_error", "account_expired", errTxt
+				} else {
+					g.markAccountInsufficient(decision.Account.ID, errTxt)
+					lastStatus, lastErrType, lastErrCode, lastErrMsg = http.StatusPaymentRequired, "insufficient_quota", "insufficient_balance", errTxt
+				}
+				excluded[decision.Account.ID] = true
+				continue
+			}
+
+			copyUpstreamRequestID(w, upResp)
+			errMsg := forwardUpstreamError(w, upResp.StatusCode, errBody)
+			g.recordFailure("/v1/chat/completions", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, upResp.StatusCode, start, errMsg)
+			return
+		}
+
+		// Upstream returned 2xx: commit response to client (no failover after first byte).
+		defer upResp.Body.Close()
+		copyUpstreamRequestID(w, upResp)
+		w.Header().Set("X-Bohrium-Routing-Mode", decision.Mode)
+
+		if upstreamAPI == "chat_completions" {
+			g.finishChatFromChatUpstream(w, &req, model, decision, upResp, start)
+		} else {
+			g.finishChatFromResponsesUpstream(w, &req, model, decision, upResp, start)
+		}
 		return
 	}
 
-	upResp, err := g.client.DoSciXLLM(r.Context(), "/chat/completions", payloadBytes, true, execHdr, traceparent)
-	if err != nil {
-		WriteError(w, http.StatusBadGateway, "upstream_error", "upstream_transport_error", err.Error())
-		g.recordFailure("/v1/chat/completions", "chat_completions", model.ID, req.Stream, http.StatusBadGateway, start, err.Error())
-		return
-	}
-	defer upResp.Body.Close()
+	WriteError(w, lastStatus, lastErrType, lastErrCode, lastErrMsg)
+	g.recordFailure("/v1/chat/completions", "", req.Model, "", "", "", req.Stream, lastStatus, start, lastErrMsg)
+}
 
-	copyUpstreamRequestID(w, upResp)
-	if upResp.StatusCode < 200 || upResp.StatusCode >= 300 {
-		errBody, _ := io.ReadAll(io.LimitReader(upResp.Body, 256*1024))
-		errMsg := forwardUpstreamError(w, upResp.StatusCode, errBody)
-		g.recordFailure("/v1/chat/completions", "chat_completions", model.ID, req.Stream, upResp.StatusCode, start, errMsg)
-		return
-	}
-
+func (g *Gateway) finishChatFromChatUpstream(w http.ResponseWriter, req *ChatCompletionRequest, model bohrium.SciXModel, decision *RouteDecision, upResp *http.Response, start time.Time) {
 	if req.Stream {
 		usage, sErr := PipeChatSSE(w, upResp.Body)
 		errStr := ""
@@ -440,6 +601,9 @@ func (g *Gateway) execChatViaChatUpstream(w http.ResponseWriter, r *http.Request
 			Endpoint:         "/v1/chat/completions",
 			UpstreamAPI:      "chat_completions",
 			Model:            model.ID,
+			AccountID:        decision.Account.ID,
+			AccountLabel:     decision.Account.DisplayName(),
+			RoutingMode:      decision.Mode,
 			Stream:           true,
 			Status:           http.StatusOK,
 			DurationMs:       time.Since(start).Milliseconds(),
@@ -452,19 +616,22 @@ func (g *Gateway) execChatViaChatUpstream(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	var parsed *ChatCompletionResponse
+	var (
+		parsed *ChatCompletionResponse
+		err    error
+	)
 	if isSSEContentType(upResp) {
 		parsed, err = AggregateChatSSE(upResp.Body, model.ID)
 		if err != nil {
 			WriteError(w, http.StatusBadGateway, "upstream_error", "stream_aggregate_error", err.Error())
-			g.recordFailure("/v1/chat/completions", "chat_completions", model.ID, false, http.StatusBadGateway, start, err.Error())
+			g.recordFailure("/v1/chat/completions", "chat_completions", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, http.StatusBadGateway, start, err.Error())
 			return
 		}
 	} else {
 		rawResp, rErr := io.ReadAll(io.LimitReader(upResp.Body, 32*1024*1024))
 		if rErr != nil {
 			WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", rErr.Error())
-			g.recordFailure("/v1/chat/completions", "chat_completions", model.ID, false, http.StatusBadGateway, start, rErr.Error())
+			g.recordFailure("/v1/chat/completions", "chat_completions", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, http.StatusBadGateway, start, rErr.Error())
 			return
 		}
 		var direct ChatCompletionResponse
@@ -473,14 +640,6 @@ func (g *Gateway) execChatViaChatUpstream(w http.ResponseWriter, r *http.Request
 			w.Header().Set("Cache-Control", "no-store")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(rawResp)
-			g.respDir.RecordRequest(RequestLogEntry{
-				Endpoint:    "/v1/chat/completions",
-				UpstreamAPI: "chat_completions",
-				Model:       model.ID,
-				Stream:      false,
-				Status:      http.StatusOK,
-				DurationMs:  time.Since(start).Milliseconds(),
-			})
 			return
 		}
 		parsed = &direct
@@ -496,6 +655,9 @@ func (g *Gateway) execChatViaChatUpstream(w http.ResponseWriter, r *http.Request
 		Endpoint:         "/v1/chat/completions",
 		UpstreamAPI:      "chat_completions",
 		Model:            model.ID,
+		AccountID:        decision.Account.ID,
+		AccountLabel:     decision.Account.DisplayName(),
+		RoutingMode:      decision.Mode,
 		Stream:           false,
 		Status:           http.StatusOK,
 		DurationMs:       time.Since(start).Milliseconds(),
@@ -506,58 +668,7 @@ func (g *Gateway) execChatViaChatUpstream(w http.ResponseWriter, r *http.Request
 	})
 }
 
-func (g *Gateway) execChatViaResponsesUpstream(w http.ResponseWriter, r *http.Request, req *ChatCompletionRequest, model bohrium.SciXModel, traceparent string, start time.Time) {
-	isToolCont := isChatToolContinuation(req)
-	sessionID, execHdr := g.resolveExecEnvelope(
-		r.Header.Get(bohrium.SciXExecutionHeader),
-		sessionSeedForChat(req),
-		model.ID,
-		"",
-		lastChatToolCallID(req),
-		isToolCont,
-	)
-
-	payloadMap, question, err := ChatToResponsesRequest(req, model, SciXRequestOptions{
-		SciMasterPrompt: g.sciMasterPromptEnabled(),
-		ForceStream:     true,
-		SessionID:       sessionID,
-	})
-	if err != nil {
-		WriteError(w, http.StatusBadRequest, "invalid_request_error", "invalid_request", err.Error())
-		g.recordFailure("/v1/chat/completions", "responses", model.ID, req.Stream, http.StatusBadRequest, start, err.Error())
-		return
-	}
-	if question != "" {
-		_, execHdr = g.resolveExecEnvelopeWithQuestion(
-			r.Header.Get(bohrium.SciXExecutionHeader),
-			sessionID,
-			model.ID,
-			question,
-			lastChatToolCallID(req),
-		)
-	}
-	payloadBytes, err := json.Marshal(payloadMap)
-	if err != nil {
-		WriteError(w, http.StatusInternalServerError, "server_error", "marshal_error", err.Error())
-		return
-	}
-
-	upResp, err := g.client.DoSciXLLM(r.Context(), "/responses", payloadBytes, true, execHdr, traceparent)
-	if err != nil {
-		WriteError(w, http.StatusBadGateway, "upstream_error", "upstream_transport_error", err.Error())
-		g.recordFailure("/v1/chat/completions", "responses", model.ID, req.Stream, http.StatusBadGateway, start, err.Error())
-		return
-	}
-	defer upResp.Body.Close()
-
-	copyUpstreamRequestID(w, upResp)
-	if upResp.StatusCode < 200 || upResp.StatusCode >= 300 {
-		errBody, _ := io.ReadAll(io.LimitReader(upResp.Body, 256*1024))
-		errMsg := forwardUpstreamError(w, upResp.StatusCode, errBody)
-		g.recordFailure("/v1/chat/completions", "responses", model.ID, req.Stream, upResp.StatusCode, start, errMsg)
-		return
-	}
-
+func (g *Gateway) finishChatFromResponsesUpstream(w http.ResponseWriter, req *ChatCompletionRequest, model bohrium.SciXModel, decision *RouteDecision, upResp *http.Response, start time.Time) {
 	if req.Stream {
 		includeUsage := req.StreamOptions == nil || req.StreamOptions.IncludeUsage
 		usage, sErr := StreamResponsesToChatSSE(w, upResp.Body, model.ID, includeUsage)
@@ -569,6 +680,9 @@ func (g *Gateway) execChatViaResponsesUpstream(w http.ResponseWriter, r *http.Re
 			Endpoint:         "/v1/chat/completions",
 			UpstreamAPI:      "responses",
 			Model:            model.ID,
+			AccountID:        decision.Account.ID,
+			AccountLabel:     decision.Account.DisplayName(),
+			RoutingMode:      decision.Mode,
 			Stream:           true,
 			Status:           http.StatusOK,
 			DurationMs:       time.Since(start).Milliseconds(),
@@ -581,19 +695,22 @@ func (g *Gateway) execChatViaResponsesUpstream(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	var respMap map[string]any
+	var (
+		respMap map[string]any
+		err     error
+	)
 	if isSSEContentType(upResp) {
 		respMap, err = AggregateResponsesSSE(upResp.Body, nil, model.ID)
 		if err != nil {
 			WriteError(w, http.StatusBadGateway, "upstream_error", "stream_aggregate_error", err.Error())
-			g.recordFailure("/v1/chat/completions", "responses", model.ID, false, http.StatusBadGateway, start, err.Error())
+			g.recordFailure("/v1/chat/completions", "responses", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, http.StatusBadGateway, start, err.Error())
 			return
 		}
 	} else {
 		rawResp, rErr := io.ReadAll(io.LimitReader(upResp.Body, 32*1024*1024))
 		if rErr != nil {
 			WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", rErr.Error())
-			g.recordFailure("/v1/chat/completions", "responses", model.ID, false, http.StatusBadGateway, start, rErr.Error())
+			g.recordFailure("/v1/chat/completions", "responses", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, http.StatusBadGateway, start, rErr.Error())
 			return
 		}
 		if err := json.Unmarshal(rawResp, &respMap); err != nil {
@@ -609,6 +726,9 @@ func (g *Gateway) execChatViaResponsesUpstream(w http.ResponseWriter, r *http.Re
 		Endpoint:         "/v1/chat/completions",
 		UpstreamAPI:      "responses",
 		Model:            model.ID,
+		AccountID:        decision.Account.ID,
+		AccountLabel:     decision.Account.DisplayName(),
+		RoutingMode:      decision.Mode,
 		Stream:           false,
 		Status:           http.StatusOK,
 		DurationMs:       time.Since(start).Milliseconds(),
@@ -636,7 +756,6 @@ func (g *Gateway) handleCreateResponse(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusBadRequest, "invalid_request_error", "invalid_json", "Invalid JSON body: "+err.Error())
 		return
 	}
-
 	if req.Background != nil && *req.Background {
 		WriteError(w, http.StatusBadRequest, "invalid_request_error", "unsupported_parameter", "background=true is not supported; use synchronous streaming or non-streaming requests")
 		return
@@ -648,16 +767,23 @@ func (g *Gateway) handleCreateResponse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve previous_response_id chain locally since Bohrium upstream Responses is stateless.
-	var allItems []map[string]any
+	var (
+		allItems         []map[string]any
+		prevRootID       string
+		prevAccountID    string
+		prevSessionHash  string
+	)
 	effectiveInstr := req.Instructions
 	if strings.TrimSpace(req.PreviousResponseID) != "" {
-		prevItems, prevInstr, found := g.respDir.BuildChainItems(strings.TrimSpace(req.PreviousResponseID))
+		prevItems, prevInstr, rootID, accID, sessHash, found := g.respDir.BuildChainItems(strings.TrimSpace(req.PreviousResponseID))
 		if !found {
 			WriteError(w, http.StatusNotFound, "invalid_request_error", "previous_response_not_found", fmt.Sprintf("previous_response_id %q was not found", req.PreviousResponseID))
 			return
 		}
 		allItems = append(allItems, prevItems...)
+		prevRootID = rootID
+		prevAccountID = accID
+		prevSessionHash = sessHash
 		if effectiveInstr == nil && prevInstr != nil {
 			effectiveInstr = prevInstr
 		}
@@ -670,97 +796,167 @@ func (g *Gateway) handleCreateResponse(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	model, _, err := g.client.ResolveSciXModel(ctx, req.Model)
-	if err != nil {
-		status := http.StatusBadRequest
-		errType := "invalid_request_error"
-		code := "model_not_found"
-		if errors.Is(err, bohrium.ErrBohriumNotLoggedIn) {
-			status = http.StatusServiceUnavailable
-			errType = "authentication_error"
-			code = "bohrium_not_logged_in"
-		}
-		WriteError(w, status, errType, code, err.Error())
-		g.recordFailure("/v1/responses", "", req.Model, req.Stream, status, start, err.Error())
-		return
-	}
-
-	traceparent := strings.TrimSpace(r.Header.Get("traceparent"))
-	if traceparent == "" {
-		traceparent = bohrium.NewTraceparent()
-	}
-
-	// Mirror Bohrium desktop client: run /billing/preflight on new user turns,
-	// skipping redundant preflights on pure function_call_output continuation turns.
-	if !isResponsesToolContinuation(turnItems) {
-		if status, errType, code, reason, ok := g.runPreflightIfEnabled(ctx, model.ID, traceparent); !ok {
-			WriteError(w, status, errType, code, reason)
-			g.recordFailure("/v1/responses", model.EffectiveAPI(), model.ID, req.Stream, status, start, reason)
-			return
-		}
-	}
-
-	shouldStore := req.Store == nil || *req.Store
-	if model.EffectiveAPI() == "responses" {
-		g.execResponsesViaResponsesUpstream(w, r, &req, model, turnItems, allItems, effectiveInstr, shouldStore, traceparent, start)
-		return
-	}
-	g.execResponsesViaChatUpstream(w, r, &req, model, turnItems, allItems, effectiveInstr, shouldStore, traceparent, start)
-}
-
-func (g *Gateway) execResponsesViaResponsesUpstream(w http.ResponseWriter, r *http.Request, req *ResponsesRequest, model bohrium.SciXModel, turnItems, allItems []map[string]any, effectiveInstr *string, shouldStore bool, traceparent string, start time.Time) {
 	isToolCont := isResponsesToolContinuation(turnItems)
 	toolCallID := lastResponsesToolCallID(turnItems)
-	sessionID, execHdr := g.resolveExecEnvelope(
-		r.Header.Get(bohrium.SciXExecutionHeader),
-		sessionSeedForResponses(req, g.respDir, allItems),
-		model.ID,
-		"",
-		toolCallID,
-		isToolCont,
+	sessionHash := computeResponsesSessionHash(r, &req, allItems, prevRootID, prevSessionHash)
+	explicitAcc := explicitAccountFromCtx(ctx)
+	shouldStore := req.Store == nil || *req.Store
+	excluded := make(map[string]bool)
+
+	var (
+		lastStatus  int
+		lastErrType string
+		lastErrCode string
+		lastErrMsg  string
 	)
 
-	payloadMap, question, err := NormalizeResponsesRequestForSciX(req, model, allItems, effectiveInstr, SciXRequestOptions{
-		SciMasterPrompt: g.sciMasterPromptEnabled(),
-		ForceStream:     true,
-		SessionID:       sessionID,
-	})
-	if err != nil {
-		WriteError(w, http.StatusBadRequest, "invalid_request_error", "invalid_request", err.Error())
-		g.recordFailure("/v1/responses", "responses", model.ID, req.Stream, http.StatusBadRequest, start, err.Error())
-		return
+	attempts := maxFailoverAttempts
+	if explicitAcc != "" {
+		attempts = 1
 	}
-	if question != "" {
-		_, execHdr = g.resolveExecEnvelopeWithQuestion(
-			r.Header.Get(bohrium.SciXExecutionHeader),
-			sessionID,
-			model.ID,
-			question,
-			toolCallID,
+
+	for attempt := 0; attempt < attempts; attempt++ {
+		decision, rErr := g.router.SelectAccount(ctx, RouteRequest{
+			SessionHash:         sessionHash,
+			ExplicitAccountID:   explicitAcc,
+			PrevRespAccountID:   prevAccountID,
+			PrevRespSessionHash: prevSessionHash,
+			ModelHint:           req.Model,
+			IsToolContinuation:  isToolCont,
+			ExcludeAccountIDs:   excluded,
+		})
+		if rErr != nil {
+			if attempt > 0 && lastStatus > 0 {
+				WriteError(w, lastStatus, lastErrType, lastErrCode, lastErrMsg)
+				g.recordFailure("/v1/responses", "", req.Model, "", "", "", req.Stream, lastStatus, start, lastErrMsg)
+				return
+			}
+			status := writePoolRouteError(w, rErr)
+			g.recordFailure("/v1/responses", "", req.Model, "", "", "", req.Stream, status, start, rErr.Error())
+			return
+		}
+
+		model, _, mErr := decision.Client.ResolveSciXModel(ctx, req.Model)
+		if mErr != nil {
+			if isAuthErrorText(mErr.Error()) && explicitAcc == "" {
+				g.markAccountExpired(decision.Account.ID, mErr.Error())
+				excluded[decision.Account.ID] = true
+				lastStatus, lastErrType, lastErrCode, lastErrMsg = http.StatusServiceUnavailable, "authentication_error", "account_expired", mErr.Error()
+				continue
+			}
+			WriteError(w, http.StatusBadRequest, "invalid_request_error", "model_not_found", mErr.Error())
+			g.recordFailure("/v1/responses", "", req.Model, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, http.StatusBadRequest, start, mErr.Error())
+			return
+		}
+
+		upstreamAPI := model.EffectiveAPI()
+		traceparent := strings.TrimSpace(r.Header.Get("traceparent"))
+		if traceparent == "" {
+			traceparent = bohrium.NewTraceparent()
+		}
+
+		if !isToolCont {
+			if status, errType, code, reason, ok := g.runPreflightIfEnabled(ctx, decision.Client, model.ID, traceparent); !ok {
+				if status == http.StatusPaymentRequired && explicitAcc == "" {
+					g.markAccountInsufficient(decision.Account.ID, reason)
+					excluded[decision.Account.ID] = true
+					lastStatus, lastErrType, lastErrCode, lastErrMsg = status, errType, code, reason
+					continue
+				}
+				WriteError(w, status, errType, code, reason)
+				g.recordFailure("/v1/responses", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, status, start, reason)
+				return
+			}
+		}
+
+		var (
+			payloadMap map[string]any
+			question   string
+			subPath    string
+			normErr    error
 		)
-	}
-	payloadBytes, err := json.Marshal(payloadMap)
-	if err != nil {
-		WriteError(w, http.StatusInternalServerError, "server_error", "marshal_error", err.Error())
+		opts := SciXRequestOptions{
+			SciMasterPrompt: g.sciMasterPromptEnabled(),
+			ForceStream:     true,
+			SessionID:       decision.SciXSessionID,
+		}
+		if upstreamAPI == "responses" {
+			subPath = "/responses"
+			payloadMap, question, normErr = NormalizeResponsesRequestForSciX(&req, model, allItems, effectiveInstr, opts)
+		} else {
+			subPath = "/chat/completions"
+			payloadMap, question, normErr = ResponsesToChatRequest(&req, model, allItems, effectiveInstr, opts)
+		}
+		if normErr != nil {
+			WriteError(w, http.StatusBadRequest, "invalid_request_error", "invalid_request", normErr.Error())
+			g.recordFailure("/v1/responses", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, http.StatusBadRequest, start, normErr.Error())
+			return
+		}
+		payloadBytes, err := json.Marshal(payloadMap)
+		if err != nil {
+			WriteError(w, http.StatusInternalServerError, "server_error", "marshal_error", err.Error())
+			return
+		}
+
+		execHdr := decision.Client.BuildSciXExecutionHeader(bohrium.SciXExecOptions{
+			IncomingHeader:   r.Header.Get(bohrium.SciXExecutionHeader),
+			SessionID:        decision.SciXSessionID,
+			RootSessionID:    decision.SciXSessionID,
+			RunID:            decision.SciXRunID,
+			RootRunID:        decision.SciXRunID,
+			SessionCreatedAt: decision.SessionCreatedAt,
+			Question:         question,
+			ToolCallID:       toolCallID,
+			ModelID:          model.ID,
+		})
+
+		upResp, err := decision.Client.DoSciXLLM(ctx, subPath, payloadBytes, true, execHdr, traceparent)
+		if err != nil {
+			WriteError(w, http.StatusBadGateway, "upstream_error", "upstream_transport_error", err.Error())
+			g.recordFailure("/v1/responses", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, http.StatusBadGateway, start, err.Error())
+			return
+		}
+
+		if upResp.StatusCode < 200 || upResp.StatusCode >= 300 {
+			errBody, _ := io.ReadAll(io.LimitReader(upResp.Body, 256*1024))
+			_ = upResp.Body.Close()
+
+			if explicitAcc == "" && shouldFailoverUpstreamStatus(upResp.StatusCode, errBody) {
+				errTxt := extractUpstreamErrorText(errBody, upResp.StatusCode)
+				if upResp.StatusCode == http.StatusUnauthorized {
+					g.markAccountExpired(decision.Account.ID, errTxt)
+					lastStatus, lastErrType, lastErrCode, lastErrMsg = http.StatusUnauthorized, "authentication_error", "account_expired", errTxt
+				} else {
+					g.markAccountInsufficient(decision.Account.ID, errTxt)
+					lastStatus, lastErrType, lastErrCode, lastErrMsg = http.StatusPaymentRequired, "insufficient_quota", "insufficient_balance", errTxt
+				}
+				excluded[decision.Account.ID] = true
+				continue
+			}
+
+			copyUpstreamRequestID(w, upResp)
+			errMsg := forwardUpstreamError(w, upResp.StatusCode, errBody)
+			g.recordFailure("/v1/responses", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, upResp.StatusCode, start, errMsg)
+			return
+		}
+
+		defer upResp.Body.Close()
+		copyUpstreamRequestID(w, upResp)
+		w.Header().Set("X-Bohrium-Routing-Mode", decision.Mode)
+
+		if upstreamAPI == "responses" {
+			g.finishResponsesFromResponsesUpstream(w, &req, model, decision, turnItems, effectiveInstr, shouldStore, upResp, start)
+		} else {
+			g.finishResponsesFromChatUpstream(w, &req, model, decision, turnItems, effectiveInstr, shouldStore, upResp, start)
+		}
 		return
 	}
 
-	upResp, err := g.client.DoSciXLLM(r.Context(), "/responses", payloadBytes, true, execHdr, traceparent)
-	if err != nil {
-		WriteError(w, http.StatusBadGateway, "upstream_error", "upstream_transport_error", err.Error())
-		g.recordFailure("/v1/responses", "responses", model.ID, req.Stream, http.StatusBadGateway, start, err.Error())
-		return
-	}
-	defer upResp.Body.Close()
+	WriteError(w, lastStatus, lastErrType, lastErrCode, lastErrMsg)
+	g.recordFailure("/v1/responses", "", req.Model, "", "", "", req.Stream, lastStatus, start, lastErrMsg)
+}
 
-	copyUpstreamRequestID(w, upResp)
-	if upResp.StatusCode < 200 || upResp.StatusCode >= 300 {
-		errBody, _ := io.ReadAll(io.LimitReader(upResp.Body, 256*1024))
-		errMsg := forwardUpstreamError(w, upResp.StatusCode, errBody)
-		g.recordFailure("/v1/responses", "responses", model.ID, req.Stream, upResp.StatusCode, start, errMsg)
-		return
-	}
-
+func (g *Gateway) finishResponsesFromResponsesUpstream(w http.ResponseWriter, req *ResponsesRequest, model bohrium.SciXModel, decision *RouteDecision, turnItems []map[string]any, effectiveInstr *string, shouldStore bool, upResp *http.Response, start time.Time) {
 	if req.Stream {
 		terminalResp, usage, sErr := PipeResponsesSSE(w, upResp.Body, req)
 		if shouldStore && terminalResp != nil {
@@ -768,6 +964,8 @@ func (g *Gateway) execResponsesViaResponsesUpstream(w http.ResponseWriter, r *ht
 				g.respDir.Save(&StoredResponse{
 					ID:                 id,
 					PreviousResponseID: req.PreviousResponseID,
+					AccountID:          decision.Account.ID,
+					SessionHash:        decision.SessionHash,
 					Model:              model.ID,
 					Instructions:       effectiveInstr,
 					InputItems:         turnItems,
@@ -784,6 +982,9 @@ func (g *Gateway) execResponsesViaResponsesUpstream(w http.ResponseWriter, r *ht
 			Endpoint:         "/v1/responses",
 			UpstreamAPI:      "responses",
 			Model:            model.ID,
+			AccountID:        decision.Account.ID,
+			AccountLabel:     decision.Account.DisplayName(),
+			RoutingMode:      decision.Mode,
 			Stream:           true,
 			Status:           http.StatusOK,
 			DurationMs:       time.Since(start).Milliseconds(),
@@ -796,19 +997,22 @@ func (g *Gateway) execResponsesViaResponsesUpstream(w http.ResponseWriter, r *ht
 		return
 	}
 
-	var respMap map[string]any
+	var (
+		respMap map[string]any
+		err     error
+	)
 	if isSSEContentType(upResp) {
 		respMap, err = AggregateResponsesSSE(upResp.Body, req, model.ID)
 		if err != nil {
 			WriteError(w, http.StatusBadGateway, "upstream_error", "stream_aggregate_error", err.Error())
-			g.recordFailure("/v1/responses", "responses", model.ID, false, http.StatusBadGateway, start, err.Error())
+			g.recordFailure("/v1/responses", "responses", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, http.StatusBadGateway, start, err.Error())
 			return
 		}
 	} else {
 		rawResp, rErr := io.ReadAll(io.LimitReader(upResp.Body, 32*1024*1024))
 		if rErr != nil {
 			WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", rErr.Error())
-			g.recordFailure("/v1/responses", "responses", model.ID, false, http.StatusBadGateway, start, rErr.Error())
+			g.recordFailure("/v1/responses", "responses", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, http.StatusBadGateway, start, rErr.Error())
 			return
 		}
 		if err := json.Unmarshal(rawResp, &respMap); err != nil {
@@ -823,6 +1027,8 @@ func (g *Gateway) execResponsesViaResponsesUpstream(w http.ResponseWriter, r *ht
 			g.respDir.Save(&StoredResponse{
 				ID:                 id,
 				PreviousResponseID: req.PreviousResponseID,
+				AccountID:          decision.Account.ID,
+				SessionHash:        decision.SessionHash,
 				Model:              model.ID,
 				Instructions:       effectiveInstr,
 				InputItems:         turnItems,
@@ -837,6 +1043,9 @@ func (g *Gateway) execResponsesViaResponsesUpstream(w http.ResponseWriter, r *ht
 		Endpoint:         "/v1/responses",
 		UpstreamAPI:      "responses",
 		Model:            model.ID,
+		AccountID:        decision.Account.ID,
+		AccountLabel:     decision.Account.DisplayName(),
+		RoutingMode:      decision.Mode,
 		Stream:           false,
 		Status:           http.StatusOK,
 		DurationMs:       time.Since(start).Milliseconds(),
@@ -847,59 +1056,7 @@ func (g *Gateway) execResponsesViaResponsesUpstream(w http.ResponseWriter, r *ht
 	})
 }
 
-func (g *Gateway) execResponsesViaChatUpstream(w http.ResponseWriter, r *http.Request, req *ResponsesRequest, model bohrium.SciXModel, turnItems, allItems []map[string]any, effectiveInstr *string, shouldStore bool, traceparent string, start time.Time) {
-	isToolCont := isResponsesToolContinuation(turnItems)
-	toolCallID := lastResponsesToolCallID(turnItems)
-	sessionID, execHdr := g.resolveExecEnvelope(
-		r.Header.Get(bohrium.SciXExecutionHeader),
-		sessionSeedForResponses(req, g.respDir, allItems),
-		model.ID,
-		"",
-		toolCallID,
-		isToolCont,
-	)
-
-	payloadMap, question, err := ResponsesToChatRequest(req, model, allItems, effectiveInstr, SciXRequestOptions{
-		SciMasterPrompt: g.sciMasterPromptEnabled(),
-		ForceStream:     true,
-		SessionID:       sessionID,
-	})
-	if err != nil {
-		WriteError(w, http.StatusBadRequest, "invalid_request_error", "invalid_request", err.Error())
-		g.recordFailure("/v1/responses", "chat_completions", model.ID, req.Stream, http.StatusBadRequest, start, err.Error())
-		return
-	}
-	if question != "" {
-		_, execHdr = g.resolveExecEnvelopeWithQuestion(
-			r.Header.Get(bohrium.SciXExecutionHeader),
-			sessionID,
-			model.ID,
-			question,
-			toolCallID,
-		)
-	}
-	payloadBytes, err := json.Marshal(payloadMap)
-	if err != nil {
-		WriteError(w, http.StatusInternalServerError, "server_error", "marshal_error", err.Error())
-		return
-	}
-
-	upResp, err := g.client.DoSciXLLM(r.Context(), "/chat/completions", payloadBytes, true, execHdr, traceparent)
-	if err != nil {
-		WriteError(w, http.StatusBadGateway, "upstream_error", "upstream_transport_error", err.Error())
-		g.recordFailure("/v1/responses", "chat_completions", model.ID, req.Stream, http.StatusBadGateway, start, err.Error())
-		return
-	}
-	defer upResp.Body.Close()
-
-	copyUpstreamRequestID(w, upResp)
-	if upResp.StatusCode < 200 || upResp.StatusCode >= 300 {
-		errBody, _ := io.ReadAll(io.LimitReader(upResp.Body, 256*1024))
-		errMsg := forwardUpstreamError(w, upResp.StatusCode, errBody)
-		g.recordFailure("/v1/responses", "chat_completions", model.ID, req.Stream, upResp.StatusCode, start, errMsg)
-		return
-	}
-
+func (g *Gateway) finishResponsesFromChatUpstream(w http.ResponseWriter, req *ResponsesRequest, model bohrium.SciXModel, decision *RouteDecision, turnItems []map[string]any, effectiveInstr *string, shouldStore bool, upResp *http.Response, start time.Time) {
 	respID := RandomID("resp_")
 
 	if req.Stream {
@@ -909,6 +1066,8 @@ func (g *Gateway) execResponsesViaChatUpstream(w http.ResponseWriter, r *http.Re
 			g.respDir.Save(&StoredResponse{
 				ID:                 finalResp.ID,
 				PreviousResponseID: req.PreviousResponseID,
+				AccountID:          decision.Account.ID,
+				SessionHash:        decision.SessionHash,
 				Model:              model.ID,
 				Instructions:       effectiveInstr,
 				InputItems:         turnItems,
@@ -924,6 +1083,9 @@ func (g *Gateway) execResponsesViaChatUpstream(w http.ResponseWriter, r *http.Re
 			Endpoint:         "/v1/responses",
 			UpstreamAPI:      "chat_completions",
 			Model:            model.ID,
+			AccountID:        decision.Account.ID,
+			AccountLabel:     decision.Account.DisplayName(),
+			RoutingMode:      decision.Mode,
 			Stream:           true,
 			Status:           http.StatusOK,
 			DurationMs:       time.Since(start).Milliseconds(),
@@ -936,19 +1098,22 @@ func (g *Gateway) execResponsesViaChatUpstream(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	var chatResp *ChatCompletionResponse
+	var (
+		chatResp *ChatCompletionResponse
+		err      error
+	)
 	if isSSEContentType(upResp) {
 		chatResp, err = AggregateChatSSE(upResp.Body, model.ID)
 		if err != nil {
 			WriteError(w, http.StatusBadGateway, "upstream_error", "stream_aggregate_error", err.Error())
-			g.recordFailure("/v1/responses", "chat_completions", model.ID, false, http.StatusBadGateway, start, err.Error())
+			g.recordFailure("/v1/responses", "chat_completions", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, http.StatusBadGateway, start, err.Error())
 			return
 		}
 	} else {
 		rawResp, rErr := io.ReadAll(io.LimitReader(upResp.Body, 32*1024*1024))
 		if rErr != nil {
 			WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", rErr.Error())
-			g.recordFailure("/v1/responses", "chat_completions", model.ID, false, http.StatusBadGateway, start, rErr.Error())
+			g.recordFailure("/v1/responses", "chat_completions", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, http.StatusBadGateway, start, rErr.Error())
 			return
 		}
 		var direct ChatCompletionResponse
@@ -968,6 +1133,8 @@ func (g *Gateway) execResponsesViaChatUpstream(w http.ResponseWriter, r *http.Re
 		g.respDir.Save(&StoredResponse{
 			ID:                 openAIResp.ID,
 			PreviousResponseID: req.PreviousResponseID,
+			AccountID:          decision.Account.ID,
+			SessionHash:        decision.SessionHash,
 			Model:              model.ID,
 			Instructions:       effectiveInstr,
 			InputItems:         turnItems,
@@ -981,6 +1148,9 @@ func (g *Gateway) execResponsesViaChatUpstream(w http.ResponseWriter, r *http.Re
 		Endpoint:         "/v1/responses",
 		UpstreamAPI:      "chat_completions",
 		Model:            model.ID,
+		AccountID:        decision.Account.ID,
+		AccountLabel:     decision.Account.DisplayName(),
+		RoutingMode:      decision.Mode,
 		Stream:           false,
 		Status:           http.StatusOK,
 		DurationMs:       time.Since(start).Milliseconds(),
@@ -1040,11 +1210,11 @@ func (g *Gateway) handleGetResponseInputItems(w http.ResponseWriter, r *http.Req
 	})
 }
 
-func (g *Gateway) runPreflightIfEnabled(ctx context.Context, modelID, traceparent string) (status int, errType, code, msg string, ok bool) {
+func (g *Gateway) runPreflightIfEnabled(ctx context.Context, cli *bohrium.Client, modelID, traceparent string) (status int, errType, code, msg string, ok bool) {
 	if g.cfg == nil || !g.cfg.Get().Gateway.PreflightMode {
 		return 0, "", "", "", true
 	}
-	allowed, reason, err := g.client.SciXBillingPreflight(ctx, modelID, traceparent)
+	allowed, reason, err := cli.SciXBillingPreflight(ctx, modelID, traceparent)
 	if err != nil {
 		return http.StatusBadGateway, "upstream_error", "billing_unavailable", "Billing admission unavailable: " + err.Error(), false
 	}
@@ -1057,9 +1227,65 @@ func (g *Gateway) runPreflightIfEnabled(ctx context.Context, modelID, traceparen
 	return 0, "", "", "", true
 }
 
-// isChatToolContinuation reports whether a Chat Completions request is resuming an agent loop
-// after local tool execution (last message is a tool/function output), matching brain.mjs which
-// does not re-run /billing/preflight on mid-run tool steps.
+func (g *Gateway) markAccountInsufficient(accountID, reason string) {
+	coolUntil := time.Now().UTC().Add(30 * time.Minute)
+	_ = g.mgr.Store().UpdateAccountHealth(accountID, "insufficient", reason, coolUntil)
+	go func(id string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_, _ = g.mgr.RefreshAccountBalance(ctx, id)
+	}(accountID)
+}
+
+func (g *Gateway) markAccountExpired(accountID, reason string) {
+	_ = g.mgr.Store().UpdateAccountHealth(accountID, "expired", reason, time.Time{})
+}
+
+func writePoolRouteError(w http.ResponseWriter, err error) int {
+	if errors.Is(err, ErrEmptyPool) {
+		WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "empty_pool", err.Error())
+		return http.StatusServiceUnavailable
+	}
+	if errors.Is(err, ErrNoHealthyPoolAccount) {
+		WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "no_healthy_pool_accounts", err.Error())
+		return http.StatusServiceUnavailable
+	}
+	if errors.Is(err, bohrium.ErrBohriumNotLoggedIn) {
+		WriteError(w, http.StatusServiceUnavailable, "authentication_error", "bohrium_not_logged_in", err.Error())
+		return http.StatusServiceUnavailable
+	}
+	WriteError(w, http.StatusBadGateway, "upstream_error", "routing_error", err.Error())
+	return http.StatusBadGateway
+}
+
+func shouldFailoverUpstreamStatus(status int, body []byte) bool {
+	if status == http.StatusUnauthorized || status == http.StatusPaymentRequired {
+		return true
+	}
+	lower := strings.ToLower(string(body))
+	return strings.Contains(lower, "insufficient_balance") || strings.Contains(string(body), "BILLING_PHOTON_NOT_ENOUGH")
+}
+
+func isAuthErrorText(msg string) bool {
+	l := strings.ToLower(msg)
+	return strings.Contains(l, "http 401") || strings.Contains(l, "unauthorized") || strings.Contains(l, "not logged in")
+}
+
+func extractUpstreamErrorText(body []byte, status int) string {
+	var parsed ErrorEnvelope
+	if json.Unmarshal(body, &parsed) == nil && parsed.Error.Message != "" {
+		return parsed.Error.Message
+	}
+	s := strings.TrimSpace(string(body))
+	if s == "" {
+		return fmt.Sprintf("upstream returned HTTP %d", status)
+	}
+	if len(s) > 240 {
+		return s[:240] + "..."
+	}
+	return s
+}
+
 func isChatToolContinuation(req *ChatCompletionRequest) bool {
 	if req == nil || len(req.Messages) == 0 {
 		return false
@@ -1068,7 +1294,6 @@ func isChatToolContinuation(req *ChatCompletionRequest) bool {
 	return lastRole == "tool" || lastRole == "function"
 }
 
-// isResponsesToolContinuation reports whether the current turn consists solely of function_call_output items.
 func isResponsesToolContinuation(turnItems []map[string]any) bool {
 	if len(turnItems) == 0 {
 		return false
@@ -1082,15 +1307,18 @@ func isResponsesToolContinuation(turnItems []map[string]any) bool {
 	return true
 }
 
-func (g *Gateway) recordFailure(endpoint, upstreamAPI, model string, stream bool, status int, start time.Time, errMsg string) {
+func (g *Gateway) recordFailure(endpoint, upstreamAPI, model, accID, accLabel, routeMode string, stream bool, status int, start time.Time, errMsg string) {
 	g.respDir.RecordRequest(RequestLogEntry{
-		Endpoint:    endpoint,
-		UpstreamAPI: upstreamAPI,
-		Model:       model,
-		Stream:      stream,
-		Status:      status,
-		DurationMs:  time.Since(start).Milliseconds(),
-		Error:       errMsg,
+		Endpoint:     endpoint,
+		UpstreamAPI:  upstreamAPI,
+		Model:        model,
+		AccountID:    accID,
+		AccountLabel: accLabel,
+		RoutingMode:  routeMode,
+		Stream:       stream,
+		Status:       status,
+		DurationMs:   time.Since(start).Milliseconds(),
+		Error:        errMsg,
 	})
 }
 
@@ -1109,103 +1337,35 @@ func (g *Gateway) sciMasterPromptEnabled() bool {
 	return g.cfg.Get().Gateway.SciMasterPrompt
 }
 
-// resolveExecEnvelope maintains authentic Bohrium desktop-client session & run affinity:
-// - same conversation keeps stable sessionId/rootSessionId/sessionCreatedAt;
-// - new user turn starts a fresh runId/rootRunId;
-// - tool continuation turn reuses the active runId/rootRunId and attaches toolCallId.
-func (g *Gateway) resolveExecEnvelope(incomingHeader, sessionSeed, modelID, question, toolCallID string, isToolContinuation bool) (string, string) {
-	sessionID := bohrium.DeterministicSessionUUID(sessionSeed)
-
-	g.sessMu.Lock()
-	if g.sessions == nil {
-		g.sessions = make(map[string]*trackedSession)
+func extractExplicitSessionKey(r *http.Request, promptCacheKey, userField string) string {
+	if sid := strings.TrimSpace(r.Header.Get("x-session-id")); sid != "" {
+		return "hdr:" + sid
 	}
-	now := time.Now().UTC()
-	st, exists := g.sessions[sessionID]
-	if !exists {
-		if len(g.sessions) >= maxTrackedSessions {
-			var oldestKey string
-			var oldestTime time.Time
-			for k, v := range g.sessions {
-				if oldestKey == "" || v.updatedAt.Before(oldestTime) {
-					oldestKey = k
-					oldestTime = v.updatedAt
+	if rawExec := strings.TrimSpace(r.Header.Get(bohrium.SciXExecutionHeader)); rawExec != "" {
+		if dec, err := base64.RawURLEncoding.DecodeString(rawExec); err == nil {
+			var p bohrium.SciXExecutionPayload
+			if json.Unmarshal(dec, &p) == nil {
+				if p.RootSessionID != "" {
+					return "scix:" + p.RootSessionID
+				}
+				if p.SessionID != "" {
+					return "scix:" + p.SessionID
 				}
 			}
-			if oldestKey != "" {
-				delete(g.sessions, oldestKey)
-			}
 		}
-		runID := bohrium.NewCanonicalUUID()
-		st = &trackedSession{
-			sessionID:        sessionID,
-			rootSessionID:    sessionID,
-			runID:            runID,
-			rootRunID:        runID,
-			sessionCreatedAt: now.Format("2006-01-02T15:04:05.000Z"),
-			updatedAt:        now,
-		}
-		g.sessions[sessionID] = st
-	} else {
-		if !isToolContinuation || st.runID == "" {
-			runID := bohrium.NewCanonicalUUID()
-			st.runID = runID
-			st.rootRunID = runID
-		}
-		st.updatedAt = now
 	}
-	cp := *st
-	g.sessMu.Unlock()
-
-	hdr := g.client.BuildSciXExecutionHeader(bohrium.SciXExecOptions{
-		IncomingHeader:   incomingHeader,
-		SessionID:        cp.sessionID,
-		RootSessionID:    cp.rootSessionID,
-		RunID:            cp.runID,
-		RootRunID:        cp.rootRunID,
-		SessionCreatedAt: cp.sessionCreatedAt,
-		Question:         question,
-		ToolCallID:       toolCallID,
-		ModelID:          modelID,
-	})
-	return cp.sessionID, hdr
+	if k := strings.TrimSpace(promptCacheKey); k != "" {
+		return "pck:" + k
+	}
+	if u := strings.TrimSpace(userField); u != "" {
+		return "user:" + u
+	}
+	return ""
 }
 
-func (g *Gateway) resolveExecEnvelopeWithQuestion(incomingHeader, sessionID, modelID, question, toolCallID string) (string, string) {
-	g.sessMu.Lock()
-	var cp trackedSession
-	if g.sessions != nil {
-		if st, ok := g.sessions[sessionID]; ok {
-			cp = *st
-		}
-	}
-	g.sessMu.Unlock()
-	hdr := g.client.BuildSciXExecutionHeader(bohrium.SciXExecOptions{
-		IncomingHeader:   incomingHeader,
-		SessionID:        cp.sessionID,
-		RootSessionID:    cp.rootSessionID,
-		RunID:            cp.runID,
-		RootRunID:        cp.rootRunID,
-		SessionCreatedAt: cp.sessionCreatedAt,
-		Question:         question,
-		ToolCallID:       toolCallID,
-		ModelID:          modelID,
-	})
-	return sessionID, hdr
-}
-
-func sessionSeedForChat(req *ChatCompletionRequest) string {
-	if req == nil {
-		return ""
-	}
-	if req.PromptCacheKey != "" {
-		return "pck:" + req.PromptCacheKey
-	}
-	if req.User != "" {
-		return "user:" + req.User
-	}
-	// Derive a deterministic conversation seed from the earliest user message (plus optional leading system prompt)
-	// so multi-turn follow-ups and tool-call loops stay bound to the same SciX sessionId.
+func computeChatSessionHash(r *http.Request, req *ChatCompletionRequest) string {
+	apiScope := apiKeyScopeFromCtx(r.Context())
+	explicit := extractExplicitSessionKey(r, req.PromptCacheKey, req.User)
 	var firstSys, firstUser string
 	for _, m := range req.Messages {
 		role := strings.ToLower(strings.TrimSpace(m.Role))
@@ -1217,49 +1377,33 @@ func sessionSeedForChat(req *ChatCompletionRequest) string {
 			break
 		}
 	}
-	if firstUser != "" {
-		if len(firstSys) > 256 {
-			firstSys = firstSys[:256]
-		}
-		if len(firstUser) > 512 {
-			firstUser = firstUser[:512]
-		}
-		return "chat:" + firstSys + "\x00" + firstUser
-	}
-	return ""
+	return ComputeSessionHash(apiScope, explicit, firstSys, firstUser, "")
 }
 
-func sessionSeedForResponses(req *ResponsesRequest, rs *ResponseStore, allItems []map[string]any) string {
-	if req == nil {
-		return ""
+func computeResponsesSessionHash(r *http.Request, req *ResponsesRequest, allItems []map[string]any, prevRootID, prevSessionHash string) string {
+	if strings.TrimSpace(prevSessionHash) != "" {
+		return strings.TrimSpace(prevSessionHash)
 	}
-	if req.PromptCacheKey != "" {
-		return "pck:" + req.PromptCacheKey
+	apiScope := apiKeyScopeFromCtx(r.Context())
+	explicit := extractExplicitSessionKey(r, req.PromptCacheKey, req.User)
+	if explicit == "" && strings.TrimSpace(prevRootID) != "" {
+		explicit = "resp-chain:" + strings.TrimSpace(prevRootID)
 	}
-	if strings.TrimSpace(req.PreviousResponseID) != "" {
-		rootID := strings.TrimSpace(req.PreviousResponseID)
-		if rs != nil {
-			rootID = rs.RootResponseID(rootID)
-		}
-		return "resp-chain:" + rootID
-	}
-	if req.User != "" {
-		return "user:" + req.User
+	var firstSys, firstUser string
+	if req.Instructions != nil {
+		firstSys = strings.TrimSpace(*req.Instructions)
 	}
 	for _, it := range allItems {
 		typ, _ := it["type"].(string)
 		role, _ := it["role"].(string)
 		if (typ == "message" || typ == "") && strings.EqualFold(role, "user") {
-			txt := strings.TrimSpace(flattenContentToText(it["content"]))
-			if txt != "" {
-				if len(txt) > 512 {
-					txt = txt[:512]
-				}
-				return "resp-first:" + txt
+			if txt := strings.TrimSpace(flattenContentToText(it["content"])); txt != "" {
+				firstUser = txt
+				break
 			}
 		}
 	}
-	return ""
+	return ComputeSessionHash(apiScope, explicit, firstSys, firstUser, "")
 }
 
 func lastChatToolCallID(req *ChatCompletionRequest) string {

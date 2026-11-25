@@ -1,16 +1,29 @@
 package store
 
 import (
+	"crypto/rand"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
-// AuthState persists the Bohrium login session and JWT metadata.
+const (
+	// SessionBindingTTL is the strict hard upper bound (7 days) for OpenAI session-to-account bindings.
+	SessionBindingTTL = 7 * 24 * time.Hour
+
+	maxLogs            = 1000
+	maxStoredResponses = 500
+)
+
+// AuthState persists a single Bohrium account's login session and JWT metadata.
 type AuthState struct {
 	Token         string    `json:"token"`
 	UserID        int64     `json:"userId"`
@@ -24,12 +37,124 @@ type AuthState struct {
 	ExpiresAt     time.Time `json:"expiresAt"`
 	LastLoginAt   time.Time `json:"lastLoginAt"`
 	LastRefreshAt time.Time `json:"lastRefreshAt"`
-	LoginMethod   string    `json:"loginMethod"` // "wechat_qr" | "manual_token" | "password"
+	LoginMethod   string    `json:"loginMethod"` // "wechat_qr" | "oauth_google" | ... | "manual_token" | "password"
 }
 
-// RunLog records a single automation action or task execution.
+// Account represents a managed Bohrium account stored in SQLite.
+// Newly logged-in accounts default to PoolEnabled=false and must be explicitly added to the OpenAI routing pool.
+type Account struct {
+	ID               string    `json:"id"`
+	UserID           int64     `json:"userId"`
+	OrgID            int64     `json:"orgId"`
+	UserType         int       `json:"userType"`
+	Label            string    `json:"label"`
+	Nickname         string    `json:"nickname"`
+	Phone            string    `json:"phone,omitempty"`
+	Email            string    `json:"email,omitempty"`
+	Avatar           string    `json:"avatar,omitempty"`
+	Token            string    `json:"token,omitempty"`
+	LoginMethod      string    `json:"loginMethod"`
+	ClubBound        bool      `json:"clubBound"`
+	ExpiresAt        time.Time `json:"expiresAt"`
+	LastLoginAt      time.Time `json:"lastLoginAt"`
+	LastRefreshAt    time.Time `json:"lastRefreshAt"`
+	StoreID          string    `json:"storeId"`
+	PoolEnabled      bool      `json:"poolEnabled"`
+	PoolOrder        int       `json:"poolOrder"`
+	CheckinEnabled   bool      `json:"checkinEnabled"`
+	PhotonBalance    float64   `json:"photonBalance"`
+	OrgBalance       float64   `json:"orgBalance"`
+	WalletBalanceCNY float64   `json:"walletBalanceCny"`
+	BalanceUpdatedAt time.Time `json:"balanceUpdatedAt,omitempty"`
+	HealthStatus     string    `json:"healthStatus"` // "active" | "expired" | "insufficient" | "cooldown"
+	CooldownUntil    time.Time `json:"cooldownUntil,omitempty"`
+	LastError        string    `json:"lastError,omitempty"`
+	LastScheduledDay string    `json:"lastScheduledDay,omitempty"`
+	LastRunAt        time.Time `json:"lastRunAt,omitempty"`
+	LastRunSummary   string    `json:"lastRunSummary,omitempty"`
+	CreatedAt        time.Time `json:"createdAt"`
+	UpdatedAt        time.Time `json:"updatedAt"`
+}
+
+// AuthState projects Account credentials into AuthState.
+func (a Account) AuthState() AuthState {
+	return AuthState{
+		Token:         a.Token,
+		UserID:        a.UserID,
+		OrgID:         a.OrgID,
+		UserType:      a.UserType,
+		Nickname:      a.Nickname,
+		Phone:         a.Phone,
+		Email:         a.Email,
+		Avatar:        a.Avatar,
+		ClubBound:     a.ClubBound,
+		ExpiresAt:     a.ExpiresAt,
+		LastLoginAt:   a.LastLoginAt,
+		LastRefreshAt: a.LastRefreshAt,
+		LoginMethod:   a.LoginMethod,
+	}
+}
+
+// EffectiveBalance returns total spendable photons (personal photons + usable org balance) used for weighted routing.
+func (a Account) EffectiveBalance() float64 {
+	total := 0.0
+	if a.PhotonBalance > 0 {
+		total += a.PhotonBalance
+	}
+	if a.OrgBalance > 0 {
+		total += a.OrgBalance
+	}
+	return total
+}
+
+// DisplayName returns the user-friendly name for UI & logs.
+func (a Account) DisplayName() string {
+	if s := strings.TrimSpace(a.Label); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(a.Nickname); s != "" {
+		return s
+	}
+	if a.UserID > 0 {
+		return fmt.Sprintf("UID %d", a.UserID)
+	}
+	return a.ID
+}
+
+// IsHealthyForPool reports whether this account is currently eligible to receive OpenAI gateway traffic.
+func (a Account) IsHealthyForPool(now time.Time) bool {
+	if !a.PoolEnabled || strings.TrimSpace(a.Token) == "" {
+		return false
+	}
+	if a.HealthStatus == "expired" {
+		return false
+	}
+	if !a.ExpiresAt.IsZero() && !a.ExpiresAt.After(now) {
+		return false
+	}
+	if !a.CooldownUntil.IsZero() && a.CooldownUntil.After(now) {
+		return false
+	}
+	return true
+}
+
+// Redacted returns a copy of Account with its raw JWT token masked for safe API exposure.
+func (a Account) Redacted() Account {
+	cp := a
+	if len(cp.Token) > 16 {
+		cp.Token = cp.Token[:8] + "..." + cp.Token[len(cp.Token)-6:]
+	} else if cp.Token != "" {
+		cp.Token = "***"
+	}
+	return cp
+}
+
+// RunLog records a single automation action or task execution (optionally tagged to a specific account).
 type RunLog struct {
 	ID         string         `json:"id"`
+	AccountID  string         `json:"accountId,omitempty"`
+	AccountUID int64          `json:"accountUid,omitempty"`
+	Nickname   string         `json:"nickname,omitempty"`
 	Timestamp  time.Time      `json:"timestamp"`
 	Trigger    string         `json:"trigger"` // "manual" | "schedule" | "system"
 	Action     string         `json:"action"`  // "claim_all" | "claim_one" | "task_run" | "run_all" | "refresh_token" | "login" | "recon"
@@ -42,137 +167,322 @@ type RunLog struct {
 	Meta       map[string]any `json:"meta,omitempty"`
 }
 
-// State is the persisted runtime state stored atomically in <dataDir>/state.json.
-type State struct {
-	Auth             AuthState `json:"auth"`
-	LastScheduledDay string    `json:"lastScheduledDay"` // YYYY-MM-DD in Asia/Shanghai
-	LastRunAt        time.Time `json:"lastRunAt,omitempty"`
-	LastRunSummary   string    `json:"lastRunSummary,omitempty"`
-	Logs             []RunLog  `json:"logs"`
+// SessionBinding stores a 7-day-TTL OpenAI session-hash to account routing binding in SQLite.
+type SessionBinding struct {
+	SessionHash      string    `json:"sessionHash"`
+	AccountID        string    `json:"accountId"`
+	SciXSessionID    string    `json:"scixSessionId"`
+	SciXRunID        string    `json:"scixRunId,omitempty"`
+	SessionCreatedAt string    `json:"sessionCreatedAt"`
+	ModelHint        string    `json:"modelHint,omitempty"`
+	HitCount         int64     `json:"hitCount"`
+	CreatedAt        time.Time `json:"createdAt"`
+	LastUsedAt       time.Time `json:"lastUsedAt"`
+	ExpiresAt        time.Time `json:"expiresAt"`
+
+	// Enriched metadata populated when listing bindings for the Web Console.
+	AccountLabel    string `json:"accountLabel,omitempty"`
+	AccountNickname string `json:"accountNickname,omitempty"`
+	AccountUID      int64  `json:"accountUid,omitempty"`
 }
 
-const maxLogs = 200
+// ResponseRecord stores an OpenAI Responses API turn in SQLite, linked to its owning account and session hash.
+type ResponseRecord struct {
+	ID                 string           `json:"id"`
+	PreviousResponseID string           `json:"previous_response_id,omitempty"`
+	AccountID          string           `json:"account_id,omitempty"`
+	SessionHash        string           `json:"session_hash,omitempty"`
+	Model              string           `json:"model"`
+	Instructions       *string          `json:"instructions,omitempty"`
+	InputItems         []map[string]any `json:"input_items"`
+	OutputItems        []map[string]any `json:"output_items"`
+	Response           map[string]any   `json:"response"`
+	CreatedAt          time.Time        `json:"created_at"`
+}
 
-// Store manages thread-safe atomic persistence of State.
+// Store manages thread-safe SQLite persistence for multi-account state, OpenAI session bindings,
+// Responses API chains, and execution logs.
 type Store struct {
-	mu    sync.RWMutex
-	path  string
-	state State
+	mu      sync.Mutex
+	db      *sql.DB
+	dbPath  string
+	dataDir string
 }
 
-// Open loads or initializes <dataDir>/state.json.
+// Open initializes (or opens) <dataDir>/bohrium.db in WAL mode, creates schema idempotently,
+// migrates any legacy single-account state.json / responses.json once, and purges expired bindings.
 func Open(dataDir string) (*Store, error) {
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		return nil, fmt.Errorf("create store dir: %w", err)
-	}
-	p := filepath.Join(dataDir, "state.json")
-	s := &Store{
-		path: p,
-		state: State{
-			Logs: make([]RunLog, 0),
-		},
-	}
-	raw, err := os.ReadFile(p)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return s, nil
+	var dsn, dbPath string
+	if strings.TrimSpace(dataDir) == "" {
+		dsn = "file::memory:?cache=shared&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)"
+	} else {
+		if err := os.MkdirAll(dataDir, 0o755); err != nil {
+			return nil, fmt.Errorf("create store dir: %w", err)
 		}
-		return nil, fmt.Errorf("read state %s: %w", p, err)
+		dbPath = filepath.Join(dataDir, "bohrium.db")
+		// Forward slashes keep SQLite URI clean on Windows.
+		uriPath := filepath.ToSlash(dbPath)
+		dsn = fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)", uriPath)
 	}
-	if err := json.Unmarshal(raw, &s.state); err != nil {
-		return nil, fmt.Errorf("parse state %s: %w", p, err)
+
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite %s: %w", dbPath, err)
 	}
-	if s.state.Logs == nil {
-		s.state.Logs = make([]RunLog, 0)
+	// Single connection serializes writers cleanly in pure-Go SQLite without SQLITE_BUSY contention.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("ping sqlite %s: %w", dbPath, err)
 	}
+	if dbPath != "" {
+		_ = os.Chmod(dbPath, 0o600)
+	}
+
+	s := &Store{
+		db:      db,
+		dbPath:  dbPath,
+		dataDir: dataDir,
+	}
+	if err := s.initSchema(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if dataDir != "" {
+		_ = s.migrateLegacyFiles(dataDir)
+	}
+	_, _ = s.PurgeExpiredSessionBindings(time.Now().UTC())
 	return s, nil
 }
 
-// GetAuth returns a copy of the stored AuthState.
-func (s *Store) GetAuth() AuthState {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.state.Auth
-}
-
-// SetAuth updates and persists AuthState.
-func (s *Store) SetAuth(auth AuthState) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.state.Auth = auth
-	return s.saveLocked()
-}
-
-// ClearAuth removes stored Bohrium credentials.
-func (s *Store) ClearAuth() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.state.Auth = AuthState{}
-	return s.saveLocked()
-}
-
-// GetLastScheduledDay returns the YYYY-MM-DD of the most recent scheduled daily run.
-func (s *Store) GetLastScheduledDay() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.state.LastScheduledDay
-}
-
-// SetLastScheduledDay persists the last scheduled run day and summary.
-func (s *Store) SetLastScheduledDay(day, summary string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.state.LastScheduledDay = day
-	s.state.LastRunAt = time.Now().UTC()
-	s.state.LastRunSummary = summary
-	return s.saveLocked()
-}
-
-// GetSummary returns last run metadata.
-func (s *Store) GetSummary() (lastDay string, lastAt time.Time, summary string) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.state.LastScheduledDay, s.state.LastRunAt, s.state.LastRunSummary
-}
-
-// AppendLog prepends a log entry (newest first) and trims to maxLogs.
-func (s *Store) AppendLog(entry RunLog) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if entry.Timestamp.IsZero() {
-		entry.Timestamp = time.Now().UTC()
+// Close cleanly closes the underlying SQLite database handle.
+func (s *Store) Close() error {
+	if s == nil || s.db == nil {
+		return nil
 	}
-	if entry.ID == "" {
-		entry.ID = fmt.Sprintf("%d", entry.Timestamp.UnixNano())
-	}
-	s.state.Logs = append([]RunLog{entry}, s.state.Logs...)
-	if len(s.state.Logs) > maxLogs {
-		s.state.Logs = s.state.Logs[:maxLogs]
-	}
-	return s.saveLocked()
+	return s.db.Close()
 }
 
-// GetLogs returns up to limit recent logs (newest first).
-func (s *Store) GetLogs(limit int) []RunLog {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if limit <= 0 || limit > len(s.state.Logs) {
-		limit = len(s.state.Logs)
-	}
-	out := make([]RunLog, limit)
-	copy(out, s.state.Logs[:limit])
-	return out
+// DBPath returns the SQLite database file path (empty for in-memory stores).
+func (s *Store) DBPath() string {
+	return s.dbPath
 }
 
-func (s *Store) saveLocked() error {
-	data, err := json.MarshalIndent(s.state, "", "  ")
+func (s *Store) initSchema() error {
+	const ddl = `
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS accounts (
+    id                 TEXT PRIMARY KEY,
+    user_id            INTEGER NOT NULL UNIQUE,
+    org_id             INTEGER NOT NULL DEFAULT 0,
+    user_type          INTEGER NOT NULL DEFAULT 0,
+    label              TEXT NOT NULL DEFAULT '',
+    nickname           TEXT NOT NULL DEFAULT '',
+    phone              TEXT NOT NULL DEFAULT '',
+    email              TEXT NOT NULL DEFAULT '',
+    avatar             TEXT NOT NULL DEFAULT '',
+    token              TEXT NOT NULL,
+    login_method       TEXT NOT NULL DEFAULT '',
+    club_bound         INTEGER NOT NULL DEFAULT 0,
+    expires_at         INTEGER NOT NULL DEFAULT 0,
+    last_login_at      INTEGER NOT NULL DEFAULT 0,
+    last_refresh_at    INTEGER NOT NULL DEFAULT 0,
+    store_id           TEXT NOT NULL,
+    pool_enabled       INTEGER NOT NULL DEFAULT 0,
+    pool_order         INTEGER NOT NULL DEFAULT 0,
+    checkin_enabled    INTEGER NOT NULL DEFAULT 1,
+    photon_balance     REAL NOT NULL DEFAULT 0,
+    org_balance        REAL NOT NULL DEFAULT 0,
+    wallet_balance_cny REAL NOT NULL DEFAULT 0,
+    balance_updated_at INTEGER NOT NULL DEFAULT 0,
+    health_status      TEXT NOT NULL DEFAULT 'active',
+    cooldown_until     INTEGER NOT NULL DEFAULT 0,
+    last_error         TEXT NOT NULL DEFAULT '',
+    last_scheduled_day TEXT NOT NULL DEFAULT '',
+    last_run_at        INTEGER NOT NULL DEFAULT 0,
+    last_run_summary   TEXT NOT NULL DEFAULT '',
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_bindings (
+    session_hash       TEXT PRIMARY KEY,
+    account_id         TEXT NOT NULL,
+    scix_session_id    TEXT NOT NULL,
+    scix_run_id        TEXT NOT NULL DEFAULT '',
+    session_created_at TEXT NOT NULL,
+    model_hint         TEXT NOT NULL DEFAULT '',
+    hit_count          INTEGER NOT NULL DEFAULT 1,
+    created_at         INTEGER NOT NULL,
+    last_used_at       INTEGER NOT NULL,
+    expires_at         INTEGER NOT NULL,
+    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_session_bindings_expires ON session_bindings(expires_at);
+CREATE INDEX IF NOT EXISTS idx_session_bindings_account ON session_bindings(account_id);
+
+CREATE TABLE IF NOT EXISTS responses (
+    id                   TEXT PRIMARY KEY,
+    previous_response_id TEXT NOT NULL DEFAULT '',
+    account_id           TEXT NOT NULL DEFAULT '',
+    session_hash         TEXT NOT NULL DEFAULT '',
+    model                TEXT NOT NULL,
+    instructions         TEXT,
+    input_items_json     TEXT NOT NULL,
+    output_items_json    TEXT NOT NULL,
+    response_json        TEXT NOT NULL,
+    created_at           INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_responses_created ON responses(created_at);
+
+CREATE TABLE IF NOT EXISTS run_logs (
+    id          TEXT PRIMARY KEY,
+    account_id  TEXT NOT NULL DEFAULT '',
+    account_uid INTEGER NOT NULL DEFAULT 0,
+    nickname    TEXT NOT NULL DEFAULT '',
+    timestamp   INTEGER NOT NULL,
+    trigger     TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    task_key    TEXT NOT NULL DEFAULT '',
+    task_title  TEXT NOT NULL DEFAULT '',
+    success     INTEGER NOT NULL DEFAULT 0,
+    skipped     INTEGER NOT NULL DEFAULT 0,
+    message     TEXT NOT NULL DEFAULT '',
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    meta_json   TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_run_logs_ts ON run_logs(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_run_logs_acc ON run_logs(account_id, timestamp DESC);
+`
+	if _, err := s.db.Exec(ddl); err != nil {
+		return fmt.Errorf("init sqlite schema: %w", err)
+	}
+	return nil
+}
+
+// migrateLegacyFiles performs a one-time lossless import of legacy data/state.json and data/responses.json.
+// Migrated legacy accounts always start with PoolEnabled=false (requiring explicit opt-in into the OpenAI pool).
+func (s *Store) migrateLegacyFiles(dataDir string) error {
+	var done string
+	err := s.db.QueryRow(`SELECT value FROM meta WHERE key = 'migrated_legacy_v1'`).Scan(&done)
+	if err == nil && done == "1" {
+		return nil
+	}
+
+	var migratedAccID string
+	legacyStatePath := filepath.Join(dataDir, "state.json")
+	if raw, rErr := os.ReadFile(legacyStatePath); rErr == nil && len(raw) > 0 {
+		var legacy struct {
+			Auth             AuthState `json:"auth"`
+			LastScheduledDay string    `json:"lastScheduledDay"`
+			LastRunAt        time.Time `json:"lastRunAt"`
+			LastRunSummary   string    `json:"lastRunSummary"`
+			Logs             []RunLog  `json:"logs"`
+		}
+		if json.Unmarshal(raw, &legacy) == nil {
+			if strings.TrimSpace(legacy.Auth.Token) != "" {
+				// Preserve legacy gateway.storeId if available in data/config.json.
+				legacyStoreID := readLegacyStoreID(filepath.Join(dataDir, "config.json"))
+				acc, _, uErr := s.upsertAccountInternal(legacy.Auth, "", legacyStoreID)
+				if uErr == nil && acc != nil {
+					migratedAccID = acc.ID
+					if legacy.LastScheduledDay != "" || !legacy.LastRunAt.IsZero() {
+						_, _ = s.db.Exec(
+							`UPDATE accounts SET last_scheduled_day = ?, last_run_at = ?, last_run_summary = ? WHERE id = ?`,
+							legacy.LastScheduledDay, toUnix(legacy.LastRunAt), legacy.LastRunSummary, acc.ID,
+						)
+					}
+				}
+			}
+			// Import legacy run logs (oldest -> newest so timestamps stay intact).
+			for i := len(legacy.Logs) - 1; i >= 0; i-- {
+				entry := legacy.Logs[i]
+				if entry.AccountID == "" && migratedAccID != "" {
+					entry.AccountID = migratedAccID
+					entry.AccountUID = legacy.Auth.UserID
+					entry.Nickname = legacy.Auth.Nickname
+				}
+				_ = s.AppendLog(entry)
+			}
+		}
+	}
+
+	legacyRespPath := filepath.Join(dataDir, "responses.json")
+	if raw, rErr := os.ReadFile(legacyRespPath); rErr == nil && len(raw) > 0 {
+		var disk struct {
+			Order   []string                   `json:"order"`
+			Records map[string]*ResponseRecord `json:"records"`
+		}
+		if json.Unmarshal(raw, &disk) == nil && len(disk.Records) > 0 {
+			for _, id := range disk.Order {
+				rec := disk.Records[id]
+				if rec == nil || rec.ID == "" {
+					continue
+				}
+				if rec.AccountID == "" && migratedAccID != "" {
+					rec.AccountID = migratedAccID
+				}
+				_ = s.SaveResponse(rec)
+			}
+		}
+	}
+
+	_, _ = s.db.Exec(`INSERT OR REPLACE INTO meta(key, value) VALUES ('migrated_legacy_v1', '1')`)
+	return nil
+}
+
+func readLegacyStoreID(cfgPath string) string {
+	raw, err := os.ReadFile(cfgPath)
 	if err != nil {
-		return err
+		return ""
 	}
-	data = append(data, '\n')
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
+	var partial struct {
+		Gateway struct {
+			StoreID string `json:"storeId"`
+		} `json:"gateway"`
 	}
-	return os.Rename(tmp, s.path)
+	if json.Unmarshal(raw, &partial) == nil {
+		return strings.TrimSpace(partial.Gateway.StoreID)
+	}
+	return ""
+}
+
+func newUUIDv4() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+func toUnix(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UTC().Unix()
+}
+
+func fromUnix(sec int64) time.Time {
+	if sec <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(sec, 0).UTC()
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func isErrNoRows(err error) bool {
+	return errors.Is(err, sql.ErrNoRows)
 }

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -37,7 +38,7 @@ type capturedUpstream struct {
 	preflightDenyReason string
 }
 
-func setupTestGateway(t *testing.T, upstreamHandler http.HandlerFunc) (*openai.Gateway, *httptest.Server, string, *capturedUpstream) {
+func setupTestGatewayEnv(t *testing.T, autoPool bool, upstreamHandler http.HandlerFunc) (*openai.Gateway, *httptest.Server, *store.Store, *bohrium.Manager, string, *capturedUpstream) {
 	t.Helper()
 
 	capUp := &capturedUpstream{}
@@ -127,32 +128,48 @@ func setupTestGateway(t *testing.T, upstreamHandler http.HandlerFunc) (*openai.G
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	if err := st.SetAuth(store.AuthState{
-		Token:     "fake-brm-jwt-token",
-		UserID:    100001,
-		OrgID:     200001,
-		ExpiresAt: time.Now().Add(24 * time.Hour),
-	}); err != nil {
-		t.Fatalf("SetAuth: %v", err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	if autoPool {
+		acc, _, err := st.UpsertAccountFromAuth(store.AuthState{
+			Token:     "fake-brm-jwt-token",
+			UserID:    100001,
+			OrgID:     200001,
+			Nickname:  "TestScientist",
+			ExpiresAt: time.Now().Add(24 * time.Hour),
+		}, "Primary")
+		if err != nil {
+			t.Fatalf("UpsertAccountFromAuth: %v", err)
+		}
+		_ = st.UpdateAccountBalance(acc.ID, 5000, 500, 10)
+		if err := st.SetPoolMembership([]string{acc.ID}); err != nil {
+			t.Fatalf("SetPoolMembership: %v", err)
+		}
 	}
 
 	httpCli, err := chromehttp.New(chromehttp.Options{Timeout: 10 * time.Second})
 	if err != nil {
 		t.Fatalf("chromehttp.New: %v", err)
 	}
-	bClient := bohrium.NewClient(httpCli, cfgMgr, st)
-	bClient.SetEndpoints(bohrium.Endpoints{
+	mgr := bohrium.NewManager(httpCli, cfgMgr, st)
+	mgr.SetEndpoints(bohrium.Endpoints{
 		SigmaLLMBase: upSrv.URL,
 		WWWBase:      upSrv.URL,
 	})
 
-	gw := openai.NewGateway(cfgMgr, bClient)
+	gw := openai.NewGateway(cfgMgr, mgr)
 	mux := http.NewServeMux()
 	gw.RegisterRoutes(mux)
 	gwSrv := httptest.NewServer(mux)
 	t.Cleanup(gwSrv.Close)
 
-	return gw, gwSrv, "sk-brm-test-key-001", capUp
+	return gw, gwSrv, st, mgr, "sk-brm-test-key-001", capUp
+}
+
+func setupTestGateway(t *testing.T, upstreamHandler http.HandlerFunc) (*openai.Gateway, *httptest.Server, string, *capturedUpstream) {
+	t.Helper()
+	gw, gwSrv, _, _, apiKey, capUp := setupTestGatewayEnv(t, true, upstreamHandler)
+	return gw, gwSrv, apiKey, capUp
 }
 
 func TestAPIKeyAuthAndModels(t *testing.T) {
@@ -581,7 +598,7 @@ func TestBalanceEndpoint(t *testing.T) {
 
 func TestBillingPreflightClientFidelityAndInsufficientBalance(t *testing.T) {
 	upstreamInsufficient := false
-	_, gwSrv, apiKey, capUp := setupTestGateway(t, func(w http.ResponseWriter, r *http.Request) {
+	_, gwSrv, st, _, apiKey, capUp := setupTestGatewayEnv(t, true, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if upstreamInsufficient {
 			w.WriteHeader(http.StatusPaymentRequired)
@@ -670,6 +687,10 @@ func TestBillingPreflightClientFidelityAndInsufficientBalance(t *testing.T) {
 	}
 
 	// 4. Mid-run tool step hitting upstream insufficient_balance directly -> mapped cleanly to 402 insufficient_balance
+	// Reset account health from step 3's cooldown so the single pooled test account can exercise direct upstream 402.
+	if accs, _ := st.ListAccounts(); len(accs) > 0 {
+		_ = st.UpdateAccountHealth(accs[0].ID, "active", "", time.Time{})
+	}
 	capUp.mu.Lock()
 	capUp.preflightDenyReason = ""
 	capUp.mu.Unlock()
@@ -911,5 +932,373 @@ func TestDesktopClientFingerprintAndSciMasterPromptToggle(t *testing.T) {
 	capOff.mu.Unlock()
 	if len(msgsOff) != 1 || msgsOff[0].(map[string]any)["role"] != "user" {
 		t.Fatalf("expected raw pass-through without SciMaster when toggle is off, got %+v", msgsOff)
+	}
+}
+
+func TestDefaultAccountNotInPoolRequiresManualOptIn(t *testing.T) {
+	_, gwSrv, st, _, apiKey, _ := setupTestGatewayEnv(t, false, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		_, _ = io.WriteString(w, `data: {"id":"c_opt","object":"chat.completion.chunk","created":1700000300,"model":"dsflash-high","choices":[{"index":0,"delta":{"role":"assistant","content":"Pooled!"},"finish_reason":"stop"}]}`+"\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	})
+
+	// Add an authenticated account WITHOUT dragging it into the routing pool
+	acc, _, err := st.UpsertAccountFromAuth(store.AuthState{
+		Token:     "tok-unpooled-1",
+		UserID:    300001,
+		OrgID:     400001,
+		Nickname:  "UnpooledUser",
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+	}, "Unpooled")
+	if err != nil {
+		t.Fatalf("UpsertAccountFromAuth: %v", err)
+	}
+	if acc.PoolEnabled {
+		t.Fatalf("expected newly added account to default poolEnabled=false")
+	}
+	_ = st.UpdateAccountBalance(acc.ID, 5000, 0, 0)
+
+	// /v1/models, /v1/balance, and /v1/chat/completions MUST all reject with 503 empty_pool
+	for _, tc := range []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{http.MethodGet, "/v1/models", ""},
+		{http.MethodGet, "/v1/balance", ""},
+		{http.MethodPost, "/v1/chat/completions", `{"model":"dsflash-high","messages":[{"role":"user","content":"hi"}]}`},
+	} {
+		req, _ := http.NewRequest(tc.method, gwSrv.URL+tc.path, strings.NewReader(tc.body))
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		if tc.body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", tc.method, tc.path, err)
+		}
+		var env openai.ErrorEnvelope
+		_ = json.NewDecoder(resp.Body).Decode(&env)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable || env.Error.Code != "empty_pool" {
+			t.Fatalf("%s %s: expected 503 empty_pool before manual opt-in, got status=%d env=%+v", tc.method, tc.path, resp.StatusCode, env)
+		}
+	}
+
+	// Manually drag account into routing pool -> /v1/chat/completions now succeeds!
+	if err := st.SetPoolMembership([]string{acc.ID}); err != nil {
+		t.Fatalf("SetPoolMembership: %v", err)
+	}
+	reqOK, _ := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/chat/completions", strings.NewReader(`{
+		"model": "dsflash-high",
+		"stream": false,
+		"messages": [{"role": "user", "content": "now in pool"}]
+	}`))
+	reqOK.Header.Set("Authorization", "Bearer "+apiKey)
+	reqOK.Header.Set("Content-Type", "application/json")
+	respOK, err := http.DefaultClient.Do(reqOK)
+	if err != nil {
+		t.Fatalf("POST after opt-in: %v", err)
+	}
+	respOK.Body.Close()
+	if respOK.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 after manual opt-in, got %d", respOK.StatusCode)
+	}
+}
+
+func TestWeightedBalanceProbabilisticRoutingAnd7DayStickyBinding(t *testing.T) {
+	var (
+		mu             sync.Mutex
+		authHits       = map[string]int{}
+		storeByAuth    = map[string]string{}
+		lastSessByAuth = map[string]string{}
+	)
+	_, gwSrv, st, _, apiKey, _ := setupTestGatewayEnv(t, false, func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		execRaw := r.Header.Get(bohrium.SciXExecutionHeader)
+		var execObj bohrium.SciXExecutionPayload
+		if dec, err := base64.RawURLEncoding.DecodeString(execRaw); err == nil {
+			_ = json.Unmarshal(dec, &execObj)
+		}
+		mu.Lock()
+		authHits[auth]++
+		storeByAuth[auth] = execObj.StoreID
+		lastSessByAuth[auth] = execObj.SessionID
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		_, _ = io.WriteString(w, `data: {"id":"c_w","object":"chat.completion.chunk","created":1700000400,"model":"dsflash-high","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`+"\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	})
+
+	accHigh, _, _ := st.UpsertAccountFromAuth(store.AuthState{
+		Token:     "tok-high-90k",
+		UserID:    500001,
+		Nickname:  "RichAccount",
+		ExpiresAt: time.Now().Add(48 * time.Hour),
+	}, "High")
+	accLow, _, _ := st.UpsertAccountFromAuth(store.AuthState{
+		Token:     "tok-low-10k",
+		UserID:    500002,
+		Nickname:  "SmallAccount",
+		ExpiresAt: time.Now().Add(48 * time.Hour),
+	}, "Low")
+	// 90,000 + 10,000 = 100,000 vs 10,000 + 0 = 10,000 (~90.9% vs ~9.1%)
+	_ = st.UpdateAccountBalance(accHigh.ID, 90000, 10000, 0)
+	_ = st.UpdateAccountBalance(accLow.ID, 10000, 0, 0)
+	_ = st.SetPoolMembership([]string{accHigh.ID, accLow.ID})
+
+	const totalSessions = 100
+	for i := 0; i < totalSessions; i++ {
+		body := fmt.Sprintf(`{"model":"dsflash-high","stream":false,"messages":[{"role":"user","content":"Weighted routing test prompt #%d"}]}`, i)
+		req, _ := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("session %d: %v", i, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("session %d status=%d", i, resp.StatusCode)
+		}
+		if mode := resp.Header.Get("X-Bohrium-Routing-Mode"); mode != "new_bind" {
+			t.Fatalf("session %d: expected X-Bohrium-Routing-Mode=new_bind, got %q", i, mode)
+		}
+		resp.Body.Close()
+	}
+
+	mu.Lock()
+	highCount := authHits["Bearer tok-high-90k"]
+	lowCount := authHits["Bearer tok-low-10k"]
+	highStore := storeByAuth["Bearer tok-high-90k"]
+	lowStore := storeByAuth["Bearer tok-low-10k"]
+	mu.Unlock()
+
+	// With P(high)=0.909 over 100 trials, expected ~91; threshold >=72 has <1e-7 false failure rate.
+	if highCount < 72 || highCount+lowCount != totalSessions {
+		t.Fatalf("expected high-balance account (~90.9%%) to strongly dominate routing, got high=%d low=%d", highCount, lowCount)
+	}
+	// Verify per-account isolated StoreID when both accounts saw traffic
+	if lowCount > 0 && (highStore == "" || lowStore == "" || highStore == lowStore) {
+		t.Fatalf("expected isolated per-account storeId, got high=%q low=%q", highStore, lowStore)
+	}
+
+	// Verify sticky binding: follow-up turn in conversation #0 hits the exact bound account & scixSessionId, incrementing hitCount to 2
+	bindingsBefore, _ := st.ListSessionBindings(time.Now().UTC(), 200)
+	if len(bindingsBefore) != totalSessions {
+		t.Fatalf("expected %d SQLite bindings, got %d", totalSessions, len(bindingsBefore))
+	}
+	reqFollow, _ := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/chat/completions", strings.NewReader(`{
+		"model": "dsflash-high",
+		"stream": false,
+		"messages": [
+			{"role": "user", "content": "Weighted routing test prompt #0"},
+			{"role": "assistant", "content": "ok"},
+			{"role": "user", "content": "Follow-up turn"}
+		]
+	}`))
+	reqFollow.Header.Set("Authorization", "Bearer "+apiKey)
+	reqFollow.Header.Set("Content-Type", "application/json")
+	respFollow, err := http.DefaultClient.Do(reqFollow)
+	if err != nil {
+		t.Fatalf("follow-up turn: %v", err)
+	}
+	if mode := respFollow.Header.Get("X-Bohrium-Routing-Mode"); mode != "bound" {
+		t.Fatalf("expected follow-up turn X-Bohrium-Routing-Mode=bound, got %q", mode)
+	}
+	respFollow.Body.Close()
+
+	// Find the binding with HitCount == 2
+	foundHit2 := false
+	bindingsAfter, _ := st.ListSessionBindings(time.Now().UTC(), 200)
+	for _, b := range bindingsAfter {
+		if b.HitCount == 2 {
+			foundHit2 = true
+			if b.ExpiresAt.Sub(b.CreatedAt) > store.SessionBindingTTL {
+				t.Fatalf("binding TTL exceeded 7 days: %s", b.ExpiresAt.Sub(b.CreatedAt))
+			}
+			break
+		}
+	}
+	if !foundHit2 {
+		t.Fatalf("expected bound conversation's SQLite hit_count to increment to 2")
+	}
+
+	// Purging 7 days + 1 min into the future deletes all 100 bindings
+	purged, err := st.PurgeExpiredSessionBindings(time.Now().UTC().Add(store.SessionBindingTTL + time.Minute))
+	if err != nil || purged != totalSessions {
+		t.Fatalf("expected %d bindings purged after 7d, got purged=%d err=%v", totalSessions, purged, err)
+	}
+}
+
+func TestPreFirstByteAutomaticFailoverAndRebind(t *testing.T) {
+	failA := false
+	_, gwSrv, st, _, apiKey, _ := setupTestGatewayEnv(t, false, func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if failA && auth == "Bearer tok-fail-A" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusPaymentRequired)
+			_, _ = io.WriteString(w, `{"error":{"code":"insufficient_balance","message":"BILLING_PHOTON_NOT_ENOUGH"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		_, _ = io.WriteString(w, `data: {"id":"c_fb","object":"chat.completion.chunk","created":1700000500,"model":"dsflash-high","choices":[{"index":0,"delta":{"role":"assistant","content":"Handled via `+auth+`"},"finish_reason":"stop"}]}`+"\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	})
+
+	accA, _, _ := st.UpsertAccountFromAuth(store.AuthState{Token: "tok-fail-A", UserID: 600001, Nickname: "FailA", ExpiresAt: time.Now().Add(48 * time.Hour)}, "A")
+	accB, _, _ := st.UpsertAccountFromAuth(store.AuthState{Token: "tok-ok-B", UserID: 600002, Nickname: "HealthyB", ExpiresAt: time.Now().Add(48 * time.Hour)}, "B")
+	_ = st.UpdateAccountBalance(accA.ID, 50000, 0, 0)
+	_ = st.UpdateAccountBalance(accB.ID, 10000, 0, 0)
+	// Start with only accA in pool so Turn 1 genuinely binds "failover-conv-1" -> accA in SQLite
+	_ = st.SetPoolMembership([]string{accA.ID})
+
+	reqInit, _ := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/chat/completions", strings.NewReader(`{
+		"model": "dsflash-high",
+		"stream": false,
+		"messages": [{"role": "user", "content": "bind to accA first"}]
+	}`))
+	reqInit.Header.Set("Authorization", "Bearer "+apiKey)
+	reqInit.Header.Set("Content-Type", "application/json")
+	reqInit.Header.Set("x-session-id", "failover-conv-1")
+	respInit, err := http.DefaultClient.Do(reqInit)
+	if err != nil {
+		t.Fatalf("init request: %v", err)
+	}
+	respInit.Body.Close()
+	if respInit.StatusCode != http.StatusOK || respInit.Header.Get("X-Bohrium-Routing-Mode") != "new_bind" {
+		t.Fatalf("expected 200 new_bind on turn 1, got %d %q", respInit.StatusCode, respInit.Header.Get("X-Bohrium-Routing-Mode"))
+	}
+	initBindings, _ := st.ListSessionBindings(time.Now().UTC(), 10)
+	if len(initBindings) != 1 || initBindings[0].AccountID != accA.ID {
+		t.Fatalf("expected 1 SQLite binding to accA, got %+v", initBindings)
+	}
+	sessHash := initBindings[0].SessionHash
+
+	// Now add accB to pool and make accA fail with 402 insufficient_balance -> Turn 2 MUST failover & rebind!
+	_ = st.SetPoolMembership([]string{accA.ID, accB.ID})
+	failA = true
+
+	req, _ := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/chat/completions", strings.NewReader(`{
+		"model": "dsflash-high",
+		"stream": false,
+		"messages": [{"role": "user", "content": "trigger failover"}]
+	}`))
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-session-id", "failover-conv-1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failover request: %v", err)
+	}
+	var out openai.ChatCompletionResponse
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 after automatic failover, got %d", resp.StatusCode)
+	}
+	if mode := resp.Header.Get("X-Bohrium-Routing-Mode"); mode != "rebound" {
+		t.Fatalf("expected X-Bohrium-Routing-Mode=rebound, got %q", mode)
+	}
+	if !strings.Contains(out.Choices[0].Message.Content.(string), "tok-ok-B") {
+		t.Fatalf("expected response from HealthyB, got %+v", out.Choices[0].Message.Content)
+	}
+
+	// Verify SQLite binding was updated to accB and accA was marked insufficient/cooling down
+	rebound, ok, _ := st.GetSessionBinding(sessHash, time.Now().UTC())
+	if !ok || rebound.AccountID != accB.ID {
+		t.Fatalf("expected SQLite binding rebound to accB (%s), got ok=%v binding=%+v", accB.ID, ok, rebound)
+	}
+	afterA, _, _ := st.GetAccount(accA.ID)
+	if afterA.HealthStatus != "insufficient" || !afterA.CooldownUntil.After(time.Now().UTC()) {
+		t.Fatalf("expected accA marked insufficient with cooldown, got status=%q cooldown=%s", afterA.HealthStatus, afterA.CooldownUntil)
+	}
+
+	// Next: remove accB from pool and add accC -> bound session fails over cleanly to accC!
+	accC, _, _ := st.UpsertAccountFromAuth(store.AuthState{Token: "tok-ok-C", UserID: 600003, Nickname: "HealthyC", ExpiresAt: time.Now().Add(48 * time.Hour)}, "C")
+	_ = st.UpdateAccountBalance(accC.ID, 20000, 0, 0)
+	_ = st.SetPoolMembership([]string{accC.ID})
+
+	req2, _ := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/chat/completions", strings.NewReader(`{
+		"model": "dsflash-high",
+		"stream": false,
+		"messages": [{"role": "user", "content": "after accB removed"}]
+	}`))
+	req2.Header.Set("Authorization", "Bearer "+apiKey)
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("x-session-id", "failover-conv-1")
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatalf("post-removal request: %v", err)
+	}
+	var out2 openai.ChatCompletionResponse
+	_ = json.NewDecoder(resp2.Body).Decode(&out2)
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK || !strings.Contains(out2.Choices[0].Message.Content.(string), "tok-ok-C") {
+		t.Fatalf("expected automatic failover to accC after accB removed from pool, got status=%d content=%v", resp2.StatusCode, out2.Choices[0].Message.Content)
+	}
+	reboundC, ok, _ := st.GetSessionBinding(sessHash, time.Now().UTC())
+	if !ok || reboundC.AccountID != accC.ID {
+		t.Fatalf("expected SQLite binding rebound to accC (%s), got ok=%v binding=%+v", accC.ID, ok, reboundC)
+	}
+}
+
+func TestMultiAccountAggregatedBalance(t *testing.T) {
+	_, gwSrv, st, _, apiKey, _ := setupTestGatewayEnv(t, false, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		auth := r.Header.Get("Authorization")
+		switch r.URL.Path {
+		case "/bohrapi/v1/account/user/integral":
+			switch auth {
+			case "Bearer tok-bal-1":
+				_, _ = io.WriteString(w, `{"code":0,"data":{"balance":2000,"orgBalance":0,"orgBalanceLimit":0}}`)
+			case "Bearer tok-bal-2":
+				_, _ = io.WriteString(w, `{"code":0,"data":{"balance":7000,"orgBalance":1000,"orgBalanceLimit":2000}}`)
+			default:
+				_, _ = io.WriteString(w, `{"code":0,"data":{"balance":50000,"orgBalance":0,"orgBalanceLimit":0}}`)
+			}
+		case "/brm/v1/wallet/info":
+			_, _ = io.WriteString(w, `{"code":0,"data":{"balance":5}}`)
+		case "/platform-gateway/v1/benefits/quota/info":
+			_, _ = io.WriteString(w, `{"code":0,"data":{"extraExpire7DayAmount":100}}`)
+		case "/platform-gateway/v1/benefits/quota/expire_page", "/bohrapi/v1/account/user/integral_page":
+			_, _ = io.WriteString(w, `{"code":0,"data":{"items":[]}}`)
+		case "/platform-gateway/v1/membership/info":
+			_, _ = io.WriteString(w, `{"code":0,"data":{"level":1,"photons":500}}`)
+		case "/bohrapi/v1/literature-sage/api/v1/file/capacity":
+			_, _ = io.WriteString(w, `{"code":0,"data":{"remainingCapacity":1000,"usedCapacity":100,"totalCapacity":1100}}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	a1, _, _ := st.UpsertAccountFromAuth(store.AuthState{Token: "tok-bal-1", UserID: 700001, Nickname: "Pool1", ExpiresAt: time.Now().Add(48 * time.Hour)}, "P1")
+	a2, _, _ := st.UpsertAccountFromAuth(store.AuthState{Token: "tok-bal-2", UserID: 700002, Nickname: "Pool2", ExpiresAt: time.Now().Add(48 * time.Hour)}, "P2")
+	_, _, _ = st.UpsertAccountFromAuth(store.AuthState{Token: "tok-bal-3", UserID: 700003, Nickname: "OutOfPool", ExpiresAt: time.Now().Add(48 * time.Hour)}, "Out")
+	_ = st.SetPoolMembership([]string{a1.ID, a2.ID})
+
+	req, _ := http.NewRequest(http.MethodGet, gwSrv.URL+"/v1/balance", nil)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /v1/balance: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(raw))
+	}
+
+	var bal openai.BalanceResponse
+	if err := json.NewDecoder(resp.Body).Decode(&bal); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// Pool1 (2000+0) + Pool2 (7000+1000) = 9000 photon + 1000 org = 10000 effective (OutOfPool 50000 excluded!)
+	if bal.PhotonBalance != 9000 || bal.OrgBalance != 1000 || bal.PoolAccountCount != 2 || bal.HealthyPoolCount != 2 {
+		t.Fatalf("unexpected aggregated pool balance: %+v", bal)
+	}
+	if len(bal.PoolAccounts) != 2 || bal.PoolAccounts[0].WeightPercent != 20.0 || bal.PoolAccounts[1].WeightPercent != 80.0 {
+		t.Fatalf("expected 20%% / 80%% pool weights, got %+v", bal.PoolAccounts)
 	}
 }

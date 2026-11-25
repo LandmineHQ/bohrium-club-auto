@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"bohrium-club-auto/internal/bohrium"
 	"bohrium-club-auto/internal/chromehttp"
@@ -15,7 +16,8 @@ import (
 	"bohrium-club-auto/internal/store"
 )
 
-func TestAdminPasswordProtectionAndHealthz(t *testing.T) {
+func setupTestServer(t *testing.T) (*Server, *store.Store, string) {
+	t.Helper()
 	tmp := t.TempDir()
 	t.Setenv("BOHRIUM_DATA_DIR", tmp)
 	t.Setenv("BOHRIUM_ADMIN_PASSWORD", "super-secret-admin")
@@ -28,10 +30,17 @@ func TestAdminPasswordProtectionAndHealthz(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
+	t.Cleanup(func() { _ = st.Close() })
+
 	httpCli, _ := chromehttp.New(chromehttp.Options{})
-	bCli := bohrium.NewClient(httpCli, cfgMgr, st)
-	sched := scheduler.New(bCli, cfgMgr, st)
-	srv := New("test-1.0", cfgMgr, st, httpCli, bCli, sched)
+	mgr := bohrium.NewManager(httpCli, cfgMgr, st)
+	sched := scheduler.New(mgr, cfgMgr, st)
+	srv := New("test-1.0", cfgMgr, st, httpCli, mgr, sched)
+	return srv, st, "super-secret-admin"
+}
+
+func TestAdminPasswordProtectionAndHealthz(t *testing.T) {
+	srv, _, pw := setupTestServer(t)
 
 	// 1. /healthz is public and reports Chrome UA
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -59,7 +68,7 @@ func TestAdminPasswordProtectionAndHealthz(t *testing.T) {
 	}
 
 	// 4. Correct admin password issues HttpOnly cookie that grants access
-	goodBody, _ := json.Marshal(map[string]string{"password": "super-secret-admin"})
+	goodBody, _ := json.Marshal(map[string]string{"password": pw})
 	req4 := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewReader(goodBody))
 	rec4 := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec4, req4)
@@ -85,5 +94,151 @@ func TestAdminPasswordProtectionAndHealthz(t *testing.T) {
 	srv.Handler().ServeHTTP(rec6, req6)
 	if rec6.Code != http.StatusOK || !strings.Contains(rec6.Body.String(), "Bohrium Club Auto") {
 		t.Fatalf("expected embedded dashboard HTML, got code=%d", rec6.Code)
+	}
+}
+
+func TestMultiAccountPoolAndBindingsAdminAPI(t *testing.T) {
+	srv, st, pw := setupTestServer(t)
+
+	acc1, _, err := st.UpsertAccountFromAuth(store.AuthState{
+		Token:       "tok-secret-alpha-111",
+		UserID:      1001,
+		OrgID:       2001,
+		Nickname:    "Alpha",
+		ExpiresAt:   time.Now().Add(48 * time.Hour),
+		LoginMethod: "token",
+	}, "Main")
+	if err != nil {
+		t.Fatalf("UpsertAccountFromAuth acc1: %v", err)
+	}
+	acc2, _, err := st.UpsertAccountFromAuth(store.AuthState{
+		Token:       "tok-secret-beta-222",
+		UserID:      1002,
+		OrgID:       2002,
+		Nickname:    "Beta",
+		ExpiresAt:   time.Now().Add(48 * time.Hour),
+		LoginMethod: "wechat_qr",
+	}, "Spare")
+	if err != nil {
+		t.Fatalf("UpsertAccountFromAuth acc2: %v", err)
+	}
+	if acc1.PoolEnabled || acc2.PoolEnabled {
+		t.Fatalf("newly logged-in accounts must default to poolEnabled=false")
+	}
+	if acc1.StoreID == "" || acc2.StoreID == "" || acc1.StoreID == acc2.StoreID {
+		t.Fatalf("expected distinct non-empty storeIds, got %q vs %q", acc1.StoreID, acc2.StoreID)
+	}
+	_ = st.UpdateAccountBalance(acc1.ID, 8000, 2000, 10)
+	_ = st.UpdateAccountBalance(acc2.ID, 2500, 0, 5)
+
+	doAdmin := func(method, path string, body any) *httptest.ResponseRecorder {
+		var rdr *bytes.Reader
+		if body != nil {
+			b, _ := json.Marshal(body)
+			rdr = bytes.NewReader(b)
+		} else {
+			rdr = bytes.NewReader(nil)
+		}
+		req := httptest.NewRequest(method, path, rdr)
+		req.Header.Set("X-Admin-Password", pw)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1. GET /api/accounts lists both accounts and NEVER leaks raw JWT tokens
+	rec := doAdmin(http.MethodGet, "/api/accounts", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/accounts: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "tok-secret-alpha-111") || strings.Contains(rec.Body.String(), "tok-secret-beta-222") {
+		t.Fatalf("raw JWT token leaked in /api/accounts response!")
+	}
+	var listRes struct {
+		OK       bool            `json:"ok"`
+		Accounts []store.Account `json:"accounts"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &listRes)
+	if len(listRes.Accounts) != 2 {
+		t.Fatalf("expected 2 accounts, got %d", len(listRes.Accounts))
+	}
+
+	// 2. PATCH /api/accounts/{id} updates label & checkinEnabled
+	chkFalse := false
+	lbl := "Lab-A"
+	recPatch := doAdmin(http.MethodPatch, "/api/accounts/"+acc1.ID, map[string]any{
+		"label":          lbl,
+		"checkinEnabled": chkFalse,
+	})
+	if recPatch.Code != http.StatusOK {
+		t.Fatalf("PATCH account: code=%d body=%s", recPatch.Code, recPatch.Body.String())
+	}
+	got1, _, _ := st.GetAccount(acc1.ID)
+	if got1.Label != "Lab-A" || got1.CheckinEnabled {
+		t.Fatalf("expected updated label/checkin, got %+v", got1)
+	}
+
+	// 3. PUT /api/gateway/pool drags acc1 into the OpenAI pool (leaving acc2 out)
+	recPool := doAdmin(http.MethodPut, "/api/gateway/pool", map[string]any{
+		"accountIds": []string{acc1.ID},
+	})
+	if recPool.Code != http.StatusOK {
+		t.Fatalf("PUT /api/gateway/pool: code=%d body=%s", recPool.Code, recPool.Body.String())
+	}
+	poolAccs, _ := st.ListPoolAccounts()
+	if len(poolAccs) != 1 || poolAccs[0].ID != acc1.ID {
+		t.Fatalf("expected only acc1 in pool, got %+v", poolAccs)
+	}
+
+	// 4. SQLite session bindings endpoints (list, delete one, clear all)
+	now := time.Now().UTC()
+	_ = st.UpsertSessionBinding(store.SessionBinding{
+		SessionHash: "hash-session-one",
+		AccountID:   acc1.ID,
+		ModelHint:   "dspro-high",
+		CreatedAt:   now,
+		LastUsedAt:  now,
+		ExpiresAt:   now.Add(store.SessionBindingTTL),
+	})
+	_ = st.UpsertSessionBinding(store.SessionBinding{
+		SessionHash: "hash-session-two",
+		AccountID:   acc1.ID,
+		ModelHint:   "kimi-k3",
+		CreatedAt:   now,
+		LastUsedAt:  now,
+		ExpiresAt:   now.Add(store.SessionBindingTTL),
+	})
+
+	recB := doAdmin(http.MethodGet, "/api/gateway/bindings", nil)
+	if recB.Code != http.StatusOK || !strings.Contains(recB.Body.String(), "hash-session-one") {
+		t.Fatalf("GET /api/gateway/bindings failed: %d %s", recB.Code, recB.Body.String())
+	}
+
+	recDel1 := doAdmin(http.MethodDelete, "/api/gateway/bindings/hash-session-one", nil)
+	if recDel1.Code != http.StatusOK {
+		t.Fatalf("DELETE single binding failed: %d %s", recDel1.Code, recDel1.Body.String())
+	}
+	if _, found, _ := st.GetSessionBinding("hash-session-one", now); found {
+		t.Fatalf("expected hash-session-one to be deleted")
+	}
+
+	recDelAll := doAdmin(http.MethodDelete, "/api/gateway/bindings", nil)
+	if recDelAll.Code != http.StatusOK {
+		t.Fatalf("DELETE all bindings failed: %d %s", recDelAll.Code, recDelAll.Body.String())
+	}
+	rem, _ := st.ListSessionBindings(now, 50)
+	if len(rem) != 0 {
+		t.Fatalf("expected 0 remaining bindings, got %d", len(rem))
+	}
+
+	// 5. DELETE /api/accounts/{id} removes acc2 cleanly
+	recDelAcc := doAdmin(http.MethodDelete, "/api/accounts/"+acc2.ID, nil)
+	if recDelAcc.Code != http.StatusOK {
+		t.Fatalf("DELETE account failed: %d %s", recDelAcc.Code, recDelAcc.Body.String())
+	}
+	afterAccs, _ := st.ListAccounts()
+	if len(afterAccs) != 1 || afterAccs[0].ID != acc1.ID {
+		t.Fatalf("expected only acc1 remaining, got %+v", afterAccs)
 	}
 }

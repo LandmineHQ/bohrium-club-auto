@@ -1,49 +1,41 @@
 # 快速开始
 
-推荐在服务器上使用 **Docker Compose** 部署，或直接在 GitHub Releases 下载对应平台的静态单文件二进制运行。
+支持通过 Docker Compose、预构建二进制或源码构建三种方式运行。
 
-## 方式一：Docker Compose（推荐）
+## 方式一：Docker Compose
 
 ```bash
 git clone https://github.com/LandmineHQ/bohrium-club-auto.git
 cd bohrium-club-auto
 
-# 指定管理员密码并启动
 BOHRIUM_ADMIN_PASSWORD="YourStrongPassword" docker compose up -d --build
-
-# 查看启动日志
 docker compose logs -f bohrium-club-auto
 ```
 
-若未设置 `BOHRIUM_ADMIN_PASSWORD`，首次启动会自动生成强随机密码并打印到日志及写入 `/data/config.json`。
+若未设置 `BOHRIUM_ADMIN_PASSWORD`，首次启动时会自动生成随机密码并写入 `/data/config.json`。
 
-## 方式二：GHCR 预构建极简镜像
-
-通过仓库内置的 `publish-docker-image.yml` 发布镜像后，可直接拉取运行：
+## 方式二：拉取预构建镜像
 
 ```bash
 BOHRIUM_ADMIN_PASSWORD="YourStrongPassword" \
 docker compose -f docker-compose.ghcr.yml up -d
 ```
 
-默认镜像地址为 `ghcr.io/landminehq/bohrium-club-auto:latest`。
+## 方式三：直接运行二进制
 
-## 方式三：直接运行单文件二进制
-
-从仓库 **[Releases](https://github.com/LandmineHQ/bohrium-club-auto/releases/latest)** 下载对应平台的归档文件（无需安装 Go、Node.js 或任何依赖）：
+解压对应平台的归档文件后直接执行：
 
 ```bash
-# Linux / macOS
 tar -xzf bohrium-club-auto-linux-x64.tar.gz
 chmod +x bohrium-club-auto
 BOHRIUM_ADMIN_PASSWORD="YourStrongPassword" ./bohrium-club-auto
 ```
 
-Windows 用户解压 `bohrium-club-auto-windows-x64.zip` 后，双击或在终端运行 `bohrium-club-auto.exe`。
+Windows 直接运行 `bohrium-club-auto.exe`。
 
-## 首次使用步骤
+## 初次配置步骤
 
-1. 浏览器访问 `http://<server-ip>:8788/`；
-2. 输入管理员密码登录控制台；
-3. 点击右上角 **「远程登录玻尔」** → **「获取 / 刷新二维码」**，用微信扫码完成远程登录；
-4. 登录后首页自动展示光子余额、存储容量、配额与 4 项每日任务，可点击 **「一键领取每日任务」** 或 **「一键执行全部 Web 任务」** / 单项手动按钮测试。
+1. 访问 `http://<host>:8788/`，使用管理员密码登录控制台；
+2. 点击 **添加 / 登录账号**，通过微信扫码、OAuth、验证码或 `brmToken` 添加一个或多个账号；
+3. 在「多账号与签到」页面检查账号余额、签到开关与每日任务状态；
+4. 如需使用 `/v1/*` OpenAI 接口，前往「OpenAI 路由池」将账号拖入右侧路由池，并复制 API Base URL 与 API Key。

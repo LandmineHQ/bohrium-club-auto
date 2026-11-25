@@ -19,12 +19,23 @@ func (s *Server) handleGatewayStatus(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	gwCfg := s.cfg.Get().Gateway
-	auth := s.store.GetAuth()
+	allViews, summary := s.buildAccountViews()
+	poolViews, poolTotalEff, _ := s.gateway.Router().PoolSummary()
+	bindings, _ := s.store.ListSessionBindings(time.Now().UTC(), 100)
+
+	// Partition non-pooled candidate accounts for the left drag-and-drop column.
+	candidates := make([]AccountSummaryView, 0)
+	for _, v := range allViews {
+		if !v.PoolEnabled {
+			candidates = append(candidates, v)
+		}
+	}
+
 	var (
 		catalog    *bohrium.SciXModelCatalog
 		catalogErr string
 	)
-	if auth.Token != "" {
+	if len(allViews) > 0 {
 		cat, err := s.gateway.ListCatalog(ctx, false)
 		if err != nil {
 			catalogErr = err.Error()
@@ -35,8 +46,8 @@ func (s *Server) handleGatewayStatus(w http.ResponseWriter, r *http.Request) {
 
 	pgPrompts, _ := prompts.PlaygroundPrompts()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":                true,
-		"bohriumLoggedIn":   auth.Token != "",
+		"ok":              true,
+		"bohriumLoggedIn": len(allViews) > 0,
 		"config": map[string]any{
 			"enabled":         gwCfg.Enabled,
 			"defaultModel":    gwCfg.DefaultModel,
@@ -47,11 +58,99 @@ func (s *Server) handleGatewayStatus(w http.ResponseWriter, r *http.Request) {
 			"storeId":         gwCfg.StoreID,
 			"apiKeys":         gwCfg.APIKeys,
 		},
+		"pool": map[string]any{
+			"pooled":                poolViews,
+			"candidates":            candidates,
+			"totalEffectiveBalance": poolTotalEff,
+			"activeBindingCount":    len(bindings),
+			"ttlDays":               7,
+		},
+		"accounts":          allViews,
+		"accountSummary":    summary,
+		"bindings":          bindings,
 		"catalog":           catalog,
 		"catalogError":      catalogErr,
 		"stats":             s.gateway.Stats(),
 		"playgroundPrompts": pgPrompts,
 	})
+}
+
+// handleGatewaySetPool atomically updates which accounts belong to the OpenAI routing pool
+// and their order (directly backing drag-and-drop pool management).
+func (s *Server) handleGatewaySetPool(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		AccountIDs []string `json:"accountIds"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "无效请求体"})
+		return
+	}
+	if err := s.store.SetPoolMembership(body.AccountIDs); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+
+	// Quickly fetch initial balance for any newly pooled account that has no snapshot yet.
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	s.mgr.RefreshStaleBalances(ctx, 24*time.Hour)
+
+	allViews, summary := s.buildAccountViews()
+	poolViews, poolTotalEff, _ := s.gateway.Router().PoolSummary()
+	candidates := make([]AccountSummaryView, 0)
+	for _, v := range allViews {
+		if !v.PoolEnabled {
+			candidates = append(candidates, v)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true,
+		"pool": map[string]any{
+			"pooled":                poolViews,
+			"candidates":            candidates,
+			"totalEffectiveBalance": poolTotalEff,
+			"ttlDays":               7,
+		},
+		"accounts":       allViews,
+		"accountSummary": summary,
+		"message":        "OpenAI 路由池已更新",
+	})
+}
+
+func (s *Server) handleGatewayListBindings(w http.ResponseWriter, r *http.Request) {
+	bindings, err := s.store.ListSessionBindings(time.Now().UTC(), 200)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"ttlDays":  7,
+		"bindings": bindings,
+	})
+}
+
+func (s *Server) handleGatewayDeleteBinding(w http.ResponseWriter, r *http.Request) {
+	hash := strings.TrimSpace(r.PathValue("hash"))
+	deleted, err := s.store.DeleteSessionBinding(hash)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if !deleted {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "绑定记录不存在"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "deleted": true})
+}
+
+func (s *Server) handleGatewayClearBindings(w http.ResponseWriter, r *http.Request) {
+	n, err := s.store.ClearSessionBindings()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": n})
 }
 
 func (s *Server) handleGatewayRefreshModels(w http.ResponseWriter, r *http.Request) {
@@ -204,7 +303,8 @@ func (s *Server) handleGatewayUpdateSettings(w http.ResponseWriter, r *http.Requ
 
 func (s *Server) handleGatewayPreflight(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Model string `json:"model"`
+		AccountID string `json:"accountId"`
+		Model     string `json:"model"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "无效请求体"})
@@ -212,23 +312,25 @@ func (s *Server) handleGatewayPreflight(w http.ResponseWriter, r *http.Request) 
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	allowed, reason, err := s.gateway.Preflight(ctx, body.Model)
+	allowed, reason, accName, err := s.gateway.Preflight(ctx, body.AccountID, body.Model)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"allowed": allowed,
-		"reason":  reason,
+		"ok":          true,
+		"allowed":     allowed,
+		"reason":      reason,
+		"accountName": accName,
 	})
 }
 
 // handleGatewayPlayground lets an authenticated admin test /v1/chat/completions or /v1/responses
-// directly from the Web Console without needing to pass an API key manually.
+// directly from the Web Console using either automatic pool routing or an explicit account override.
 func (s *Server) handleGatewayPlayground(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Endpoint        string `json:"endpoint"` // "chat" | "responses"
+		AccountID       string `json:"accountId"` // empty = automatic weighted pool routing
+		Endpoint        string `json:"endpoint"`  // "chat" | "responses"
 		Model           string `json:"model"`
 		Prompt          string `json:"prompt"`
 		System          string `json:"system"`
@@ -289,13 +391,16 @@ func (s *Server) handleGatewayPlayground(w http.ResponseWriter, r *http.Request)
 	}
 
 	b, _ := json.Marshal(reqPayload)
-	subReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetPath, bytes.NewReader(b))
+	subCtx := r.Context()
+	if strings.TrimSpace(body.AccountID) != "" {
+		subCtx = openai.WithExplicitAccountID(subCtx, body.AccountID)
+	}
+	subReq, err := http.NewRequestWithContext(subCtx, http.MethodPost, targetPath, bytes.NewReader(b))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
 	subReq.Header.Set("Content-Type", "application/json")
-	// Inject first enabled API key for internal dispatch through the real /v1/* route.
 	gwCfg := s.cfg.Get().Gateway
 	for _, k := range gwCfg.APIKeys {
 		if k.Enabled && k.Key != "" {

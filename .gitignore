@@ -6,6 +6,11 @@
 .env
 .env.*
 
+# Frontend dependencies & compiled SPA bundle (keep tracked .gitkeep for go:embed)
+/web/node_modules/
+/web/dist/*
+!/web/dist/.gitkeep
+
 # Build outputs
 /dist/
 /bin/

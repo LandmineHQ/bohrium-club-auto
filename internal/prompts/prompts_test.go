@@ -40,6 +40,37 @@ func TestEmbeddedCorpusAndPapers(t *testing.T) {
 	if !strings.HasPrefix(sciPrompt, "You are SciMaster,") || len(sciPrompt) < 500 {
 		t.Fatalf("expected authentic SciMaster system prompt, got len=%d prefix=%q", len(sciPrompt), sciPrompt[:min(40, len(sciPrompt))])
 	}
+	desktopTools, err := DesktopClientTools()
+	if err != nil || len(desktopTools) != 16 {
+		t.Fatalf("DesktopClientTools(): err=%v len=%d (expected 16)", err, len(desktopTools))
+	}
+	wantTools := map[string]bool{
+		"pwsh": true, "read": true, "write": true, "edit": true,
+		"read_image": true, "glob": true, "grep": true, "skill": true,
+		"web_search": true, "web_fetch": true, "paper_search": true, "generate_image": true,
+		"memory_write": true, "ask_user_question": true, "subagent": true, "browser": true,
+	}
+	for i, item := range desktopTools {
+		if item["type"] != "function" {
+			t.Fatalf("desktop tool[%d] type=%v, want function", i, item["type"])
+		}
+		fn, _ := item["function"].(map[string]any)
+		name, _ := fn["name"].(string)
+		if !wantTools[name] {
+			t.Fatalf("unexpected desktop tool[%d] name=%q", i, name)
+		}
+		delete(wantTools, name)
+		if fn["strict"] != false {
+			t.Fatalf("desktop tool %s expected strict=false, got %v", name, fn["strict"])
+		}
+		params, _ := fn["parameters"].(map[string]any)
+		if params["type"] != "object" {
+			t.Fatalf("desktop tool %s expected parameters.type=object, got %v", name, params["type"])
+		}
+	}
+	if len(wantTools) != 0 {
+		t.Fatalf("missing desktop tools: %+v", wantTools)
+	}
 
 	papers, err := Papers()
 	if err != nil {

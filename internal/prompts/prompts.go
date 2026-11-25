@@ -10,7 +10,7 @@ import (
 	"sync"
 )
 
-//go:embed data/science_space_prompts.json data/academic_writing_prompts.json data/literature_reading_prompts.json data/playground_prompts.json data/papers_catalog.json data/scimaster_system_prompt.txt
+//go:embed data/science_space_prompts.json data/academic_writing_prompts.json data/literature_reading_prompts.json data/playground_prompts.json data/papers_catalog.json data/scimaster_system_prompt.txt data/desktop_tools.json
 var embeddedFS embed.FS
 
 // Paper represents one real open-access scientific paper PDF in the pre-collected 100-paper catalog.
@@ -46,6 +46,7 @@ var (
 	playgroundPrompts        []string
 	papersCatalog            []Paper
 	sciMasterSystemPrompt    string
+	desktopTools             []map[string]any
 )
 
 func ensureLoaded() error {
@@ -76,6 +77,10 @@ func ensureLoaded() error {
 			return
 		}
 		sciMasterSystemPrompt = strings.TrimSpace(string(rawPrompt))
+		if err := loadJSON("data/desktop_tools.json", &desktopTools); err != nil {
+			loadErr = err
+			return
+		}
 	})
 	return loadErr
 }
@@ -117,6 +122,23 @@ func PlaygroundPrompts() ([]string, error) {
 func SciMasterSystemPrompt() string {
 	_ = ensureLoaded()
 	return sciMasterSystemPrompt
+}
+
+// DesktopClientTools returns a deep-cloned slice of all 16 Bohrium desktop client built-in OpenAI function tools
+// matching scix v0.10.25 (cordis.yml / brain.mjs).
+func DesktopClientTools() ([]map[string]any, error) {
+	if err := ensureLoaded(); err != nil {
+		return nil, err
+	}
+	raw, err := json.Marshal(desktopTools)
+	if err != nil {
+		return nil, err
+	}
+	var cloned []map[string]any
+	if err := json.Unmarshal(raw, &cloned); err != nil {
+		return nil, err
+	}
+	return cloned, nil
 }
 
 // RandomPlaygroundPrompt picks a random prompt from the 100-item playground pool.

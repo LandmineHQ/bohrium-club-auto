@@ -1,19 +1,19 @@
 # syntax=docker/dockerfile:1
-# ---------------------------------------------------------------------------
-# Bohrium Club Auto — 极简运行时镜像（静态单文件 Go 二进制 + Alpine）
-#
-#   docker build -t bohrium-club-auto:latest .
-#   docker run -d --name bohrium-club-auto -p 8788:8788 \
-#     -e BOHRIUM_ADMIN_PASSWORD="change-me" \
-#     -v bohrium-club-auto-data:/data bohrium-club-auto:latest
-#
-# 设计：
-#   - build 阶段使用 golang:1.24-alpine，CGO_ENABLED=0 静态编译单文件二进制
-#     （所有 870+ 提问语料、100 篇文献目录与管理面板均通过 go:embed 内置）；
-#   - runtime 阶段仅包含 alpine:3.20 + ca-certificates + tzdata + 单文件二进制。
-# ---------------------------------------------------------------------------
+# Multi-stage build:
+#   1) web-build: compiles React + Vite + shadcn/ui dashboard into /web/dist
+#   2) go-build:  compiles static Go binary (CGO_ENABLED=0) embedding /web/dist
+#   3) runtime:   minimal Alpine image with ca-certificates + tzdata
 
-FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS build
+FROM --platform=$BUILDPLATFORM node:22-alpine AS web-build
+
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/index.html web/tsconfig.json web/tsconfig.app.json web/tsconfig.node.json web/vite.config.ts web/components.json ./
+COPY web/src ./src
+RUN npm run build
+
+FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS go-build
 
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
@@ -21,16 +21,17 @@ ARG APP_VERSION="dev"
 
 WORKDIR /src
 
-COPY go.mod ./
+COPY go.mod go.sum ./
+RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
-COPY web ./web
+COPY web/embed.go ./web/embed.go
+COPY --from=web-build /web/dist ./web/dist
 
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags="-s -w -X main.Version=${APP_VERSION}" \
     -o /out/bohrium-club-auto ./cmd/bohrium-club-auto
 
-# ---------- 运行阶段：最小 Alpine + 静态二进制 ----------
 FROM alpine:3.20
 
 ARG APP_VERSION="dev"
@@ -43,7 +44,6 @@ ENV BOHRIUM_VERSION=${APP_VERSION} \
     TZ=Asia/Shanghai
 
 LABEL org.opencontainers.image.title="bohrium-club-auto" \
-      org.opencontainers.image.description="Self-hosted Bohrium User Community daily task automation and points/capacity dashboard (single Go binary)" \
       org.opencontainers.image.version="${APP_VERSION}" \
       org.opencontainers.image.licenses="MIT"
 
@@ -53,11 +53,10 @@ RUN apk add --no-cache ca-certificates tzdata \
  && mkdir -p /data \
  && chown -R bohrium:bohrium /data
 
-COPY --from=build /out/bohrium-club-auto /usr/local/bin/bohrium-club-auto
+COPY --from=go-build /out/bohrium-club-auto /usr/local/bin/bohrium-club-auto
 
 USER bohrium
 
-# 持久化数据：config.json / state.json / pdfs/ / custom_pdfs/ / recon/
 VOLUME ["/data"]
 
 EXPOSE 8788

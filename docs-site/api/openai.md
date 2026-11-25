@@ -1,6 +1,13 @@
-# OpenAI 兼容网关（Chat Completions & Responses API）
+# OpenAI 兼容网关（多账号混合池 · Chat Completions & Responses API）
 
-`bohrium-club-auto` 内置了一套严格遵循 **Bohrium 桌面客户端（SciX）原生协议** 的 OpenAI 兼容网关，直接复用服务内已登录并自动续期的 `brmToken`，向外暴露标准的 `/v1/models`、`/v1/chat/completions` 与 `/v1/responses` 接口。
+`bohrium-club-auto` 内置了一套严格遵循 **Bohrium 桌面客户端（SciX）原生协议** 的多账号混合路由 OpenAI 兼容网关，向外暴露标准的 `/v1/models`、`/v1/balance`、`/v1/chat/completions` 与 `/v1/responses` 接口。
+
+## 多账号路由池与余额加权粘性绑定（SQLite）
+
+- **严格手动入池（默认不入池）**：所有新登录的账号（包括从旧版 `data/state.json` 自动迁移的历史账号）均默认 `poolEnabled = false`，**不会**自动参与 OpenAI 路由。必须在 Web 控制台「03 OpenAI 网关」的路由池双列面板中手动将账号拖入右侧「已入池」，该账号才会承载 `/v1/*` 流量。若路由池为空，`/v1/*` 将返回 HTTP `503`（`error.code = "empty_pool"`）。
+- **余额加权概率选路**：新会话到来时，路由器仅从已入池且健康（未过期、未处于 402/401 冷却期）的账号中按有效余额 $B_i = \max(0, \text{photon\_balance}_i + \text{org\_balance}_i)$ 进行线性加权随机采样（$P_i = B_i / \sum_j B_j$）——余额越高的账号被绑定到新会话的概率越大。
+- **SQLite 7 天硬上限粘性绑定**：选中账号后，网关将 `session_hash → (account_id, scix_session_id, expires_at)` 写入 `data/bohrium.db` 的 `session_bindings` 表，同一对话后续轮次复用同一账号与独立 `storeId`/`sessionId`。每条绑定最长缓存 **7 天**（硬上限 `created_at + 7d`，不滑动续期），到期自动失效并由后台每小时物理清理；亦可在控制台实时查看与手动解绑。
+- **首字节前无感故障转移与重绑**：若某会话已绑定的账号被移出池、发生 401 Token 失效或 402 光子不足，只要尚未向客户端写出首个响应字节，网关会自动将异常账号标记为过期/余额不足（30 分钟冷却），按剩余健康池账号余额权重重新采样、更新 SQLite 绑定关系并透明重试，响应头 `X-Bohrium-Routing-Mode` 会体现 `new_bind` / `bound` / `rebound`。
 
 ## 上游协议保真机制
 
@@ -23,7 +30,7 @@ Bohrium 上游对不同模型限定了原生端点：
 网关会自动按模型原生协议路由并执行**无损双向桥接**：
 1. 用主力模型调用 **`POST /v1/responses`** 时，网关底层以客户端原生格式请求 Bohrium `/chat/completions`，并实时输出符合 OpenAI 规范的 Responses SSE 事件流（`response.created` → `response.in_progress` → `response.reasoning_text.*` / `response.output_text.*` / `response.function_call_arguments.*` → `response.output_item.done` → `response.completed`）或非流式 `object: "response"` 对象。
 2. 用 `responses` 原生模型调用 **`POST /v1/chat/completions`** 时，网关底层请求 Bohrium `/responses` 并实时转换为标准 `chat.completion.chunk` / `chat.completion`。
-3. 通过本地持久化存储（`data/responses.json`，最多保留 200 条）完整支持 `previous_response_id` 多轮会话链、`store`、`GET /v1/responses/{id}`、`GET /v1/responses/{id}/input_items` 与 `DELETE /v1/responses/{id}`，同时向上游始终发送无状态 `store: false`。
+3. 通过本地 SQLite 持久化存储（`data/bohrium.db` `responses` 表，最多保留 200 条）完整支持 `previous_response_id` 多轮会话链、`store`、`GET /v1/responses/{id}`、`GET /v1/responses/{id}/input_items` 与 `DELETE /v1/responses/{id}`，同时向上游始终发送无状态 `store: false`。
 
 ## 鉴权方式
 
@@ -38,7 +45,7 @@ Bohrium 上游对不同模型限定了原生端点：
 | --- | --- | --- |
 | `GET` | `/v1/models` | 返回实时 Bohrium SciX 模型列表（含 `scix_catalog` 元数据，兼容客户端与 OpenAI SDK） |
 | `GET` | `/v1/models/{id}` | 按模型 ID、`scix/<id>` 或显示名别名（如 `DeepSeek-V4-Pro`）查询模型详情 |
-| `GET` | `/v1/balance` | 查询当前账号光子余额、组织余额、钱包余额（CNY）、7 日将过期批次、会员配额与知识库存储容量（含 `balance_infos`） |
+| `GET` | `/v1/balance` | 实时聚合所有已入池账号的光子余额、组织余额、钱包余额（CNY）、配额、知识库存储及各入池账号余额与路由权重明细（`pool_accounts`、`balance_infos`） |
 | `POST` | `/v1/chat/completions` | 完整 Chat Completions（SSE/非流式、工具调用、`reasoning_effort`、多模态图像、`response_format`） |
 | `POST` | `/v1/responses` | 完整 Responses API（SSE/非流式、`instructions`、`input` 项数组、工具调用、推理、视觉、`previous_response_id`） |
 | `GET` | `/v1/responses/{id}` | 获取已存储的响应对象 |

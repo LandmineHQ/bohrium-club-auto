@@ -36,10 +36,11 @@ const (
 	ShrimpClientSurfaceHeader = "x-shrimp-client-surface"
 	ShrimpClientSurfaceValue  = "shrimp-web"
 
-	TaskKeyScienceSpaceWeb   = "bohrium_science_space_web"
-	TaskKeyLiteratureReading = "bohrium_literature_reading"
-	TaskKeyAcademicWriting   = "bohrium_academic_writing"
-	TaskKeyClientSkipped     = "bohrium_science_space_client"
+	TaskKeyScienceSpaceWeb    = "bohrium_science_space_web"
+	TaskKeyScienceSpaceClient = "bohrium_science_space_client"
+	TaskKeyLiteratureReading  = "bohrium_literature_reading"
+	TaskKeyAcademicWriting    = "bohrium_academic_writing"
+	TaskKeyClientSkipped      = TaskKeyScienceSpaceClient // Deprecated alias retained for backward compatibility
 )
 
 // Endpoints allows overriding upstream base URLs (e.g., for httptest unit tests).
@@ -63,13 +64,24 @@ func defaultEndpoints() Endpoints {
 	}
 }
 
-// Client interacts with club.bohrium.com, platform.bohrium.com, www.bohrium.com, and sb-cloud.dp.tech.
+// AccountStore abstracts credential, StoreID, and log persistence for a single Bohrium account.
+// Both *store.Store (legacy/default) and per-account *store.AccountScope / *store.LoginScope satisfy this interface.
+type AccountStore interface {
+	GetAuth() store.AuthState
+	SetAuth(auth store.AuthState) error
+	ClearAuth() error
+	AppendLog(entry store.RunLog) error
+	StoreID() string
+}
+
+// Client interacts with club.bohrium.com, platform.bohrium.com, www.bohrium.com, and sb-cloud.dp.tech
+// scoped to a single Bohrium account's credentials and StoreID.
 // Note: The deprecated legacy 200-photon check-in endpoint (/bohrapi/v1/account/user/integral_receive)
 // is intentionally never implemented or called.
 type Client struct {
 	http      *chromehttp.Client
 	cfg       *config.Manager
-	store     *store.Store
+	store     AccountStore
 	endpoints Endpoints
 
 	catalogMu        sync.RWMutex
@@ -78,8 +90,8 @@ type Client struct {
 	catalogUserID    int64
 }
 
-// NewClient creates a Bohrium API client using the Chrome-emulating HTTP client.
-func NewClient(httpClient *chromehttp.Client, cfg *config.Manager, st *store.Store) *Client {
+// NewClient creates a Bohrium API client bound to the given AccountStore.
+func NewClient(httpClient *chromehttp.Client, cfg *config.Manager, st AccountStore) *Client {
 	return &Client{
 		http:      httpClient,
 		cfg:       cfg,

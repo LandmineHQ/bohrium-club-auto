@@ -1,26 +1,27 @@
 # 安装与部署
 
-## 1. Docker 多阶段构建说明
+## 1. Docker 多阶段构建
 
-根目录 `Dockerfile` 采用两阶段构建：
+根目录 `Dockerfile` 分为三个阶段：
 
-- **Build 阶段**：`golang:1.24-alpine` 执行 `CGO_ENABLED=0 go build -trimpath -ldflags="-s -w"`；
-- **Runtime 阶段**：仅包含 `alpine:3.20` + `ca-certificates` + `tzdata` + `/usr/local/bin/bohrium-club-auto`，以非 root 用户 `bohrium`（UID `10001`）运行。
+1. **web-build (`node:22-alpine`)**：在 `web/` 中执行 `npm ci && npm run build`，构建 React + Vite + shadcn/ui 静态资源至 `/web/dist`；
+2. **go-build (`golang:1.24-alpine`)**：拷贝 `/web/dist` 并执行 `CGO_ENABLED=0 go build` 产出静态二进制；
+3. **runtime (`alpine:3.20`)**：仅包含 `ca-certificates`、`tzdata` 与可执行文件，以非 root 用户（UID `10001`）运行。
 
-持久化数据统一挂载在 `/data`：
+持久化数据目录 `/data` 结构：
 
 ```text
 /data/
-├── config.json          # 管理员密码、定时计划、Chrome UA、代理配置
-├── state.json           # 玻尔登录态、上次定时日期与最近 200 条执行日志
-├── pdfs/                # 自动缓存的 arXiv 科学文献 PDF
-├── custom_pdfs/         # 可选：放入自定义 PDF 将优先参与任务 3 随机抽取
-└── recon/bohrium-web/   # 可选：通过面板触发的本地前端 Recon 基线
+├── config.json          # 管理员密码、定时参数、OpenAI 网关配置与 API Key
+├── bohrium.db           # SQLite（多账号凭据、7 天会话绑定、Responses 记录、执行日志）
+├── pdfs/                # 自动下载缓存的文献 PDF
+├── custom_pdfs/         # 可选：自定义 PDF 目录（任务 3 优先随机抽取）
+└── recon/bohrium-web/   # 可选：前端 Recon 基线目录
 ```
 
-## 2. 反向代理建议（Nginx / Caddy）
+## 2. 反向代理（Nginx）
 
-如果通过域名对外暴露管理后台，请启用 HTTPS，并保持 Cookie 与超时配置正常（文献上传+提问可能需要 10~30 秒）：
+若通过域名访问控制台或 `/v1/*` 流式接口，建议关闭代理缓冲并适当放宽读超时：
 
 ```nginx
 location / {
@@ -29,11 +30,12 @@ location / {
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_read_timeout 180s;
+    proxy_buffering off;
+    proxy_read_timeout 300s;
 }
 ```
 
-## 3. systemd 托管（裸机二进制部署）
+## 3. systemd 托管
 
 ```ini
 [Unit]

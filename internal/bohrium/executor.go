@@ -174,20 +174,11 @@ func (c *Client) RunAllWebTasks(ctx context.Context, trigger string, autoClaim b
 	return out, nil
 }
 
-// ExecuteSingleTask executes a single Web task by its taskKey or actionKey.
+// ExecuteSingleTask executes a single daily task (Web or Desktop Client) by its taskKey or actionKey.
 func (c *Client) ExecuteSingleTask(ctx context.Context, taskKey, trigger string) (*TaskExecutionResult, error) {
 	auth := c.store.GetAuth()
 	if auth.Token == "" {
 		return nil, fmt.Errorf("请先登录 Bohrium 账号")
-	}
-	if IsClientSkippedTask(taskKey) {
-		return &TaskExecutionResult{
-			TaskKey:   taskKey,
-			ActionKey: TaskKeyClientSkipped,
-			Success:   true,
-			Skipped:   true,
-			Message:   "客户端任务已按规则跳过，不会执行",
-		}, nil
 	}
 
 	// Fetch current tasks so we know if it needs claiming first and have its exact title/actionKey.
@@ -233,6 +224,8 @@ func (c *Client) executeClassifiedTask(ctx context.Context, task DailyTask, trig
 	switch task.ActionKey {
 	case TaskKeyScienceSpaceWeb:
 		res = c.runScienceSpaceWebTask(ctx, task)
+	case TaskKeyScienceSpaceClient:
+		res = c.runScienceSpaceClientTask(ctx, task)
 	case TaskKeyLiteratureReading:
 		res = c.runLiteratureReadingTask(ctx, task)
 	case TaskKeyAcademicWriting:
@@ -249,6 +242,19 @@ func (c *Client) executeClassifiedTask(ctx context.Context, task DailyTask, trig
 	}
 	res.DurationMs = time.Since(start).Milliseconds()
 
+	logMeta := map[string]any{
+		"actionKey":     res.ActionKey,
+		"workflowId":    res.WorkflowID,
+		"queryId":       res.QueryID,
+		"paperId":       res.PaperID,
+		"paperSource":   res.PaperSource,
+		"queryReported": res.QueryReported,
+		"cancelled":     res.Cancelled,
+		"promptPreview": res.PromptPreview,
+	}
+	for k, v := range res.Meta {
+		logMeta[k] = v
+	}
 	_ = c.store.AppendLog(store.RunLog{
 		Trigger:    trigger,
 		Action:     "task_run",
@@ -258,16 +264,7 @@ func (c *Client) executeClassifiedTask(ctx context.Context, task DailyTask, trig
 		Skipped:    res.Skipped,
 		DurationMs: res.DurationMs,
 		Message:    res.Message,
-		Meta: map[string]any{
-			"actionKey":     res.ActionKey,
-			"workflowId":    res.WorkflowID,
-			"queryId":       res.QueryID,
-			"paperId":       res.PaperID,
-			"paperSource":   res.PaperSource,
-			"queryReported": res.QueryReported,
-			"cancelled":     res.Cancelled,
-			"promptPreview": res.PromptPreview,
-		},
+		Meta:       logMeta,
 	})
 	return res
 }
@@ -792,8 +789,20 @@ func (c *Client) reportQueryEvent(ctx context.Context, auth store.AuthState, que
 		"eventKey":  eventKey,
 		"task_key":  taskKey,
 	}
-	resp, err := c.http.DoJSON(ctx, http.MethodPost, c.endpoints.SBCloudBase+"/api/v1/query-events", payload, c.sbCloudHeaders(auth.Token, ""))
-	return err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300
+	for attempt := 1; attempt <= 3; attempt++ {
+		resp, err := c.http.DoJSON(ctx, http.MethodPost, c.endpoints.SBCloudBase+"/api/v1/query-events", payload, c.sbCloudHeaders(auth.Token, ""))
+		if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return true
+		}
+		if attempt < 3 {
+			select {
+			case <-ctx.Done():
+				return false
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+	}
+	return false
 }
 
 func firstStringField(m map[string]any, keys ...string) string {

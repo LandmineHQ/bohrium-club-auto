@@ -1,7 +1,6 @@
 name: build-binaries
 
-# 手动构建多平台静态单文件二进制并在对应架构 runner 上做原生 HTTP 冒烟测试。
-# 注意：使用 macos-15-intel / macos-15（macos-13 / macos-14 已从 GitHub Actions 下线）。
+# 手动构建前端 SPA + 多平台静态单文件二进制并在对应架构 runner 上做原生 HTTP 冒烟测试。
 on:
   workflow_dispatch:
 
@@ -13,8 +12,37 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  web-build:
+    name: Build web SPA
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build frontend assets
+        run: |
+          npm ci --prefix web
+          npm run build --prefix web
+
+      - name: Upload web dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          if-no-files-found: error
+          retention-days: 1
+
   build:
     name: build-${{ matrix.name }}
+    needs: web-build
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
 
@@ -57,6 +85,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Download compiled web SPA
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
@@ -80,7 +114,6 @@ jobs:
           1. Run ./bohrium-club-auto (or bohrium-club-auto.exe on Windows).
           2. Set BOHRIUM_ADMIN_PASSWORD env or check first-boot generated password in console / data/config.json.
           3. Open http://127.0.0.1:8788/ in your browser.
-          4. Run `./bohrium-club-auto recon pull` and `./bohrium-club-auto recon diff` to track upstream frontend changes.
           EOF
 
       - name: Check binary (size + version)
@@ -89,7 +122,7 @@ jobs:
           ls -lh "${{ matrix.binary }}"
           "${{ matrix.binary }}" version
 
-      - name: Smoke test binary (HTTP /healthz & auth)
+      - name: Smoke test binary (HTTP /healthz, SPA & auth)
         shell: bash
         run: |
           set -euo pipefail
@@ -109,10 +142,9 @@ jobs:
           curl -fsS http://127.0.0.1:18788/healthz | grep -q '"ok":true'
           curl -fsS http://127.0.0.1:18788/healthz | grep -q 'Chrome/'
           curl -fsS http://127.0.0.1:18788/ | grep -q 'Bohrium Club Auto'
-          # Protected API must reject unauthenticated call with 401
+          curl -fsS http://127.0.0.1:18788/ | grep -q '/assets/'
           CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18788/api/settings)
           test "$CODE" = "401"
-          # Authenticated call via X-Admin-Password must succeed
           curl -fsS -H "X-Admin-Password: ci-smoke-password" http://127.0.0.1:18788/api/settings | grep -q '"ok":true'
           echo "Native binary smoke PASS"
 

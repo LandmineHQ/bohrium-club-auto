@@ -74,7 +74,7 @@ func TestEncryptPlatformPasswordRoundTrip(t *testing.T) {
 	}
 }
 
-func TestRunAllWebTasksSkipsClientAndCancelsImmediately(t *testing.T) {
+func TestRunAllTasksIncludingDesktopClientAndImmediateCancel(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("BOHRIUM_DATA_DIR", tmp)
 	t.Setenv("BOHRIUM_ADMIN_PASSWORD", "test-pw-1234")
@@ -84,7 +84,7 @@ func TestRunAllWebTasksSkipsClientAndCancelsImmediately(t *testing.T) {
 	}
 	_, _ = cfgMgr.Update(func(c *config.Config) error {
 		c.TaskDelaySec = 0
-		c.CancelAfterMs = 10
+		c.CancelAfterMs = 15
 		return nil
 	})
 	// Place a valid local PDF so test runs offline without touching arXiv
@@ -108,36 +108,102 @@ func TestRunAllWebTasksSkipsClientAndCancelsImmediately(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
+	t.Cleanup(func() { _ = st.Close() })
 	tok := makeTestJWT(4242, 99, time.Now().Add(72*time.Hour))
 	_ = st.SetAuth(store.AuthState{Token: tok, UserID: 4242, OrgID: 99, ExpiresAt: time.Now().Add(72 * time.Hour)})
 
 	var (
-		mu             sync.Mutex
-		claimedAll     bool
-		chatCalls      int
-		cancelCalls    int
-		binaryUploaded bool
-		reportedKeys   = map[string]bool{}
-		deprecatedHit  bool
-		nonChromeUA    bool
+		mu                 sync.Mutex
+		claimedAll         bool
+		chatCalls          int
+		cancelCalls        int
+		binaryUploaded     bool
+		reportedKeys       = map[string]bool{}
+		deprecatedHit      bool
+		webNonChromeUA     bool
+		desktopBrowserLeak bool
+		desktopPreflight   bool
+		desktopLLMCalls    int
+		desktopToolCount   int
+		desktopModel       string
+		desktopSystemOK    bool
+		desktopExecOK      bool
+		desktopTraceMatch  bool
+		preflightTrace     string
 	)
 
 	var srvURL string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
-		defer mu.Unlock()
-		if !strings.Contains(r.Header.Get("User-Agent"), "Chrome/") {
-			nonChromeUA = true
+		isSciXLLM := r.URL.Path == "/models" || r.URL.Path == "/billing/preflight" || r.URL.Path == "/chat/completions"
+		if isSciXLLM {
+			// Desktop SciX LLM requests MUST NOT leak Chrome UA or Sec-CH-UA headers and MUST carry x-scix-runtime=scix_local
+			if r.Header.Get("User-Agent") != "" || r.Header.Get("Sec-Ch-Ua") != "" || r.Header.Get(SciXRuntimeHeader) != SciXRuntimeValue {
+				desktopBrowserLeak = true
+			}
+		} else {
+			if !strings.Contains(r.Header.Get("User-Agent"), "Chrome/") {
+				webNonChromeUA = true
+			}
 		}
 		if strings.Contains(r.URL.Path, "integral_receive") {
 			deprecatedHit = true
+			mu.Unlock()
 			w.WriteHeader(http.StatusGone)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
+		case "/models":
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"dspro-high","name":"DeepSeek-V4-Pro","api":"chat_completions","reasoning_effort":"high","reasoning_efforts":["low","high","max"],"presentation":{"visible":true,"default":true}}]}`))
+			return
+		case "/billing/preflight":
+			desktopPreflight = true
+			preflightTrace = r.Header.Get("traceparent")
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"allowed":true}`))
+			return
+		case "/chat/completions":
+			desktopLLMCalls++
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			desktopModel, _ = body["model"].(string)
+			if tools, ok := body["tools"].([]any); ok {
+				desktopToolCount = len(tools)
+			}
+			if msgs, ok := body["messages"].([]any); ok && len(msgs) >= 2 {
+				if sys, ok := msgs[0].(map[string]any); ok {
+					content, _ := sys["content"].(string)
+					if strings.HasPrefix(content, "You are SciMaster,") && strings.Contains(content, "<environment_context>") {
+						desktopSystemOK = true
+					}
+				}
+			}
+			if rawExec := r.Header.Get(SciXExecutionHeader); rawExec != "" {
+				if dec, err := base64.RawURLEncoding.DecodeString(rawExec); err == nil {
+					var ep SciXExecutionPayload
+					if json.Unmarshal(dec, &ep) == nil && ep.Version == 1 && ep.Scenario == "local_agent" && ep.Purpose == "agent" && ep.StoreID == st.StoreID() {
+						desktopExecOK = true
+					}
+				}
+			}
+			if preflightTrace != "" && r.Header.Get("traceparent") == preflightTrace {
+				desktopTraceMatch = true
+			}
+			mu.Unlock()
+			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(": heartbeat\n\n"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			// Wait until client cancels the SSE stream immediately
+			<-r.Context().Done()
+			return
 		case "/api/plaza/tasks":
 			if r.Header.Get(PlazaGatewayHeader) != PlazaGatewayProd {
+				mu.Unlock()
 				w.WriteHeader(http.StatusForbidden)
 				return
 			}
@@ -145,18 +211,18 @@ func TestRunAllWebTasksSkipsClientAndCancelsImmediately(t *testing.T) {
 			if claimedAll {
 				stVal = 0
 			}
-			if len(reportedKeys) == 3 {
+			if len(reportedKeys) == 4 {
 				stVal = 1
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"code": 0,
 				"data": map[string]any{
-					"taskDate": "2026-11-25",
+					"taskDate": "2026-11-26",
 					"list": []map[string]any{
-						{"id": 1, "taskKey": "bohrium_science_space_web", "titleZh": "体验玻尔科学空间「Web端」", "rewardAmount": 500, "status": stVal},
-						{"id": 2, "taskKey": "bohrium_science_space_client", "titleZh": "体验玻尔科学空间「客户端」", "rewardAmount": 500, "status": stVal},
-						{"id": 3, "taskKey": "bohrium_literature_reading", "titleZh": "体验玻尔「文献阅读」", "rewardAmount": 300, "status": stVal},
-						{"id": 4, "taskKey": "bohrium_academic_writing", "titleZh": "体验玻尔「学术写作」", "rewardAmount": 300, "status": stVal},
+						{"id": 1, "taskKey": "bohrium_science_space_web", "titleZh": "体验玻尔科学空间「Web端」", "rewardAmount": 1000, "status": stVal},
+						{"id": 2, "taskKey": "bohrium_science_space_client", "titleZh": "体验玻尔科学空间「客户端」", "rewardAmount": 1000, "status": stVal},
+						{"id": 3, "taskKey": "bohrium_literature_reading", "titleZh": "体验玻尔「文献阅读」", "rewardAmount": 1000, "status": stVal},
+						{"id": 4, "taskKey": "bohrium_academic_writing", "titleZh": "体验玻尔「学术写作」", "rewardAmount": 1000, "status": stVal},
 					},
 				},
 			})
@@ -187,6 +253,7 @@ func TestRunAllWebTasksSkipsClientAndCancelsImmediately(t *testing.T) {
 		case "/api/v1/scix/reader/entries/entry-777/document":
 			if r.Method == http.MethodPost {
 				_, _ = w.Write([]byte(`{"code":0,"data":{"kind":"ready"}}`))
+				mu.Unlock()
 				return
 			}
 			_, _ = w.Write([]byte(`{"code":0,"data":{"kind":"upgrade_required"}}`))
@@ -208,10 +275,12 @@ func TestRunAllWebTasksSkipsClientAndCancelsImmediately(t *testing.T) {
 			if strings.HasPrefix(r.URL.Path, "/api/v1/chat/") && strings.HasSuffix(r.URL.Path, "/cancel") {
 				cancelCalls++
 				_, _ = w.Write([]byte(`{"durationMs":120}`))
+				mu.Unlock()
 				return
 			}
 			w.WriteHeader(http.StatusNotFound)
 		}
+		mu.Unlock()
 	}))
 	defer srv.Close()
 	srvURL = srv.URL
@@ -224,6 +293,7 @@ func TestRunAllWebTasksSkipsClientAndCancelsImmediately(t *testing.T) {
 		WWWBase:      srv.URL,
 		SBCloudBase:  srv.URL,
 		AgentBase:    srv.URL,
+		SigmaLLMBase: srv.URL,
 	})
 
 	res, err := cli.RunAllWebTasks(context.Background(), "manual", true)
@@ -234,28 +304,32 @@ func TestRunAllWebTasksSkipsClientAndCancelsImmediately(t *testing.T) {
 	if deprecatedHit {
 		t.Fatalf("deprecated /integral_receive endpoint MUST NOT be called")
 	}
-	if nonChromeUA {
-		t.Fatalf("every outgoing request must use Chrome User-Agent")
+	if webNonChromeUA {
+		t.Fatalf("every Web task outgoing request must use Chrome User-Agent")
+	}
+	if desktopBrowserLeak {
+		t.Fatalf("desktop client SciX LLM requests must use native transport (x-scix-runtime=scix_local, no browser UA/Sec-CH-UA)")
 	}
 	if !claimedAll {
 		t.Fatalf("expected claim-all to run")
 	}
 	if chatCalls != 3 || cancelCalls != 3 {
-		t.Fatalf("expected 3 chat calls and 3 immediate cancels, got chat=%d cancel=%d", chatCalls, cancelCalls)
+		t.Fatalf("expected 3 Web chat calls and 3 immediate cancels, got chat=%d cancel=%d", chatCalls, cancelCalls)
+	}
+	if !desktopPreflight || desktopLLMCalls != 1 || desktopModel != "dspro-high" || desktopToolCount != 16 || !desktopSystemOK || !desktopExecOK || !desktopTraceMatch {
+		t.Fatalf("desktop client task protocol mismatch: preflight=%v calls=%d model=%q tools=%d sys=%v exec=%v trace=%v",
+			desktopPreflight, desktopLLMCalls, desktopModel, desktopToolCount, desktopSystemOK, desktopExecOK, desktopTraceMatch)
 	}
 	if !binaryUploaded {
 		t.Fatalf("expected PDF binary upload with X-Storage-Param for Task 3")
 	}
-	for _, k := range []string{TaskKeyScienceSpaceWeb, TaskKeyLiteratureReading, TaskKeyAcademicWriting} {
+	for _, k := range []string{TaskKeyScienceSpaceWeb, TaskKeyScienceSpaceClient, TaskKeyLiteratureReading, TaskKeyAcademicWriting} {
 		if !reportedKeys[k] {
 			t.Fatalf("expected query-events report for %s, got %+v", k, reportedKeys)
 		}
 	}
-	if reportedKeys[TaskKeyClientSkipped] {
-		t.Fatalf("desktop client task must never be executed or reported")
-	}
 	if !res.AllWebDone {
-		t.Fatalf("expected AllWebDone=true, got %+v", res)
+		t.Fatalf("expected AllWebDone=true (all 4 tasks complete), got %+v", res)
 	}
 }
 
@@ -264,6 +338,7 @@ func TestGetPointsAndCapacity(t *testing.T) {
 	t.Setenv("BOHRIUM_DATA_DIR", tmp)
 	cfgMgr, _ := config.Load()
 	st, _ := store.Open(tmp)
+	t.Cleanup(func() { _ = st.Close() })
 	_ = st.SetAuth(store.AuthState{Token: makeTestJWT(1, 2, time.Now().Add(time.Hour))})
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -318,6 +393,7 @@ func TestOAuthURLAndVerifyCallback(t *testing.T) {
 	t.Setenv("BOHRIUM_DATA_DIR", tmp)
 	cfgMgr, _ := config.Load()
 	st, _ := store.Open(tmp)
+	t.Cleanup(func() { _ = st.Close() })
 	tok := makeTestJWT(777, 888, time.Now().Add(24*time.Hour))
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -362,5 +438,123 @@ func TestOAuthURLAndVerifyCallback(t *testing.T) {
 	}
 	if auth.UserID != 777 || auth.LoginMethod != "oauth_google" {
 		t.Fatalf("unexpected oauth auth state: %+v", auth)
+	}
+}
+
+func TestAccountProfileNicknameParsingAndBackfill(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("BOHRIUM_DATA_DIR", tmp)
+	t.Setenv("BOHRIUM_ADMIN_PASSWORD", "test-pw-1234")
+	cfgMgr, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	st, err := store.Open(tmp)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	var (
+		mu             sync.Mutex
+		extendNick     string
+		clubCustomNick any
+	)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/bohrapi/v1/account/info", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		en := extendNick
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code": 0,
+			"data": map[string]any{
+				"userId":    4748512,
+				"orgId":     4741448,
+				"userName":  "bohr68859c",
+				"avatarUrl": "https://cdn.example/avatar.png",
+				"email":     "researcher@example.test",
+				"extend": map[string]any{
+					"nickName": en,
+				},
+			},
+		})
+	})
+	mux.HandleFunc("/api/platform/session", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		cn := clubCustomNick
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"logged_in": true,
+			"binding": map[string]any{
+				"name":              "bohr68859c",
+				"nickname":          cn,
+				"platform_uid":      "4748512",
+				"platform_username": "bohr68859c",
+			},
+			"profile": map[string]any{
+				"name":     "bohr68859c",
+				"username": "bohr68859c",
+				"email":    "researcher@example.test",
+			},
+		})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	httpCli, err := chromehttp.New(chromehttp.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("chromehttp.New: %v", err)
+	}
+	mgr := NewManager(httpCli, cfgMgr, st)
+	mgr.SetEndpoints(Endpoints{
+		ClubBase: ts.URL,
+		WWWBase:  ts.URL,
+	})
+
+	// 1. Existing migrated account with empty nickname gets backfilled by Manager.SyncMissingProfiles
+	tok := makeTestJWT(4748512, 4741448, time.Now().Add(48*time.Hour))
+	acc, _, err := st.UpsertAccountFromAuth(store.AuthState{
+		Token:       tok,
+		UserID:      4748512,
+		OrgID:       4741448,
+		ExpiresAt:   time.Now().Add(48 * time.Hour),
+		LoginMethod: "manual_token",
+	}, "")
+	if err != nil {
+		t.Fatalf("UpsertAccountFromAuth: %v", err)
+	}
+	if acc.Nickname != "" {
+		t.Fatalf("expected empty initial nickname, got %q", acc.Nickname)
+	}
+	if synced := mgr.SyncMissingProfiles(context.Background()); synced != 1 {
+		t.Fatalf("expected SyncMissingProfiles to update 1 account, got %d", synced)
+	}
+	updated, ok, _ := st.GetAccount(acc.ID)
+	if !ok || updated.Nickname != "bohr68859c" || updated.Avatar != "https://cdn.example/avatar.png" {
+		t.Fatalf("unexpected synced account: nick=%q avatar=%q", updated.Nickname, updated.Avatar)
+	}
+
+	// 2. Club custom binding.nickname overrides default userName when extend.nickName is empty
+	mu.Lock()
+	clubCustomNick = "科研小助手"
+	mu.Unlock()
+	if _, changed, err := mgr.ForAccount(acc.ID).SyncProfile(context.Background()); err != nil || !changed {
+		t.Fatalf("SyncProfile with club custom nick failed: changed=%v err=%v", changed, err)
+	}
+	updated, _, _ = st.GetAccount(acc.ID)
+	if updated.Nickname != "科研小助手" {
+		t.Fatalf("expected club custom nickname, got %q", updated.Nickname)
+	}
+
+	// 3. Bohrium extend.nickName takes top priority over userName and club binding.nickname
+	mu.Lock()
+	extendNick = "玻尔实验员"
+	mu.Unlock()
+	if _, changed, err := mgr.ForAccount(acc.ID).SyncProfile(context.Background()); err != nil || !changed {
+		t.Fatalf("SyncProfile with extend.nickName failed: changed=%v err=%v", changed, err)
+	}
+	updated, _, _ = st.GetAccount(acc.ID)
+	if updated.Nickname != "玻尔实验员" {
+		t.Fatalf("expected extend.nickName priority, got %q", updated.Nickname)
 	}
 }

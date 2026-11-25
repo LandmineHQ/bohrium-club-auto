@@ -49,6 +49,7 @@ jobs:
           curl -fsS http://127.0.0.1:8788/healthz | grep -q '"ok":true'
           curl -fsS http://127.0.0.1:8788/healthz | grep -q 'Chrome/'
           curl -fsS http://127.0.0.1:8788/ | grep -q 'Bohrium Club Auto'
+          curl -fsS http://127.0.0.1:8788/ | grep -q '/assets/'
 
           PW=$(docker exec bohrium-club-auto-ci cat /data/config.json | python3 -c 'import json,sys;print(json.load(sys.stdin)["adminPassword"])')
           curl -fsS -H "X-Admin-Password: $PW" http://127.0.0.1:8788/api/overview | grep -q '"ok":true'

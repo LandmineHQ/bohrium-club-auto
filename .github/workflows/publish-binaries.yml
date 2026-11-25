@@ -1,6 +1,6 @@
 name: publish-binaries
 
-# 手动构建多平台静态单文件二进制并发布到 GitHub Release。
+# 手动构建前端 SPA + 多平台静态单文件二进制并发布到 GitHub Release。
 on:
   workflow_dispatch:
     inputs:
@@ -27,8 +27,37 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  web-build:
+    name: Build web SPA
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build frontend assets
+        run: |
+          npm ci --prefix web
+          npm run build --prefix web
+
+      - name: Upload web dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          if-no-files-found: error
+          retention-days: 1
+
   build:
     name: build-${{ matrix.name }}
+    needs: web-build
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
 
@@ -71,6 +100,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Download compiled web SPA
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
@@ -93,7 +128,7 @@ jobs:
           Bohrium Club Auto — Quick Start
           1. Run ./bohrium-club-auto (or bohrium-club-auto.exe on Windows).
           2. Check the printed first-boot admin password (or set BOHRIUM_ADMIN_PASSWORD).
-          3. Open http://127.0.0.1:8788/ to scan WeChat QR and manage daily tasks.
+          3. Open http://127.0.0.1:8788/ in your browser.
           EOF
 
       - name: Package (Windows)
@@ -158,7 +193,7 @@ jobs:
           cat > release-body.md <<EOF
           ## Downloads
 
-          Static single-file Go binaries (\`CGO_ENABLED=0\`, works on both glibc & Alpine/musl Linux).
+          Static single-file binaries (\`CGO_ENABLED=0\`, includes embedded web console).
 
           | Platform | Download |
           | --- | --- |
@@ -168,13 +203,6 @@ jobs:
           | macOS Intel | [bohrium-club-auto-darwin-x64.tar.gz](${BASE}/bohrium-club-auto-darwin-x64.tar.gz) |
           | macOS Apple Silicon | [bohrium-club-auto-darwin-arm64.tar.gz](${BASE}/bohrium-club-auto-darwin-arm64.tar.gz) |
           | Checksums | [SHA256SUMS.txt](${BASE}/SHA256SUMS.txt) |
-
-          ## Quick start
-
-          - Set \`BOHRIUM_ADMIN_PASSWORD\` or read the auto-generated first-boot password from logs / \`data/config.json\`.
-          - Open \`http://127.0.0.1:8788/\` and use WeChat QR scan for remote server login.
-          - Docker is recommended for servers — see \`docker-compose.yml\` & \`docker-compose.ghcr.yml\`.
-          - Build & verification details: [docs/BINARY-BUILDS.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/docs/BINARY-BUILDS.md)
           EOF
 
       - name: Create or update release

@@ -1,100 +1,14 @@
-# ⚛️ Bohrium Club Auto — Daily Task Automation & Admin Console for Bohrium Community
+# bohrium-club-auto
 
-**A self-hosted, zero-dependency Go automation service, OpenAI-compatible LLM gateway (faithful to Bohrium Desktop SciX protocol), and embedded Swiss Minimalist Web Console for [Bohrium (`club.bohrium.com` / `www.bohrium.com`)](https://club.bohrium.com/) — featuring remote WeChat QR & OAuth/OTP login, Chrome browser outgoing fingerprint, points & storage capacity monitoring, one-click daily task claiming, real Web API task execution with immediate cancellation, full `/v1/chat/completions` & `/v1/responses` OpenAI APIs, and frontend recon drift checks.**
+自托管多账号调度与 API 代理服务，包含内置 Web 管理控制台、定时任务调度器、本地 SQLite 存储以及 OpenAI 兼容 `/v1/*` 接口层。
 
-[![Go](https://img.shields.io/badge/Go-1.24-00ADD8.svg?style=flat-square&logo=go&logoColor=white)](https://go.dev/)
-[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED.svg?style=flat-square&logo=docker&logoColor=white)](https://www.docker.com/)
-[![Zero Dependencies](https://img.shields.io/badge/Dependencies-Stdlib%20Only-10B981.svg?style=flat-square)](go.mod)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
-[![CI](https://github.com/LandmineHQ/bohrium-club-auto/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/LandmineHQ/bohrium-club-auto/actions/workflows/ci.yml)
-
-*Deploy on any Linux/Docker server, scan WeChat QR remotely in your browser, monitor remaining photons, quotas and knowledge-base capacity, and automate all 3 Bohrium Web daily tasks — while skipping the desktop client task and deprecated legacy check-in.*
-
-**Repository:** <https://github.com/LandmineHQ/bohrium-club-auto> · **Docs:** <https://landminehq.github.io/bohrium-club-auto/> · **Actions:** <https://github.com/LandmineHQ/bohrium-club-auto/actions>
-
-[Features](#-key-features) • [Daily Tasks](#-daily-tasks-matrix) • [Quick Start](#-quick-start) • [Architecture](#-architecture) • [Configuration](#%EF%B8%8F-configuration) • [API Surface](#-api-surface) • [Security](#-security--reliability)
+文档目录见 [`docs-site/`](docs-site/)。
 
 ---
 
-## 📖 Overview
+## 使用方式
 
-**Bohrium Club Auto** connects directly to Bohrium's native Web APIs (`club.bohrium.com`, `platform.bohrium.com`, `www.bohrium.com`, and `sb-cloud.dp.tech`) from a single static Go binary (~7.5 MB) with an embedded admin console and embedded scientific prompt/paper corpora.
-
-Instead of keeping a local desktop browser open or running heavy headless Chromium containers, it supports **remote server-side WeChat Official Account QR login**, automatically renews `brmToken` JWT sessions, displays real-time photon balances and capacity metrics, provides one-click claim & manual per-task triggers, and runs scheduled daily Web tasks in `Asia/Shanghai` timezone.
-
----
-
-## ✨ Key Features
-
-### Remote Authentication & Session Lifecycle
-
-- **Server-side WeChat QR login (recommended)**: Requests official QR codes from `platform.bohrium.com/api/account/wechat/login_qrcode` and polls login status right inside the Dashboard — zero CAPTCHA, zero local machine dependency.
-- **Third-party OAuth (Google / Apple / CARSI / Feishu / PKU IAAA)**: Generates official authorization URLs via `/api/account/oauth_url`, opens them in your browser, and exchanges the pasted callback URL (`code=` / `token=`) server-side via `POST /api/oauth/verify`.
-- **Phone / Email OTP login**: Sends verification codes via `send_by_phone_v3` / `send_by_email_v3` and logs in via `/api/account/v2/login/{phone_code,email_code}` (without bypassing CAPTCHA if upstream requires it).
-- **Optional password login**: Supports phone / email / Account ID (`学术码`) + AES-128-CBC login when `/api/captcha/check_user` returns `skip: true`.
-- **Manual `brmToken` import**: Paste raw JWT or cookie strings directly in the login modal; validates against `www.bohrium.com/bohrapi/v1/account/info` and auto-enrolls `club.bohrium.com` binding (`/api/enroll`) if needed.
-- **Automatic JWT renewal**: Periodically calls `/platform-gateway/v1/account/refresh_token` in the background before expiration so long-running server deployments stay signed in.
-
-### Points, Quotas & Capacity Dashboard
-
-- **Photons & wallet**: Displays personal photon balance, organization balance & limit, wallet balance, 7-day expiring photon alert, expiring lots breakdown, and recent photon ledger history.
-- **Membership & feature quotas**: Shows membership level, expiry date, and remaining counts for Literature Search (`sn.paper`), Knowledge Base Chat (`knowledge_base.chat`), and Deep Research (`sn.deep_research`).
-- **Knowledge-base storage**: Visual progress bar and human-readable breakdown of remaining, used, and total storage bytes (`/bohrapi/v1/literature-sage/api/v1/file/capacity`).
-
-### Daily Tasks & Embedded Scientific Corpus
-
-- **One-click claim**: Trigger `POST /api/plaza/tasks/claim` from the Dashboard or automatically before daily runs.
-- **Per-task manual triggers & batch run**: Click any Web task individually or run all incomplete Web tasks with one button.
-- **Strict task rules**:
-  - Automatically skips Task #2 (Desktop Client `体验玻尔科学空间「客户端」`).
-  - Never calls the deprecated legacy 200-photon daily check-in endpoint (`/bohrapi/v1/account/user/integral_receive`).
-- **870 embedded prompts + 100 real arXiv papers**:
-  - 330 Science Space Web questions, 320 Academic Writing requests, and 220 Literature Reading PDF questions compiled via `go:embed`.
-  - 100 curated open-access arXiv PDFs cataloged for Task #3 (downloaded on demand with Chrome UA and cached in `data/pdfs/`, plus optional user-supplied PDFs in `data/custom_pdfs/`).
-- **Immediate workflow cancellation**: Every Web task submits a real product API request, reports official `query-events` telemetry for its matching `task_key`, and immediately terminates the workflow via `POST /api/v1/chat/<workflowId>/cancel` (`{"source":"api_request"}`).
-
-### OpenAI-Compatible Gateway (Bohrium Desktop SciX Fidelity)
-
-- **Native Bohrium Desktop (`scix` v0.10.25) upstream protocol**: Talks directly to `https://www.bohrium.com/bohrapi/v1/sigma-search/api/v1/scix/llm` using your authenticated `brmToken`, live model catalog (`/models?tag=shrimp-brain-v2`), W3C `traceparent`, and authentic base64url `x-scix-execution` (`version: 1`, `scenario: "local_agent"`, persistent `storeId`, session continuity, canonical UUIDs, `purpose`).
-- **Full `/v1/models`, `/v1/chat/completions`, and `/v1/responses` support**:
-  - **Streaming SSE & non-streaming JSON** on both endpoints, with `: heartbeat` filtering, `reasoning_content` / `response.reasoning_text.*`, `tools` / `tool_choice` / `parallel_tool_calls`, `response_format` / `text.format` (`json_object` & `json_schema`), multimodal `image_url` / `input_image`, and accurate `usage` accounting (including `cached_tokens` and `reasoning_tokens`).
-  - **Bidirectional cross-protocol bridge**: Bohrium's flagship models (`dspro-high`, `dsflash-high`, `kimi-k3`, `kimi-k3.1-pro`) natively speak `chat_completions`, while helper models (`vision`, `title`, `summary`) speak stateless `responses`. The gateway automatically routes native calls directly and seamlessly bridges `/v1/responses` ↔ `/chat/completions` and `/v1/chat/completions` ↔ `/responses` so every model works on both endpoints.
-  - **Stateful Responses API chaining**: Implements local bounded persistence (`data/responses.json`) for `previous_response_id`, `store`, `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}`, and `GET /v1/responses/{id}/input_items`, while always sending stateless `store: false` upstream as required by Bohrium SciX.
-  - **Dedicated API Keys & Console Playground**: Separate `sk-brm-...` API keys managed in the **OpenAI 网关** tab (or via `BOHRIUM_API_KEYS`), CORS support, `/billing/preflight` verification, live token metrics, and an interactive in-browser Playground.
-
-### Operations, Fingerprint & Recon
-
-- **Desktop Chrome outgoing fingerprint**: Every outbound HTTP request injects Chrome `User-Agent`, `Sec-CH-UA`, `Sec-CH-UA-Mobile`, `Sec-CH-UA-Platform`, and `Accept-Language` — never `Go-http-client`.
-- **Admin password protection**: All operational APIs require constant-time verified admin password authentication with rate limiting and HMAC-SHA256 signed `HttpOnly` cookies (or `X-Admin-Password` header for scripts).
-- **Frontend recon drift checker**: Built-in `recon pull` / `recon diff` CLI and Dashboard tab snapshot live Bohrium static bundles into gitignored `recon/` and check SHA-256 & API contract markers for upstream changes.
-- **Minimal Docker & multi-platform binaries**: Zero third-party Go dependencies, ~7.5 MB static binary, ~15 MB Alpine runtime image.
-
----
-
-## 📋 Daily Tasks Matrix
-
-| # | Bohrium Plaza Task | `task_key` | Execution Strategy | Immediate Cancel |
-| --- | --- | --- | --- | --- |
-| 1 | 体验玻尔科学空间「Web端」 | `bohrium_science_space_web` | Random prompt from 330 Science Space prompts → `sb-cloud.dp.tech/api/v1/chat` (`teamId: AgK4D5B8Fdju`) → `query-events` | Yes (`/cancel`) |
-| 2 | 体验玻尔科学空间「客户端」 | `bohrium_science_space_client` | **Automatically skipped** | — |
-| 3 | 体验玻尔「文献阅读」 | `bohrium_literature_reading` | Random PDF from 100 arXiv papers (or `data/custom_pdfs/`) → `literature-sage` upload → `scix/reader/entries` → random prompt from 220 PDF prompts → `query-events` | Yes (`/cancel`) |
-| 4 | 体验玻尔「学术写作」 | `bohrium_academic_writing` | Random prompt from 320 Academic Writing prompts → `sb-cloud.dp.tech/api/v1/chat` (`Referer: /academic-writing`) → `query-events` | Yes (`/cancel`) |
-
----
-
-## 🚀 Quick Start
-
-### Requirements
-
-- **Option A (recommended): Docker + Docker Compose only.** Use the prebuilt minimal image from GHCR — no Go toolchain, no Node.js, no source build.
-- **Option B: nothing on the target machine.** Download a prebuilt static single-file binary for your OS/arch from the latest GitHub Release.
-
-> Building from source is a developer task; see [docs/BINARY-BUILDS.md](docs/BINARY-BUILDS.md).
-
-### Option A — GHCR image with Docker Compose (recommended)
-
-Image: `ghcr.io/landminehq/bohrium-club-auto:latest` (minimal `alpine:3.20` + static Go binary, `linux/amd64` & `linux/arm64`).
-Save this as `compose.yml` and run `docker compose up -d`:
+### 1. Docker Compose
 
 ```yaml
 services:
@@ -108,305 +22,190 @@ services:
       BOHRIUM_HOST: "0.0.0.0"
       BOHRIUM_PORT: "8788"
       BOHRIUM_DATA_DIR: "/data"
-      BOHRIUM_RECON_DIR: "/data/recon/bohrium-web"
       TZ: "Asia/Shanghai"
-      # Recommended: set a strong password; leave empty to auto-generate on first start
       BOHRIUM_ADMIN_PASSWORD: "replace-with-a-strong-password"
-      BOHRIUM_SCHEDULE_ENABLED: "true"
-      BOHRIUM_SCHEDULE_TIME: "08:15"
-      BOHRIUM_SCHEDULE_TZ: "Asia/Shanghai"
     volumes:
       - bohrium-club-auto-data:/data
-    healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8788/healthz"]
-      interval: 30s
-      timeout: 5s
-      start_period: 15s
-      retries: 3
 
 volumes:
   bohrium-club-auto-data:
 ```
+
+启动服务：
 
 ```bash
 docker compose up -d
 docker compose logs -f bohrium-club-auto
 ```
 
-Or run inline without a compose file:
+本地源码构建镜像：
 
 ```bash
-docker run -d --name bohrium-club-auto -p 8788:8788 \
-  -v bohrium-club-auto-data:/data \
-  -e BOHRIUM_ADMIN_PASSWORD="replace-with-a-strong-password" \
-  ghcr.io/landminehq/bohrium-club-auto:latest
+docker compose up -d --build
 ```
 
-- Dashboard: <http://127.0.0.1:8788/> — health check: `GET /healthz`.
-- Persistent volume `/data` stores `config.json`, `state.json`, cached PDFs (`pdfs/`), optional custom PDFs (`custom_pdfs/`), and recon snapshots (`recon/`). Container runs as non-root UID `10001`.
-- The repository also ships [`docker-compose.ghcr.yml`](docker-compose.ghcr.yml) (GHCR image) and [`docker-compose.yml`](docker-compose.yml) (local build).
+### 2. 二进制运行
 
-> If `ghcr.io/landminehq/bohrium-club-auto:latest` has not been published yet, run `Actions → publish-docker-image` first (see [Publishing](#publishing)), or use `docker compose up -d --build` from the cloned repository.
-
-### Option B — Download a prebuilt single-file binary (latest release)
-
-Go to the **[latest GitHub Release](https://github.com/LandmineHQ/bohrium-club-auto/releases/latest)** and download the archive for your platform (`CGO_ENABLED=0` static binaries, no external runtime required):
-
-| Platform | Release asset |
-| --- | --- |
-| Windows x64 | `bohrium-club-auto-windows-x64.zip` |
-| Linux x64 (static: glibc & Alpine) | `bohrium-club-auto-linux-x64.tar.gz` |
-| Linux arm64 (static: glibc & Alpine) | `bohrium-club-auto-linux-arm64.tar.gz` |
-| macOS Intel | `bohrium-club-auto-darwin-x64.tar.gz` |
-| macOS Apple Silicon | `bohrium-club-auto-darwin-arm64.tar.gz` |
-| Checksums | `SHA256SUMS.txt` |
+从 Release 下载对应平台压缩包解压后运行：
 
 ```bash
-# Linux / macOS example
 tar -xzf bohrium-club-auto-linux-x64.tar.gz
 chmod +x bohrium-club-auto
 BOHRIUM_ADMIN_PASSWORD="replace-with-a-strong-password" ./bohrium-club-auto
 ```
 
-Windows: unzip and run `bohrium-club-auto.exe`.
+Windows 直接运行 `bohrium-club-auto.exe`。默认监听 `http://127.0.0.1:8788/`，持久化数据位于 `./data`（可通过 `BOHRIUM_DATA_DIR` 修改）。
 
-- Data directory defaults to `./data` next to the working directory (override with `BOHRIUM_DATA_DIR`).
-- Unsigned binaries: Windows SmartScreen / macOS Gatekeeper may warn (macOS: `xattr -d com.apple.quarantine ./bohrium-club-auto`).
+### 3. 首次初始化
 
-### First Start
-
-1. Open <http://127.0.0.1:8788/> and sign in with your `BOHRIUM_ADMIN_PASSWORD` (if unset, check the auto-generated password printed in startup logs or `data/config.json`).
-2. Click **远程登录玻尔** → **获取 / 刷新二维码** and scan with WeChat on your phone.
-3. View remaining photons, storage capacity, and daily tasks on the home tab; click **一键领取每日任务** or **一键执行全部 Web 任务** to verify immediately.
-
-> `/data` contains your admin password and Bohrium session JWT (`brmToken`). Keep permissions `0600` and never commit it.
-
-### Permission error on a bind-mounted `./data`
-
-The container runs as UID/GID **10001:10001**. If you use a host bind mount instead of the default named volume:
-
-```bash
-mkdir -p data
-sudo chown -R 10001:10001 data
-docker compose up -d
-```
-
-### Publishing
-
-Release artifacts and container images are published manually via GitHub Actions:
-
-**Container image** — `Actions → publish-docker-image`:
-
-```text
-version: v0.1.0        # required, Docker tag rules (letters/digits/._-)
-also_latest: true      # optionally also tag :latest
-```
-
-- Builds `Dockerfile` for `linux/amd64,linux/arm64` and pushes `ghcr.io/landminehq/bohrium-club-auto:<version>`.
-
-**Binaries** — `Actions → publish-binaries`:
-
-```text
-version: v0.1.0        # required; release tag and asset version
-prerelease: false      # true = pre-release (excluded from /releases/latest)
-draft: false           # true = create as draft
-```
-
-- Compiles all 5 platforms natively, attaches `.zip`/`.tar.gz` archives plus `SHA256SUMS.txt`, and generates a release download table.
-
-**Docs site** — `Actions → Deploy docs`:
-
-- Automatically builds `docs-site/` (VitePress) and deploys to <https://landminehq.github.io/bohrium-club-auto/> on pushes to `main` touching `docs-site/**` or manual dispatch.
+1. 访问 `http://127.0.0.1:8788/`，输入 `BOHRIUM_ADMIN_PASSWORD`（未设置时首次启动会自动生成并输出到日志与 `data/config.json`）。
+2. 点击 **添加 / 登录账号**，支持微信扫码、第三方 OAuth、验证码、密码或导入 `brmToken`。
+3. 在「多账号与签到」查看账号余额、每日任务与随机波动签到计划；如需将该账号纳入 `/v1/*` 路由，前往「OpenAI 路由池」手动拖入右侧路由池。
 
 ---
 
-## 📐 Architecture
+## 功能说明
+
+- **多账号管理与持久化**：使用纯 Go SQLite（`data/bohrium.db`，WAL 模式）存储多账号凭据、独立 `storeId`、余额快照、会话绑定与执行日志，支持旧版 `state.json` / `responses.json` 自动迁移。
+- **随机波动定时签到**：支持全部 4 项每日任务（Web 端、桌面端协议任务、文献阅读、学术写作），每个账号按日期计算独立错峰执行槽位，并自动维护 Token 续期。
+- **OpenAI 兼容路由池**：
+  - 新账号默认不入池，需在控制台手动拖入后才承接 `/v1/*` 流量；
+  - 新会话按有效余额比例（个人光子 + 组织余额）加权抽签分配账号，并在 SQLite 中缓存绑定关系，最长保留 7 天后自动清理；
+  - 首包前遇到 401/402 自动冷却并切换池内其他可用账号重试；
+  - 支持 `/v1/models`、`/v1/balance`、`/v1/chat/completions`、`/v1/responses` 及 `chat_completions` / `responses` 双向兼容桥接。
+- **资产与前端检测**：聚合展示光子余额、即将过期批次、流水、配额与知识库存储容量；提供 `recon pull` / `recon diff` 检测上游前端资源变化。
+
+---
+
+## 程序架构
 
 ```mermaid
 flowchart LR
-    Browser["Admin Browser"] -->|"Cookie / X-Admin-Password"| HTTP["Go HTTP Server<br/>(internal/server + embedded web/)"]
-    SDK["OpenAI SDK / Codex / Cursor"] -->|"Bearer sk-brm-..."| GW["OpenAI /v1/* Gateway<br/>(internal/openai)"]
-    HTTP --> GW
-    HTTP --> Sched["Daily Scheduler & Mutex<br/>(Asia/Shanghai + auto refresh_token)"]
-    HTTP --> Recon["Recon Engine<br/>(pull / diff + contract markers)"]
-    GW --> Client["Bohrium Client<br/>(internal/bohrium + embedded prompts)"]
-    Sched --> Client
-    HTTP --> Client
-    Client --> Chrome["Chrome HTTP Client<br/>(Chrome UA + Sec-CH-UA + streaming transport)"]
-    Recon --> Chrome
-    Chrome --> Club["club.bohrium.com<br/>(tasks, claim, session, enroll)"]
-    Chrome --> Platform["platform.bohrium.com<br/>(WeChat QR / OAuth / OTP login)"]
-    Chrome --> WWW["www.bohrium.com<br/>(photons, quotas, storage, PDF, SciX Sigma LLM)"]
-    Chrome --> SB["sb-cloud.dp.tech<br/>(Reader, chat, query-events, cancel)"]
-    HTTP --> Store[("Atomic JSON Store<br/>data/config.json, state.json, responses.json")]
-    Client --> Store
+    WebUI["Web 控制台<br/>React + Vite + shadcn/ui (web/dist)"] --> Server["HTTP 服务<br/>internal/server"]
+    Client["OpenAI 客户端"] -->|"Bearer API Key"| GW["OpenAI 路由池<br/>internal/openai"]
+    Server --> GW
+    Server --> Sched["多账号调度器<br/>internal/scheduler"]
+    Server --> Recon["前端比对<br/>internal/recon"]
+    GW --> Brm["上游客户端管理器<br/>internal/bohrium"]
+    Sched --> Brm
+    Server --> Brm
+    Brm --> HTTP["HTTP 传输层<br/>internal/chromehttp"]
+    Server --> Store[("SQLite data/bohrium.db<br/>+ data/config.json")]
+    Brm --> Store
 ```
 
-- **Stdlib-only Go 1.24**: Zero external Go modules in `go.mod`; embeds IANA tzdata (`time/tzdata`), all 870 prompts, 100 arXiv paper metadata records, and the full dashboard SPA directly into the executable.
-- **Mutex-protected execution**: Manual dashboard triggers and scheduled daily runs share a single lock in `internal/scheduler`, preventing duplicate runs.
-- **Graceful shutdown**: Handles `SIGTERM`/`SIGINT` cleanly, stopping the scheduler and draining in-flight HTTP requests.
+### 目录结构
+
+```text
+cmd/bohrium-club-auto/   CLI 入口（serve / recon pull / recon diff / version）
+internal/chromehttp/     HTTP 客户端与流式传输封装
+internal/config/         config.json 持久化与环境变量覆盖
+internal/store/          纯 Go SQLite（多账号、7 天会话绑定、Responses 记录、日志）
+internal/prompts/        内置题库、文献目录与桌面端工具定义（go:embed）
+internal/bohrium/        多账号认证、任务执行、余额资产与上游协议客户端
+internal/openai/         /v1/* 网关、余额加权路由与协议桥接
+internal/scheduler/      多账号错峰调度、自动续期与过期绑定清理
+internal/recon/          前端资源快照与契约比对
+internal/server/         管理员鉴权、管理 API 与内置 SPA 托管
+web/                     React + Vite + TypeScript + Tailwind CSS + shadcn/ui 前端工程
+docs-site/               VitePress 文档工程
+.github/workflows/       构建与发布工作流
+```
 
 ---
 
-## ⚙️ Configuration
+## 配置说明
 
-Configuration is stored atomically in `data/config.json` (editable in the Dashboard) and overridden by environment variables:
+配置持久化于 `data/config.json`（参见 [`config/config.example.json`](config/config.example.json)），主要环境变量：
 
-| Variable | Default | Description |
+| 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `BOHRIUM_HOST` | `0.0.0.0` | Listen address |
-| `BOHRIUM_PORT` | `8788` | HTTP listen port |
-| `BOHRIUM_DATA_DIR` | `data` (`/data` in Docker) | Persistent data directory (`config.json`, `state.json`, `pdfs/`, `custom_pdfs/`) |
-| `BOHRIUM_ADMIN_PASSWORD` | auto-generated | Admin password for Dashboard & API (also accepts `ADMIN_PASSWORD`) |
-| `BOHRIUM_SESSION_SECRET` | auto-generated | HMAC-SHA256 signing secret for admin cookies |
-| `BOHRIUM_SCHEDULE_ENABLED` | `true` | Enable daily scheduled execution |
-| `BOHRIUM_SCHEDULE_TIME` | `08:15` | Daily trigger time (`HH:MM`, 24-hour) |
-| `BOHRIUM_SCHEDULE_TZ` | `Asia/Shanghai` | Scheduler timezone |
-| `BOHRIUM_USER_AGENT` | Chrome 136 Windows UA | Outgoing Chrome User-Agent override |
-| `BOHRIUM_PROXY` | empty | Optional HTTP/HTTPS outbound proxy (`HTTPS_PROXY` / `HTTP_PROXY` fallback) |
-| `BOHRIUM_RECON_DIR` | `recon/bohrium-web` | Local recon baseline snapshot directory |
-| `BOHRIUM_GATEWAY_ENABLED` | `true` | Enable OpenAI `/v1/*` API gateway |
-| `BOHRIUM_API_KEYS` | auto-generated `sk-brm-...` | Comma-separated API keys for `/v1/*` clients |
-| `BOHRIUM_GATEWAY_DEFAULT_MODEL` | `dspro-high` | Fallback model ID when client omits `model` |
-| `BOHRIUM_GATEWAY_ALLOW_NO_AUTH` | `false` | Allow unauthenticated `/v1/*` requests (trusted LAN only) |
-| `BOHRIUM_GATEWAY_CORS_ORIGINS` | `*` | `Access-Control-Allow-Origin` header value on `/v1/*` |
-| `BOHRIUM_GATEWAY_PREFLIGHT` | `true` | Run `/billing/preflight` on new user turns (matches Bohrium desktop client; skips mid-loop tool continuations) |
-| `BOHRIUM_GATEWAY_SCIMASTER_PROMPT` | `true` | Prepend Bohrium desktop client's native SciMaster system prompt on main agent models (toggleable in Console; skips `title`/`summary`) |
-
-Additional runtime fields in `data/config.json` (see [`config/config.example.json`](config/config.example.json)):
-
-| Field | Default | Description |
-| --- | --- | --- |
-| `schedule.jitterMinutes` | `15` | Deterministic per-day random delay (0–120 min) |
-| `schedule.autoClaim` | `true` | Automatically claim unclaimed daily tasks before running |
-| `schedule.autoRefresh` | `true` | Background `refresh_token` renewal |
-| `taskDelaySec` | `3` | Pause between sequential Web tasks |
-| `cancelAfterMs` | `450` | Delay before invoking `cancelWorkflow` after chat acceptance |
-| `maxPdfSizeBytes` | `26214400` (25 MB) | Max PDF file size accepted for Task #3 |
+| `BOHRIUM_HOST` | `0.0.0.0` | 监听地址 |
+| `BOHRIUM_PORT` | `8788` | 监听端口 |
+| `BOHRIUM_DATA_DIR` | `data`（容器内 `/data`） | 数据目录（`config.json`、`bohrium.db`、`pdfs/`、`custom_pdfs/`） |
+| `BOHRIUM_ADMIN_PASSWORD` | 首次启动自动生成 | 控制台与管理 API 密码 |
+| `BOHRIUM_SESSION_SECRET` | 首次启动自动生成 | 管理员 Cookie 签名密钥 |
+| `BOHRIUM_SCHEDULE_ENABLED` | `true` | 是否开启每日定时调度 |
+| `BOHRIUM_SCHEDULE_TIME` | `08:15` | 每日起始基准时间（`HH:MM`） |
+| `BOHRIUM_SCHEDULE_TZ` | `Asia/Shanghai` | 调度时区 |
+| `BOHRIUM_PROXY` | 空 | 可选出站代理 |
+| `BOHRIUM_GATEWAY_ENABLED` | `true` | 是否开启 `/v1/*` 网关 |
+| `BOHRIUM_API_KEYS` | 自动生成 | 逗号分隔的 `/v1/*` API Key |
+| `BOHRIUM_GATEWAY_DEFAULT_MODEL` | `dspro-high` | 默认模型 |
+| `BOHRIUM_GATEWAY_ALLOW_NO_AUTH` | `false` | 是否允许无 Key 访问 `/v1/*` |
+| `BOHRIUM_GATEWAY_PREFLIGHT` | `true` | 新对话前执行计费预检 |
+| `BOHRIUM_GATEWAY_SCIMASTER_PROMPT` | `true` | 主模型前置系统提示词开关 |
 
 ---
 
-## 📚 API Surface
+## API 列表
 
-All `/api/*` operational endpoints require either an authenticated admin cookie (`POST /api/auth/login`) or the `X-Admin-Password` header:
+### 管理接口（`/api/*`）
 
-| Method | Path | Description |
+鉴权方式：登录后自动下发的 `HttpOnly` Cookie，或请求头 `X-Admin-Password: <password>`。
+
+| 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/healthz` | Public health status, build version, and active Chrome UA |
-| `POST` | `/api/auth/login` | Admin password login (rate-limited, sets `HttpOnly` cookie) |
-| `GET` | `/api/overview` | Aggregated session, points/capacity, daily tasks, scheduler status, logs |
-| `POST` | `/api/bohrium/wechat/qr` | Request official WeChat QR code for remote login |
-| `GET` | `/api/bohrium/wechat/poll` | Poll WeChat QR login status and persist `brmToken` |
-| `POST` | `/api/bohrium/oauth/url` | Fetch official OAuth URL (`google` / `apple` / `carsi` / `feishu` / `pku`) |
-| `POST` | `/api/bohrium/oauth/verify` | Exchange OAuth callback URL/code via `/api/oauth/verify` |
-| `POST` | `/api/bohrium/code/send` / `login/code` | Send phone/email OTP and log in with verification code |
-| `POST` | `/api/bohrium/login/token` | Import and validate manual `brmToken` |
-| `POST` | `/api/bohrium/refresh-token` | Trigger immediate JWT refresh |
-| `GET` | `/api/tasks` | Fetch current daily tasks list |
-| `POST` | `/api/tasks/claim-all` | Claim all daily tasks in one click |
-| `POST` | `/api/tasks/run` | Manually execute a single Web task (auto-claims if needed, skips client task) |
-| `POST` | `/api/tasks/run-all` | Claim and run all incomplete Web tasks sequentially |
-| `GET` | `/api/assets` | Fetch photons, wallet, 7-day expiring lots, ledger, quotas, and storage capacity |
-| `GET` / `PUT` | `/api/settings` | Read or update schedule, UA, proxy, cancel timing, and admin password |
-| `POST` | `/api/recon/pull` / `/api/recon/diff` | Pull local frontend snapshot baseline or check live upstream drift |
-| `GET` / `PUT` | `/api/gateway/status` / `settings` | Inspect OpenAI gateway stats/catalog or update gateway settings |
-| `POST` / `PATCH` / `DELETE` | `/api/gateway/keys` | Create, toggle, or revoke OpenAI gateway API keys |
-| `POST` | `/api/gateway/preflight` / `playground` | Run Bohrium billing preflight or test models in-browser |
+| `GET` | `/healthz` | 健康检查（免鉴权） |
+| `POST` | `/api/auth/login` / `logout` | 管理员登录与登出 |
+| `GET` | `/api/overview` | 控制台总览（账号列表、聚焦账号任务/资产、调度状态、日志） |
+| `GET` | `/api/accounts` | 多账号列表与汇总 |
+| `PATCH` / `DELETE` | `/api/accounts/{id}` | 修改备注/签到开关/路由池状态，或删除账号 |
+| `POST` | `/api/accounts/refresh-balances` | 批量刷新所有账号余额 |
+| `POST` | `/api/accounts/run-all` | 立即触发全部启用签到的账号执行每日任务 |
+| `POST` | `/api/accounts/{id}/refresh-token` | 手动续期指定账号 Token 并同步资料 |
+| `POST` | `/api/accounts/{id}/tasks/{claim-all,claim,run,run-all}` | 领取或执行指定账号的每日任务 |
+| `POST` | `/api/bohrium/wechat/qr` & `GET /api/bohrium/wechat/poll` | 微信二维码登录与轮询 |
+| `POST` | `/api/bohrium/oauth/url` & `oauth/verify` | 第三方 OAuth 登录 |
+| `POST` | `/api/bohrium/code/send` & `login/code` | 手机/邮箱验证码登录 |
+| `POST` | `/api/bohrium/login/password` & `login/token` | 密码登录或导入 `brmToken` |
+| `GET` / `PUT` | `/api/settings` | 读取与更新调度及运行参数 |
+| `GET` | `/api/logs` | 查询 SQLite 执行日志（支持 `accountId`、`limit`） |
+| `GET` / `POST` | `/api/recon/{status,pull,diff}` | 前端快照状态、拉取基线与漂移检测 |
+| `GET` / `PUT` | `/api/gateway/{status,settings,pool}` | 网关状态、配置与路由池成员调整 |
+| `GET` / `DELETE` | `/api/gateway/bindings` & `bindings/{hash}` | 查询、解绑或清空 7 天会话绑定 |
+| `POST` / `PATCH` / `DELETE` | `/api/gateway/keys` & `keys/{id}` | 管理 `/v1/*` API Key |
+| `POST` | `/api/gateway/{models/refresh,preflight,playground}` | 刷新模型目录、额度预检与在线调试 |
 
-### OpenAI-Compatible `/v1/*` Endpoints
+### OpenAI 兼容接口（`/v1/*`）
 
-Authenticate with `Authorization: Bearer <sk-brm-...>` (or `x-api-key` / `api-key`):
+鉴权方式：`Authorization: Bearer <api-key>`（或 `x-api-key`）。
 
-| Method | Path | Description |
+| 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/v1/models` | Live Bohrium SciX model catalog (`tag=shrimp-brain-v2`) with `scix_catalog` metadata |
-| `GET` | `/v1/models/{id}` | Resolve model metadata by ID, `scix/<id>`, or display name alias |
-| `GET` | `/v1/balance` | Real-time Bohrium photons, org balance, CNY wallet, expiring lots, quotas, storage & `balance_infos` |
-| `POST` | `/v1/chat/completions` | Full Chat Completions (SSE & JSON, tools, reasoning, vision, structured outputs) |
-| `POST` | `/v1/responses` | Full Responses API (SSE & JSON, tools, reasoning, vision, `previous_response_id` chaining) |
-| `GET` / `DELETE` | `/v1/responses/{id}` | Retrieve or delete a locally stored response |
-| `GET` | `/v1/responses/{id}/input_items` | List input items recorded for a stored response |
-
-Full endpoint docs: <https://landminehq.github.io/bohrium-club-auto/api/openai> · <https://landminehq.github.io/bohrium-club-auto/api/admin>
+| `GET` | `/v1/models` | 获取可用模型目录 |
+| `GET` | `/v1/models/{id}` | 查询单个模型信息 |
+| `GET` | `/v1/balance` | 路由池聚合余额与账号明细 |
+| `POST` | `/v1/chat/completions` | Chat Completions（支持流式 SSE、tools、reasoning、vision） |
+| `POST` | `/v1/responses` | Responses API（支持流式 SSE、`previous_response_id` 链式上下文） |
+| `GET` / `DELETE` | `/v1/responses/{id}` | 查询或删除已保存的响应记录 |
+| `GET` | `/v1/responses/{id}/input_items` | 查询指定响应的输入条目 |
 
 ---
 
-## 🛡️ Security & Reliability
-
-- **Constant-time password check & rate limit**: Admin login hashes passwords with SHA-256 and compares with `subtle.ConstantTimeCompare`; repeated failures are rate-limited per client IP.
-- **Token redaction**: Full `brmToken` JWT strings are never returned back through dashboard APIs; `config.json` and `state.json` are written atomically with `0600` permissions.
-- **No CAPTCHA circumvention**: Password login stops gracefully whenever upstream requires Tencent Captcha and instructs the user to use official WeChat QR login.
-- **Offline / restricted-network resilience**: Task #3 caches downloaded arXiv PDFs in `data/pdfs/`, prioritizes user-provided PDFs in `data/custom_pdfs/`, retries across multiple catalog papers and mirrors, and falls back to a valid minimal PDF if external arXiv access is blocked.
-- **Zero false-positive recon diffs**: HTML hashing strips ephemeral per-request edge CDN `clientSignal` and `nonce` attributes while checking static bundle SHA-256 digests and API contract markers.
-
----
-
-## 🧪 Development & Verification
+## 本地开发与构建
 
 ```bash
-# Static analysis & full test suite (all unit tests run offline via httptest)
+# 1. 安装并构建 React + Vite + shadcn/ui 前端（产物输出到 web/dist，供 Go embed 嵌入）
+npm ci --prefix web
+npm run build --prefix web
+
+# 开发模式下可同时运行后端与前端热更新（Vite 自动代理 /api /v1 /healthz 到 127.0.0.1:8788）
+npm run dev --prefix web
+
+# 2. Go 检查、测试与静态编译
 go vet ./...
-go test -race -v ./...
+go test ./...
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.Version=dev" -o dist/bohrium-club-auto ./cmd/bohrium-club-auto
 
-# Build static single-file binary
-CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.Version=dev" \
-  -o dist/bohrium-club-auto ./cmd/bohrium-club-auto
-
-# Start server locally
-./dist/bohrium-club-auto serve
-
-# Pull & diff upstream Bohrium frontend snapshot (writes only to gitignored /recon/)
-./dist/bohrium-club-auto recon pull
-./dist/bohrium-club-auto recon diff --json
-
-# Preview or build VitePress documentation site
+# 3. 文档站本地预览与构建
 npm ci --prefix docs-site
 npm run dev --prefix docs-site
 npm run build --prefix docs-site
 ```
 
----
+更多编译与发布细节见 [`docs/BINARY-BUILDS.md`](docs/BINARY-BUILDS.md)。
 
-## 📁 Project Layout
-
-```text
-cmd/bohrium-club-auto/     CLI entry point (serve, recon pull, recon diff, version)
-internal/chromehttp/       Chrome browser User-Agent & Client Hints HTTP client
-internal/config/           Atomic config.json management, env overrides, first-boot password
-internal/store/            Atomic state.json persistence (auth, schedule day, logs)
-internal/prompts/          go:embed 870 scientific prompts + 100 real arXiv papers catalog
-internal/bohrium/          Bohrium auth, daily tasks, assets/capacity, PDF pool, task executor, SciX LLM client
-internal/openai/           OpenAI /v1/models, /v1/chat/completions, /v1/responses gateway + bidirectional bridge
-internal/scheduler/        Daily Asia/Shanghai scheduler + periodic token auto-refresh
-internal/recon/            Live Bohrium frontend snapshot & diff engine
-internal/server/           Admin password gate, rate limiter, REST API, embedded SPA router
-web/                       Embedded Web Dashboard SPA (HTML / CSS / vanilla JS)
-docs/                      Binary build guide & recon snapshot specification
-docs-site/                 VitePress documentation site source
-config/                    Sample configuration file
-.github/workflows/         CI, binary build/release, Docker build/GHCR push, recon & docs deploy
-data/                      Runtime data (gitignored; contains secrets & PDF cache)
-recon/                     Local frontend recon snapshots (gitignored)
-```
-
----
-
-## 📄 Documentation Index
-
-| Document | Content |
-| --- | --- |
-| [Online Docs (VitePress)](https://landminehq.github.io/bohrium-club-auto/) | Full user guide, API reference, configuration, and deployment docs |
-| [`docs/BINARY-BUILDS.md`](docs/BINARY-BUILDS.md) | Multi-platform static binary & Docker build/release guide |
-| [`docs/RECON-SNAPSHOT.md`](docs/RECON-SNAPSHOT.md) | Pull/compare local Bohrium web-source snapshots (`recon pull` / `recon diff`) |
-| [`config/config.example.json`](config/config.example.json) | Annotated configuration example |
-| [`AGENTS.md`](AGENTS.md) | Engineering invariants & contributor guide |
-
----
-
-## ⚠️ Disclaimer
-
-This project is an independent self-hosted automation tool created for **personal convenience, educational, and research purposes**. It is **not affiliated with, endorsed by, or associated with Bohrium or DP Technology**. Please respect Bohrium's terms of service; upstream web APIs may change at any time.
-
-## 📝 License
+## License
 
 MIT — see [LICENSE](LICENSE).

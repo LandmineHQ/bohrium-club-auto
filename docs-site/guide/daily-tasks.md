@@ -13,9 +13,12 @@
 3. 获取 `workflowId` / `queryId` 后，按官方前端一致的格式向 `POST https://sb-cloud.dp.tech/api/v1/query-events` 上报 `task_key: "bohrium_science_space_web"`；
 4. 等待极短间隔（默认 `450ms`，可配置）后**立即调用** `POST /api/v1/chat/<workflowId>/cancel`（`{"source":"api_request"}`）终止生成。
 
-### 2. 体验玻尔科学空间「客户端」
+### 2. 体验玻尔科学空间「客户端」（`bohrium_science_space_client`）
 
-- 自动识别并标记为 **已跳过**，定时任务与手动按钮均不会触发。
+1. 从内嵌的 330 条科学空间题库随机抽取一条科研问题；
+2. 严格使用 Bohrium 桌面客户端（`scix` v0.10.25）原生非浏览器传输层（`x-scix-runtime: scix_local`，无 Chrome UA / `Sec-CH-UA`）：先请求 `/models?tag=shrimp-brain-v2` 与 `POST /billing/preflight`（共享同一 W3C `traceparent`）；
+3. 构造与桌面客户端完全一致的 `POST /scix/llm/chat/completions` 请求体（含完整 `SciMaster` 系统提示词、16 项内置桌面工具 `tools` 且 `strict: false`、`<environment_context>`、`stream: true` 及每账号独立 `storeId` 的 `x-scix-execution`）；
+4. 收到上游受理响应后等待极短间隔（`cancelAfterMs`）即**立即取消 HTTP SSE 流**（与桌面端 `AbortController.abort()` 一致，最小化光子消耗），随后向 `POST https://sb-cloud.dp.tech/api/v1/query-events` 上报 `task_key: "bohrium_science_space_client"`（与 `scix.exe` 内置逻辑一致）。
 
 ### 3. 体验玻尔「文献阅读」（`bohrium_literature_reading`）
 

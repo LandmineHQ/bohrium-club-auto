@@ -3,42 +3,26 @@ layout: home
 
 hero:
   name: Bohrium Club Auto
-  text: 玻尔社区每日任务自动化与积分控制台
-  tagline: 纯 Go 零依赖静态单文件二进制、Chrome 浏览器出站指纹、服务器远程微信扫码、870 科研题库 + 100 篇 arXiv 文献随机上传提问后立即终止，以及完整的管理员 Web 仪表盘。
-  image:
-    src: /logo.svg
-    alt: Bohrium Club Auto
+  text: 使用说明、架构与 API 文档
+  tagline: 多账号托管、定时任务调度、Web 管理控制台与 OpenAI 兼容路由网关。
   actions:
     - theme: brand
       text: 快速开始
       link: /guide/quickstart
     - theme: alt
-      text: 浏览管理 API
-      link: /api/overview
+      text: 系统架构
+      link: /reference/architecture
     - theme: alt
-      text: 二进制与 Docker 发布
-      link: /reference/binary-builds
+      text: API 参考
+      link: /api/overview
 
 features:
-  - icon: 📱
-    title: 服务器端远程微信扫码登录
-    details: 服务端直接向 platform.bohrium.com 申请官方微信二维码并在 Web 面板扫码登录，无需本地挂机，无图形验证码，后台自动续期 brmToken。
-  - icon: 📊
-    title: 三大类剩余积分与容量监控
-    details: 一站式查看个人/组织光子余额、钱包余额、7 日即将过期批次与收支流水、会员功能剩余配额（文献/对话/深度研究）及知识库存储容量。
-  - icon: ⚡
-    title: 一键领取与 3 项 Web 任务自动执行
-    details: 自动跳过客户端任务（第 2 项）与已废弃的旧版 200 光子签到接口；支持一键领取、一键执行、单项手动触发及每日定时调度。
-  - icon: 📚
-    title: 870 科研题库 + 100 篇真实文献 PDF
-    details: 二进制内嵌 330 条科学空间问题、320 条学术写作问题、220 条文献阅读问题及 100 篇 arXiv 开放获取论文目录，提问并上报后立即 cancel 终止。
-  - icon: 🌐
-    title: Chrome 浏览器出站指纹
-    details: 所有出站请求自动注入桌面端 Chrome User-Agent 与 Sec-CH-UA Client Hints，彻底屏蔽 Go 默认 HTTP 客户端标识，支持自定义代理与 UA。
-  - icon: 🤖
-    title: OpenAI 兼容网关（Chat & Responses）
-    details: 完整还原 Bohrium 客户端（SciX）原生 Sigma LLM 上游协议与 x-scix-execution 交互，提供 /v1/models、/v1/chat/completions 与 /v1/responses 全能力及双向跨协议桥接。
-  - icon: 🔍
-    title: 前端 Recon 漂移监控与全套 CI/CD
-    details: 内置 recon pull / recon diff 检查线上前端源码与关键 API 契约变化；配套多平台静态二进制 Release、多架构 GHCR Docker 与文档站发布流水线。
+  - title: 多账号与远程登录
+    details: 支持微信扫码、第三方 OAuth、验证码、密码与 Token 导入，数据持久化于本地 SQLite（data/bohrium.db），各账号独立 storeId 并自动维护 Token 续期。
+  - title: 随机波动每日任务
+    details: 覆盖全部 4 项每日任务，按账号分配每日错峰执行时间并保持账号间隔离，任务触发后及时终止流以控制消耗。
+  - title: OpenAI 兼容路由池
+    details: 新账号默认不入池，手动拖入后按可用余额比例加权分配新会话，绑定关系在 SQLite 中最长缓存 7 天，支持 /v1/models、/v1/balance、/v1/chat/completions 与 /v1/responses。
+  - title: 模块化前端与单文件交付
+    details: 控制台基于 React + Vite + TypeScript + shadcn/ui 构建并嵌入 Go 静态二进制，提供多账号管理、拖拽路由池、资产监控、日志与系统设置。
 ---

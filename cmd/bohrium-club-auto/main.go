@@ -84,6 +84,7 @@ func runServer() {
 	if err != nil {
 		log.Fatalf("[boot] failed to open store: %v", err)
 	}
+	defer func() { _ = st.Close() }()
 
 	httpCli, err := chromehttp.New(chromehttp.Options{
 		UserAgent: cfg.UserAgent,
@@ -94,11 +95,18 @@ func runServer() {
 		log.Fatalf("[boot] failed to init Chrome HTTP client: %v", err)
 	}
 
-	client := bohrium.NewClient(httpCli, cfgMgr, st)
-	sched := scheduler.New(client, cfgMgr, st)
+	acctMgr := bohrium.NewManager(httpCli, cfgMgr, st)
+	go func() {
+		syncCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if n := acctMgr.SyncMissingProfiles(syncCtx); n > 0 {
+			log.Printf("[boot] synced Bohrium profile/nickname for %d existing account(s)", n)
+		}
+	}()
+	sched := scheduler.New(acctMgr, cfgMgr, st)
 	sched.Start()
 
-	srv := server.New(Version, cfgMgr, st, httpCli, client, sched)
+	srv := server.New(Version, cfgMgr, st, httpCli, acctMgr, sched)
 	addr := net.JoinHostPort(cfg.Host, fmt.Sprintf("%d", cfg.Port))
 	httpSrv := &http.Server{
 		Addr:              addr,
@@ -107,13 +115,16 @@ func runServer() {
 	}
 
 	pStats := prompts.GetStats()
+	allAccs, _ := st.ListAccounts()
+	poolAccs, _ := st.ListPoolAccounts()
 	log.Printf("============================================================")
-	log.Printf("bohrium-club-auto %s", Version)
+	log.Printf("bohrium-club-auto %s (multi-account)", Version)
 	log.Printf("Dashboard:      http://%s/", displayHost(cfg.Host, cfg.Port))
 	if cfg.Gateway.Enabled {
-		log.Printf("OpenAI API:     http://%s/v1 (Chat Completions + Responses)", displayHost(cfg.Host, cfg.Port))
+		log.Printf("OpenAI API:     http://%s/v1 (Chat Completions + Responses + Weighted Pool)", displayHost(cfg.Host, cfg.Port))
 	}
-	log.Printf("Data Dir:       %s", cfg.DataDir)
+	log.Printf("Data Dir:       %s (SQLite: %s)", cfg.DataDir, st.DBPath())
+	log.Printf("Accounts:       %d total, %d in OpenAI routing pool (new accounts opt-in manually)", len(allAccs), len(poolAccs))
 	log.Printf("Chrome UA:      %s", httpCli.UserAgent())
 	log.Printf("Prompt Corpus:  SciSpace=%d, Writing=%d, Reading=%d, Papers=%d",
 		pStats.ScienceSpacePrompts, pStats.AcademicWritingPrompts, pStats.LiteratureReadingPrompts, pStats.PaperCatalogCount)
