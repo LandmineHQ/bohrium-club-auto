@@ -92,6 +92,11 @@ export default defineConfig({
     footer: {
       message: '使用说明与接口参考文档',
       copyright: 'MIT License'
+    },
+    socialLinks: [{ icon: 'github', link: 'https://github.com/LandmineHQ/bohrium-club-auto' }],
+    editLink: {
+      pattern: 'https://github.com/LandmineHQ/bohrium-club-auto/edit/main/docs-site/:path',
+      text: '在 GitHub 上编辑此页'
     }
   }
 })
