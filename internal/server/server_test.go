@@ -369,6 +369,15 @@ func TestAsyncManualTaskExecutionAndPolling(t *testing.T) {
 		t.Fatalf("UpsertAccountFromAuth: %v", err)
 	}
 
+	// Ensure GET /api/overview always serializes activeJobs as [] (never null) when idle.
+	ovReq := httptest.NewRequest(http.MethodGet, "/api/overview", nil)
+	ovReq.Header.Set("X-Admin-Password", pw)
+	ovRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(ovRec, ovReq)
+	if ovRec.Code != http.StatusOK || !strings.Contains(ovRec.Body.String(), `"activeJobs":[]`) || strings.Contains(ovRec.Body.String(), `"activeJobs":null`) {
+		t.Fatalf("GET /api/overview expected non-null activeJobs [], got %d %s", ovRec.Code, ovRec.Body.String())
+	}
+
 	// Trigger single manual task with a short HTTP request context that is canceled immediately after 202 returns.
 	reqCtx, cancelReq := context.WithCancel(context.Background())
 	bodyBytes, _ := json.Marshal(map[string]string{"taskKey": "bohrium_science_space_web"})
@@ -434,5 +443,14 @@ func TestAsyncManualTaskExecutionAndPolling(t *testing.T) {
 	srv.Handler().ServeHTTP(listRec, listReq)
 	if listRec.Code != http.StatusOK || !strings.Contains(listRec.Body.String(), startRes.Job.ID) {
 		t.Fatalf("GET /api/tasks/jobs missing job: %d %s", listRec.Code, listRec.Body.String())
+	}
+
+	// After job completes, GET /api/overview still returns activeJobs as [] (never null).
+	ovDoneReq := httptest.NewRequest(http.MethodGet, "/api/overview", nil)
+	ovDoneReq.Header.Set("X-Admin-Password", pw)
+	ovDoneRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(ovDoneRec, ovDoneReq)
+	if ovDoneRec.Code != http.StatusOK || !strings.Contains(ovDoneRec.Body.String(), `"activeJobs":[]`) || strings.Contains(ovDoneRec.Body.String(), `"activeJobs":null`) {
+		t.Fatalf("GET /api/overview after completion expected activeJobs [], got %d %s", ovDoneRec.Code, ovDoneRec.Body.String())
 	}
 }

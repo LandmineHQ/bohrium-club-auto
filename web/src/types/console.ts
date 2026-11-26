@@ -218,7 +218,7 @@ export interface OverviewResponse {
   assets?: PointsAndCapacity | null
   assetsError?: string
   scheduler: SchedulerStatus
-  activeJobs?: TaskJob[]
+  activeJobs?: TaskJob[] | null
   promptStats: PromptStats
   pdfStats: { cached: number; custom: number }
   reconDir: string

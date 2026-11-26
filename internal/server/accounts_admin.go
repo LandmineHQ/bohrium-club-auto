@@ -284,7 +284,7 @@ func (s *Server) handleRefreshAllBalances(w http.ResponseWriter, r *http.Request
 	defer cancel()
 	accounts, _ := s.store.ListAccounts()
 	refreshed := 0
-	var errs []string
+	errs := make([]string, 0)
 	for _, acc := range accounts {
 		if strings.TrimSpace(acc.Token) == "" {
 			continue

@@ -302,7 +302,7 @@ func (s *Scheduler) ListTaskJobs(limit int) []*TaskJob {
 func (s *Scheduler) ActiveTaskJobs() []*TaskJob {
 	s.jobsMu.RLock()
 	defer s.jobsMu.RUnlock()
-	var out []*TaskJob
+	out := make([]*TaskJob, 0)
 	for i := len(s.jobOrder) - 1; i >= 0; i-- {
 		if j, ok := s.jobs[s.jobOrder[i]]; ok && j.Status == "running" {
 			out = append(out, cloneTaskJob(j))

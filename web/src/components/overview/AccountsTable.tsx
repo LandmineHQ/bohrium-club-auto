@@ -22,7 +22,7 @@ interface AccountsTableProps {
   accounts: AccountSummaryView[]
   selectedAccountId: string
   poolCount: number
-  activeJobs?: TaskJob[]
+  activeJobs?: TaskJob[] | null
   onSelectAccount: (id: string) => void
   onOpenLogin: () => void
   onRefreshAll: () => Promise<void>
@@ -38,9 +38,10 @@ export function AccountsTable({
   onRefreshAll,
 }: AccountsTableProps) {
   const [busyAction, setBusyAction] = useState<string>("")
+  const safeActiveJobs = Array.isArray(activeJobs) ? activeJobs : []
   const batchRunning =
     busyAction === "run-all" ||
-    activeJobs.some((j) => j.status === "running" && j.kind === "all_accounts")
+    safeActiveJobs.some((j) => j.status === "running" && j.kind === "all_accounts")
 
   async function toggleCheckin(acc: AccountSummaryView, enabled: boolean) {
     try {
@@ -321,7 +322,7 @@ export function AccountsTable({
                         disabled={
                           busyAction === `run:${a.id}` ||
                           sc.running ||
-                          activeJobs.some(
+                          safeActiveJobs.some(
                             (j) =>
                               j.status === "running" &&
                               (j.kind === "all_accounts" || j.accountId === a.id)

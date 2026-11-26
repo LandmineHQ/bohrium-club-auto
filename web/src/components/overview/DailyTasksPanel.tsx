@@ -17,7 +17,7 @@ interface DailyTasksPanelProps {
   onSelectAccount: (id: string) => void
   tasks?: DailyTasksResponse | null
   tasksError?: string
-  activeJobs?: TaskJob[]
+  activeJobs?: TaskJob[] | null
   onRefresh: () => Promise<void>
 }
 
@@ -38,7 +38,8 @@ export function DailyTasksPanel({
       ? "未加载"
       : "暂无账号"
 
-  const accountJobs = activeJobs.filter(
+  const safeActiveJobs = Array.isArray(activeJobs) ? activeJobs : []
+  const accountJobs = safeActiveJobs.filter(
     (j) =>
       j.status === "running" &&
       (j.kind === "all_accounts" || !j.accountId || j.accountId === selectedAccountId)

@@ -23,6 +23,7 @@ export function OverviewTab({
   onRefreshAll,
 }: OverviewTabProps) {
   const accounts = data?.accounts || []
+  const activeJobs = Array.isArray(data?.activeJobs) ? data.activeJobs : []
   const summary = data?.accountSummary
   const sched = data?.scheduler
   const storage = data?.assets?.storage
@@ -98,7 +99,7 @@ export function OverviewTab({
         accounts={accounts}
         selectedAccountId={selectedAccountId}
         poolCount={poolAcc}
-        activeJobs={data?.activeJobs}
+        activeJobs={activeJobs}
         onSelectAccount={onSelectAccount}
         onOpenLogin={onOpenLogin}
         onRefreshAll={onRefreshAll}
@@ -110,7 +111,7 @@ export function OverviewTab({
         onSelectAccount={onSelectAccount}
         tasks={data?.tasks}
         tasksError={data?.tasksError}
-        activeJobs={data?.activeJobs}
+        activeJobs={activeJobs}
         onRefresh={onRefreshAll}
       />
 
