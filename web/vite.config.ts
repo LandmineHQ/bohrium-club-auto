@@ -41,6 +41,16 @@ export default defineConfig({
           ) {
             return "d3-vendor"
           }
+          if (
+            norm.includes("/node_modules/recharts/es6/cartesian/CartesianGrid.js") ||
+            norm.includes("/node_modules/recharts/es6/cartesian/XAxis.js") ||
+            norm.includes("/node_modules/recharts/es6/cartesian/YAxis.js") ||
+            norm.includes("/node_modules/recharts/es6/component/Tooltip.js") ||
+            norm.includes("/node_modules/recharts/es6/component/Legend.js") ||
+            norm.endsWith("/node_modules/recharts/es6/index.js")
+          ) {
+            return "charts-views"
+          }
           if (norm.includes("/node_modules/recharts/")) {
             return "charts"
           }
