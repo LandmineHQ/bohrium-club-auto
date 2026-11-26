@@ -8,12 +8,58 @@ import (
 	"net/http"
 )
 
-// OpenAIModel is the standard OpenAI GET /v1/models/{id} and /v1/models item object.
+// OpenAIModelLimit carries models.dev / OpenCode style token limits.
+type OpenAIModelLimit struct {
+	Context int `json:"context,omitempty"`
+	Output  int `json:"output,omitempty"`
+}
+
+// OpenAIModelArchitecture carries OpenRouter modality metadata.
+type OpenAIModelArchitecture struct {
+	Modality         string   `json:"modality"`
+	InputModalities  []string `json:"input_modalities"`
+	OutputModalities []string `json:"output_modalities"`
+}
+
+// OpenAIModelTopProvider carries OpenRouter provider capacity metadata.
+type OpenAIModelTopProvider struct {
+	ContextLength       int  `json:"context_length,omitempty"`
+	MaxCompletionTokens int  `json:"max_completion_tokens,omitempty"`
+	IsModerated         bool `json:"is_moderated"`
+}
+
+// OpenAIModelThinking carries normalized reasoning/thinking capability metadata.
+type OpenAIModelThinking struct {
+	Supported bool     `json:"supported"`
+	Levels    []string `json:"levels,omitempty"`
+	Default   string   `json:"default,omitempty"`
+}
+
+// OpenAIModel is the OpenAI GET /v1/models/{id} and /v1/models item object,
+// enriched with OpenRouter and multi-client compatibility extension fields.
 type OpenAIModel struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	OwnedBy string `json:"owned_by"`
+	ID                     string                   `json:"id"`
+	Object                 string                   `json:"object"`
+	Created                int64                    `json:"created"`
+	OwnedBy                string                   `json:"owned_by"`
+	Name                   string                   `json:"name,omitempty"`
+	DisplayName            string                   `json:"display_name,omitempty"`
+	Description            string                   `json:"description,omitempty"`
+	ContextWindow          int                      `json:"context_window,omitempty"`
+	ContextLength          int                      `json:"context_length,omitempty"`
+	MaxModelLen            int                      `json:"max_model_len,omitempty"`
+	MaxInputTokens         int                      `json:"max_input_tokens,omitempty"`
+	MaxOutputTokens        int                      `json:"max_output_tokens,omitempty"`
+	MaxTokens              int                      `json:"max_tokens,omitempty"`
+	Limit                  *OpenAIModelLimit        `json:"limit,omitempty"`
+	TopProvider            *OpenAIModelTopProvider  `json:"top_provider,omitempty"`
+	Input                  []string                 `json:"input,omitempty"`
+	Architecture           *OpenAIModelArchitecture `json:"architecture,omitempty"`
+	SupportedParameters    []string                 `json:"supported_parameters,omitempty"`
+	SupportedEndpointTypes []string                 `json:"supported_endpoint_types,omitempty"`
+	ReasoningEffort        string                   `json:"reasoning_effort,omitempty"`
+	ReasoningEfforts       []string                 `json:"reasoning_efforts,omitempty"`
+	Thinking               *OpenAIModelThinking     `json:"thinking,omitempty"`
 }
 
 // OpenAIModelList is the standard OpenAI GET /v1/models response envelope.

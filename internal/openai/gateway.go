@@ -264,6 +264,45 @@ func (g *Gateway) IsModelEnabled(m bohrium.SciXModel) bool {
 	return g.cfg.Get().Gateway.IsModelEnabled(m.ID, m.DefaultGatewayEnabled())
 }
 
+func normalizeUniqueStrings(values []string, lower bool) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, raw := range values {
+		v := strings.TrimSpace(raw)
+		if lower {
+			v = strings.ToLower(v)
+		}
+		if v == "" {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+func resolveModelDisplayMetadata(m bohrium.SciXModel) (name, description string) {
+	if m.Presentation != nil {
+		if n := strings.TrimSpace(m.Presentation.Name); n != "" {
+			name = n
+		}
+		description = strings.TrimSpace(m.Presentation.Description)
+	}
+	if name == "" {
+		name = strings.TrimSpace(m.Name)
+	}
+	if name == "" {
+		name = m.ID
+	}
+	return name, description
+}
+
 func toOpenAIModel(m bohrium.SciXModel) OpenAIModel {
 	obj := strings.TrimSpace(m.Object)
 	if obj == "" {
@@ -273,15 +312,91 @@ func toOpenAIModel(m bohrium.SciXModel) OpenAIModel {
 	if ownedBy == "" {
 		ownedBy = "sigma"
 	}
-	return OpenAIModel{
-		ID:      m.ID,
-		Object:  obj,
-		Created: m.Created,
-		OwnedBy: ownedBy,
+
+	displayName, description := resolveModelDisplayMetadata(m)
+	ctxWin := max(0, m.ContextWindow)
+	maxOut := max(0, m.MaxOutputTokens)
+
+	inputMods := normalizeUniqueStrings(m.Input, true)
+	if len(inputMods) == 0 {
+		inputMods = []string{"text"}
 	}
+
+	supportedParams := []string{
+		"temperature",
+		"top_p",
+		"max_tokens",
+		"max_completion_tokens",
+		"stop",
+		"presence_penalty",
+		"frequency_penalty",
+		"seed",
+		"logprobs",
+		"top_logprobs",
+		"logit_bias",
+		"response_format",
+		"structured_outputs",
+		"tools",
+		"tool_choice",
+		"parallel_tool_calls",
+	}
+
+	out := OpenAIModel{
+		ID:                     m.ID,
+		Object:                 obj,
+		Created:                m.Created,
+		OwnedBy:                ownedBy,
+		Name:                   displayName,
+		DisplayName:            displayName,
+		Description:            description,
+		ContextWindow:          ctxWin,
+		ContextLength:          ctxWin,
+		MaxModelLen:            ctxWin,
+		MaxInputTokens:         ctxWin,
+		MaxOutputTokens:        maxOut,
+		MaxTokens:              maxOut,
+		Input:                  append([]string(nil), inputMods...),
+		Architecture: &OpenAIModelArchitecture{
+			Modality:         strings.Join(inputMods, "+") + "->text",
+			InputModalities:  append([]string(nil), inputMods...),
+			OutputModalities: []string{"text"},
+		},
+		SupportedEndpointTypes: []string{"openai", "openai-response"},
+	}
+
+	if ctxWin > 0 || maxOut > 0 {
+		out.Limit = &OpenAIModelLimit{
+			Context: ctxWin,
+			Output:  maxOut,
+		}
+		out.TopProvider = &OpenAIModelTopProvider{
+			ContextLength:       ctxWin,
+			MaxCompletionTokens: maxOut,
+			IsModerated:         false,
+		}
+	}
+
+	if m.SupportsReasoning() {
+		supportedParams = append(supportedParams, "reasoning", "reasoning_effort", "include_reasoning")
+		defaultEffort := strings.TrimSpace(m.ReasoningEffort)
+		efforts := normalizeUniqueStrings(m.ReasoningEfforts, false)
+		if len(efforts) == 0 && defaultEffort != "" {
+			efforts = []string{defaultEffort}
+		}
+		out.ReasoningEffort = defaultEffort
+		out.ReasoningEfforts = append([]string(nil), efforts...)
+		out.Thinking = &OpenAIModelThinking{
+			Supported: true,
+			Levels:    append([]string(nil), efforts...),
+			Default:   defaultEffort,
+		}
+	}
+	out.SupportedParameters = supportedParams
+
+	return out
 }
 
-// BuildOpenAIModelList returns the standard OpenAI GET /v1/models payload containing only enabled models.
+// BuildOpenAIModelList returns the GET /v1/models payload containing only enabled models.
 func (g *Gateway) BuildOpenAIModelList(cat *bohrium.SciXModelCatalog) OpenAIModelList {
 	list := OpenAIModelList{
 		Object: "list",

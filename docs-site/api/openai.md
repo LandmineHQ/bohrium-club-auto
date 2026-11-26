@@ -43,14 +43,23 @@ Bohrium 上游对不同模型限定了原生端点：
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/v1/models` | 按标准 OpenAI 格式（`id`、`object`、`created`、`owned_by`）返回当前已启用的模型列表 |
-| `GET` | `/v1/models/{id}` | 按模型 ID、`scix/<id>` 或显示名别名（如 `DeepSeek-V4-Pro`）查询模型详情 |
+| `GET` | `/v1/models` | 按 OpenAI 标准列表格式（`object` + `data`）返回当前已启用的模型，并附带 OpenRouter 与多客户端兼容扩展字段 |
+| `GET` | `/v1/models/{id}` | 按模型 ID、`scix/<id>` 或显示名别名（如 `DeepSeek-V4-Pro`）查询单个模型的完整元数据 |
 | `GET` | `/v1/balance` | 实时聚合所有已入池账号的光子余额、组织余额、钱包余额（CNY）、配额、知识库存储及各入池账号余额与路由权重明细（`pool_accounts`、`balance_infos`） |
 | `POST` | `/v1/chat/completions` | 完整 Chat Completions（SSE/非流式、工具调用、`reasoning_effort`、多模态图像、`response_format`） |
 | `POST` | `/v1/responses` | 完整 Responses API（SSE/非流式、`instructions`、`input` 项数组、工具调用、推理、视觉、`previous_response_id`） |
 | `GET` | `/v1/responses/{id}` | 获取已存储的响应对象 |
 | `GET` | `/v1/responses/{id}/input_items` | 获取已存储响应的输入项列表 |
 | `DELETE` | `/v1/responses/{id}` | 删除本地存储的响应记录 |
+
+### `/v1/models` 扩展字段（OpenRouter 与多客户端兼容超集）
+
+`GET /v1/models` 与 `GET /v1/models/{id}` 在保留 OpenAI 标准字段（`id`、`object`、`created`、`owned_by`）的基础上，同时下发多生态兼容扩展字段，便于 Cherry Studio、Cline、Roo Code、LobeChat、OpenCode、`dsh`、vLLM / New API 兼容客户端自动识别上下文长度、多模态输入与思考等级：
+
+- **展示信息**：`name`、`display_name`、`description`
+- **容量限制**：`context_window`、`context_length`、`max_model_len`、`max_input_tokens`、`max_output_tokens`、`max_tokens`、`limit`（`context` / `output`）、`top_provider`（`context_length` / `max_completion_tokens` / `is_moderated`）
+- **模态与端点能力**：`input`、`architecture`（`modality` / `input_modalities` / `output_modalities`）、`supported_parameters`、`supported_endpoint_types`（`["openai", "openai-response"]`）
+- **推理 / 思考能力**（仅支持推理的模型下发；`title` / `summary` 等非推理模型自动省略）：`reasoning_effort`、`reasoning_efforts`、`thinking`（`supported` / `levels` / `default`）
 
 ## 调用示例
 

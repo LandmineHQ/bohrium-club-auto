@@ -209,12 +209,70 @@ func TestAPIKeyAuthAndModels(t *testing.T) {
 	if err := json.Unmarshal(rawCat, &rawMap); err != nil || len(rawMap) != 2 {
 		t.Fatalf("expected strictly {object, data} top-level keys on /v1/models, got %v", rawMap)
 	}
-	if items, ok := rawMap["data"].([]any); !ok || len(items) != 5 {
+	items, ok := rawMap["data"].([]any)
+	if !ok || len(items) != 5 {
 		t.Fatalf("unexpected data array: %v", rawMap["data"])
-	} else {
-		first, _ := items[0].(map[string]any)
-		if len(first) != 4 {
-			t.Fatalf("expected strictly 4 OpenAI model fields {id, object, created, owned_by}, got %v", first)
+	}
+
+	byID := map[string]openai.OpenAIModel{}
+	rawByID := map[string]map[string]any{}
+	for i, m := range cat.Data {
+		byID[m.ID] = m
+		rawObj, _ := items[i].(map[string]any)
+		rawByID[m.ID] = rawObj
+	}
+
+	dspro := byID["dspro-high"]
+	if dspro.Object != "model" || dspro.OwnedBy != "sigma" || dspro.Name != "DeepSeek-V4-Pro" || dspro.DisplayName != "DeepSeek-V4-Pro" {
+		t.Fatalf("unexpected dspro-high display metadata: %+v", dspro)
+	}
+	if dspro.ContextWindow != 1000000 || dspro.ContextLength != 1000000 || dspro.MaxModelLen != 1000000 || dspro.MaxInputTokens != 1000000 ||
+		dspro.MaxOutputTokens != 384000 || dspro.MaxTokens != 384000 {
+		t.Fatalf("unexpected dspro-high capacity fields: %+v", dspro)
+	}
+	if dspro.Limit == nil || dspro.Limit.Context != 1000000 || dspro.Limit.Output != 384000 {
+		t.Fatalf("unexpected dspro-high limit: %+v", dspro.Limit)
+	}
+	if dspro.TopProvider == nil || dspro.TopProvider.ContextLength != 1000000 || dspro.TopProvider.MaxCompletionTokens != 384000 || dspro.TopProvider.IsModerated {
+		t.Fatalf("unexpected dspro-high top_provider: %+v", dspro.TopProvider)
+	}
+	if strings.Join(dspro.Input, ",") != "text" || dspro.Architecture == nil || dspro.Architecture.Modality != "text->text" ||
+		strings.Join(dspro.Architecture.InputModalities, ",") != "text" || strings.Join(dspro.Architecture.OutputModalities, ",") != "text" {
+		t.Fatalf("unexpected dspro-high architecture/input: input=%v arch=%+v", dspro.Input, dspro.Architecture)
+	}
+	if strings.Join(dspro.SupportedEndpointTypes, ",") != "openai,openai-response" {
+		t.Fatalf("unexpected supported_endpoint_types: %v", dspro.SupportedEndpointTypes)
+	}
+	dsproParams := "," + strings.Join(dspro.SupportedParameters, ",") + ","
+	for _, wantParam := range []string{"tools", "response_format", "reasoning", "reasoning_effort", "include_reasoning"} {
+		if !strings.Contains(dsproParams, ","+wantParam+",") {
+			t.Fatalf("dspro-high missing supported_parameter %q in %v", wantParam, dspro.SupportedParameters)
+		}
+	}
+	if dspro.ReasoningEffort != "high" || strings.Join(dspro.ReasoningEfforts, ",") != "low,high,max" ||
+		dspro.Thinking == nil || !dspro.Thinking.Supported || dspro.Thinking.Default != "high" || strings.Join(dspro.Thinking.Levels, ",") != "low,high,max" {
+		t.Fatalf("unexpected dspro-high reasoning/thinking fields: effort=%q efforts=%v thinking=%+v", dspro.ReasoningEffort, dspro.ReasoningEfforts, dspro.Thinking)
+	}
+
+	kimi := byID["kimi-k3"]
+	if strings.Join(kimi.Input, ",") != "text,image" || kimi.Architecture == nil || kimi.Architecture.Modality != "text+image->text" ||
+		strings.Join(kimi.Architecture.InputModalities, ",") != "text,image" {
+		t.Fatalf("unexpected kimi-k3 vision modality metadata: input=%v arch=%+v", kimi.Input, kimi.Architecture)
+	}
+
+	title := byID["title"]
+	if title.ReasoningEffort != "" || len(title.ReasoningEfforts) != 0 || title.Thinking != nil {
+		t.Fatalf("non-reasoning title model should omit reasoning/thinking fields, got effort=%q efforts=%v thinking=%+v", title.ReasoningEffort, title.ReasoningEfforts, title.Thinking)
+	}
+	for _, forbidden := range []string{"thinking", "reasoning_effort", "reasoning_efforts"} {
+		if _, exists := rawByID["title"][forbidden]; exists {
+			t.Fatalf("expected raw JSON for title to omit %q, got %v", forbidden, rawByID["title"])
+		}
+	}
+	titleParams := "," + strings.Join(title.SupportedParameters, ",") + ","
+	for _, notWanted := range []string{"reasoning", "reasoning_effort", "include_reasoning"} {
+		if strings.Contains(titleParams, ","+notWanted+",") {
+			t.Fatalf("non-reasoning title model should not list %q in supported_parameters: %v", notWanted, title.SupportedParameters)
 		}
 	}
 
@@ -231,8 +289,9 @@ func TestAPIKeyAuthAndModels(t *testing.T) {
 	}
 	var model openai.OpenAIModel
 	_ = json.NewDecoder(resp2.Body).Decode(&model)
-	if model.ID != "dspro-high" || model.Object != "model" || model.OwnedBy == "" {
-		t.Fatalf("expected dspro-high standard OpenAI model, got %+v", model)
+	if model.ID != "dspro-high" || model.Object != "model" || model.OwnedBy == "" || model.ContextLength != 1000000 ||
+		model.Thinking == nil || !model.Thinking.Supported || model.Architecture == nil {
+		t.Fatalf("expected dspro-high full OpenAI+extension model, got %+v", model)
 	}
 }
 
@@ -1391,7 +1450,7 @@ func TestModelVisibilityToggleAndStandardOpenAIModels(t *testing.T) {
 					{"id":"vision","name":"读图","hidden":true,"context_window":1050000,"max_output_tokens":128000,"input":["text","image"],"reasoning_effort":"high","reasoning_efforts":["low","medium","high"],"presentation":{"visible":false,"sortOrder":0}},
 					{"id":"title","name":"标题","hidden":true,"context_window":128000,"max_output_tokens":256,"input":["text"],"presentation":{"visible":false,"sortOrder":0}},
 					{"id":"summary","name":"工具批次摘要","hidden":true,"context_window":128000,"max_output_tokens":512,"input":["text"],"presentation":{"visible":false,"sortOrder":0}},
-					{"id":"dspro-high","name":"DeepSeek-V4-Pro","api":"chat_completions","context_window":1000000,"max_output_tokens":384000,"input":["text"],"reasoning_effort":"high","reasoning_efforts":["low","high","max"],"presentation":{"visible":true,"name":"DeepSeek-V4-Pro","sortOrder":20,"usageMultiplier":1,"default":true}},
+					{"id":"dspro-high","name":"DeepSeek-V4-Pro","api":"chat_completions","context_window":1000000,"max_output_tokens":384000,"input":["text"],"reasoning_effort":"high","reasoning_efforts":["low","high","max"],"presentation":{"visible":true,"name":"DeepSeek-V4-Pro","description":"Flagship reasoning model","sortOrder":20,"usageMultiplier":1,"default":true}},
 					{"id":"dsflash-high","name":"DeepSeek-V4.1-Flash","api":"chat_completions","context_window":1000000,"max_output_tokens":384000,"input":["text"],"reasoning_effort":"high","reasoning_efforts":["low","high","max"],"presentation":{"visible":true,"name":"DeepSeek-V4.1-Flash","sortOrder":10,"usageMultiplier":0.3}},
 					{"id":"kimi-k3","name":"Kimi-K3","api":"chat_completions","context_window":1050000,"max_output_tokens":128000,"input":["text","image"],"reasoning_effort":"high","reasoning_efforts":["low","high","max"],"presentation":{"visible":true,"name":"Kimi-K3","sortOrder":30,"usageMultiplier":2}}
 				],
@@ -1493,19 +1552,40 @@ func TestModelVisibilityToggleAndStandardOpenAIModels(t *testing.T) {
 	}
 	for _, item := range rawMap["data"].([]any) {
 		obj := item.(map[string]any)
-		if len(obj) != 4 || obj["id"] == nil || obj["object"] != "model" || obj["created"] == nil || obj["owned_by"] == nil {
-			t.Fatalf("expected strictly 4 OpenAI model fields {id, object, created, owned_by}, got %v", obj)
+		if obj["id"] == nil || obj["object"] != "model" || obj["created"] == nil || obj["owned_by"] == nil {
+			t.Fatalf("expected core OpenAI model fields {id, object, created, owned_by}, got %v", obj)
+		}
+		if obj["name"] == nil || obj["display_name"] == nil || obj["architecture"] == nil || obj["supported_parameters"] == nil || obj["supported_endpoint_types"] == nil {
+			t.Fatalf("expected extended compatibility fields on /v1/models item, got %v", obj)
+		}
+		mID, _ := obj["id"].(string)
+		if mID == "title" || mID == "summary" {
+			if _, hasThinking := obj["thinking"]; hasThinking {
+				t.Fatalf("expected non-reasoning model %q to omit thinking object, got %v", mID, obj)
+			}
+		} else {
+			if _, hasThinking := obj["thinking"]; !hasThinking {
+				t.Fatalf("expected reasoning model %q to include thinking metadata, got %v", mID, obj)
+			}
 		}
 	}
+	if dspro := byID["dspro-high"]; dspro.Description != "Flagship reasoning model" || dspro.ContextLength != 1000000 || dspro.MaxTokens != 384000 {
+		t.Fatalf("expected dspro-high extended description & capacity, got %+v", dspro)
+	}
 
-	// GET /v1/models/dspro-high also returns strictly standard OpenAI fields ONLY
+	// GET /v1/models/dspro-high also returns full OpenAI + OpenRouter/multi-client extension fields
 	rOne, rawOne := doReq(http.MethodGet, "/v1/models/dspro-high", "")
 	if rOne.StatusCode != http.StatusOK {
 		t.Fatalf("GET /v1/models/dspro-high status=%d body=%s", rOne.StatusCode, rawOne)
 	}
-	var oneMap map[string]any
-	if err := json.Unmarshal([]byte(rawOne), &oneMap); err != nil || len(oneMap) != 4 || oneMap["id"] != "dspro-high" || oneMap["object"] != "model" {
-		t.Fatalf("expected strictly {id, object, created, owned_by} on GET /v1/models/dspro-high, got %v", oneMap)
+	var oneModel openai.OpenAIModel
+	if err := json.Unmarshal([]byte(rawOne), &oneModel); err != nil || oneModel.ID != "dspro-high" || oneModel.Object != "model" ||
+		oneModel.Description != "Flagship reasoning model" || oneModel.ContextLength != 1000000 ||
+		oneModel.Limit == nil || oneModel.Limit.Context != 1000000 || oneModel.Limit.Output != 384000 ||
+		oneModel.TopProvider == nil || oneModel.TopProvider.MaxCompletionTokens != 384000 ||
+		oneModel.Architecture == nil || oneModel.Architecture.Modality != "text->text" ||
+		oneModel.Thinking == nil || !oneModel.Thinking.Supported {
+		t.Fatalf("expected full extended model on GET /v1/models/dspro-high, got err=%v model=%+v raw=%s", err, oneModel, rawOne)
 	}
 
 	// 2. Disabled standard & advanced cannot be queried or invoked (including aliases)
