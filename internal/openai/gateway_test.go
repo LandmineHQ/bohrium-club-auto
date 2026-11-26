@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -313,19 +314,19 @@ func TestChatCompletionsNativeCompatAndStreaming(t *testing.T) {
 }
 
 func TestResponsesBridgeToChatCompletionsStreamingAndChaining(t *testing.T) {
-	turn := 0
+	var turn atomic.Int32
 	_, gwSrv, apiKey, capUp := setupTestGateway(t, func(w http.ResponseWriter, r *http.Request) {
-		turn++
+		tNum := turn.Add(1)
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		// Gateway always requests stream=true upstream (matching brain.mjs), even when client requested stream=false.
 		if body["stream"] != true {
-			t.Errorf("turn %d: expected upstream stream=true, got %v", turn, body["stream"])
+			t.Errorf("turn %d: expected upstream stream=true, got %v", tNum, body["stream"])
 		}
 		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, ": heartbeat\n\n")
-		if turn == 1 {
+		if tNum == 1 {
 			_, _ = io.WriteString(w, `data: {"id":"s1","object":"chat.completion.chunk","created":1700000001,"model":"dspro-high","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Let me check."},"finish_reason":null}]}`+"\n\n")
 			_, _ = io.WriteString(w, `data: {"id":"s1","object":"chat.completion.chunk","created":1700000001,"model":"dspro-high","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"get_weather","arguments":"{\"city\":"}}]},"finish_reason":null}]}`+"\n\n")
 			_, _ = io.WriteString(w, `data: {"id":"s1","object":"chat.completion.chunk","created":1700000001,"model":"dspro-high","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Beijing\"}"}}]},"finish_reason":null}]}`+"\n\n")
@@ -597,10 +598,10 @@ func TestBalanceEndpoint(t *testing.T) {
 }
 
 func TestBillingPreflightClientFidelityAndInsufficientBalance(t *testing.T) {
-	upstreamInsufficient := false
+	var upstreamInsufficient atomic.Bool
 	_, gwSrv, st, _, apiKey, capUp := setupTestGatewayEnv(t, true, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if upstreamInsufficient {
+		if upstreamInsufficient.Load() {
 			w.WriteHeader(http.StatusPaymentRequired)
 			_, _ = io.WriteString(w, `{"error":{"code":"insufficient_balance","message":"BILLING_PHOTON_NOT_ENOUGH: photon balance exhausted","type":"insufficient_quota"}}`)
 			return
@@ -694,7 +695,7 @@ func TestBillingPreflightClientFidelityAndInsufficientBalance(t *testing.T) {
 	capUp.mu.Lock()
 	capUp.preflightDenyReason = ""
 	capUp.mu.Unlock()
-	upstreamInsufficient = true
+	upstreamInsufficient.Store(true)
 	req4, _ := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/chat/completions", strings.NewReader(`{
 		"model": "dsflash-high",
 		"stream": false,
@@ -1132,10 +1133,10 @@ func TestWeightedBalanceProbabilisticRoutingAnd7DayStickyBinding(t *testing.T) {
 }
 
 func TestPreFirstByteAutomaticFailoverAndRebind(t *testing.T) {
-	failA := false
+	var failA atomic.Bool
 	_, gwSrv, st, _, apiKey, _ := setupTestGatewayEnv(t, false, func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
-		if failA && auth == "Bearer tok-fail-A" {
+		if failA.Load() && auth == "Bearer tok-fail-A" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusPaymentRequired)
 			_, _ = io.WriteString(w, `{"error":{"code":"insufficient_balance","message":"BILLING_PHOTON_NOT_ENOUGH"}}`)
@@ -1177,7 +1178,7 @@ func TestPreFirstByteAutomaticFailoverAndRebind(t *testing.T) {
 
 	// Now add accB to pool and make accA fail with 402 insufficient_balance -> Turn 2 MUST failover & rebind!
 	_ = st.SetPoolMembership([]string{accA.ID, accB.ID})
-	failA = true
+	failA.Store(true)
 
 	req, _ := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/chat/completions", strings.NewReader(`{
 		"model": "dsflash-high",

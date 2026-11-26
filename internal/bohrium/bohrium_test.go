@@ -283,7 +283,9 @@ func TestRunAllTasksIncludingDesktopClientAndImmediateCancel(t *testing.T) {
 		mu.Unlock()
 	}))
 	defer srv.Close()
+	mu.Lock()
 	srvURL = srv.URL
+	mu.Unlock()
 
 	httpCli, _ := chromehttp.New(chromehttp.Options{})
 	cli := NewClient(httpCli, cfgMgr, st)
@@ -301,31 +303,52 @@ func TestRunAllTasksIncludingDesktopClientAndImmediateCancel(t *testing.T) {
 		t.Fatalf("RunAllWebTasks: %v", err)
 	}
 
-	if deprecatedHit {
+	mu.Lock()
+	gotDeprecatedHit := deprecatedHit
+	gotWebNonChromeUA := webNonChromeUA
+	gotDesktopBrowserLeak := desktopBrowserLeak
+	gotClaimedAll := claimedAll
+	gotChatCalls := chatCalls
+	gotCancelCalls := cancelCalls
+	gotDesktopPreflight := desktopPreflight
+	gotDesktopLLMCalls := desktopLLMCalls
+	gotDesktopModel := desktopModel
+	gotDesktopToolCount := desktopToolCount
+	gotDesktopSystemOK := desktopSystemOK
+	gotDesktopExecOK := desktopExecOK
+	gotDesktopTraceMatch := desktopTraceMatch
+	gotBinaryUploaded := binaryUploaded
+	gotReportedKeys := make(map[string]bool, len(reportedKeys))
+	for k, v := range reportedKeys {
+		gotReportedKeys[k] = v
+	}
+	mu.Unlock()
+
+	if gotDeprecatedHit {
 		t.Fatalf("deprecated /integral_receive endpoint MUST NOT be called")
 	}
-	if webNonChromeUA {
+	if gotWebNonChromeUA {
 		t.Fatalf("every Web task outgoing request must use Chrome User-Agent")
 	}
-	if desktopBrowserLeak {
+	if gotDesktopBrowserLeak {
 		t.Fatalf("desktop client SciX LLM requests must use native transport (x-scix-runtime=scix_local, no browser UA/Sec-CH-UA)")
 	}
-	if !claimedAll {
+	if !gotClaimedAll {
 		t.Fatalf("expected claim-all to run")
 	}
-	if chatCalls != 3 || cancelCalls != 3 {
-		t.Fatalf("expected 3 Web chat calls and 3 immediate cancels, got chat=%d cancel=%d", chatCalls, cancelCalls)
+	if gotChatCalls != 3 || gotCancelCalls != 3 {
+		t.Fatalf("expected 3 Web chat calls and 3 immediate cancels, got chat=%d cancel=%d", gotChatCalls, gotCancelCalls)
 	}
-	if !desktopPreflight || desktopLLMCalls != 1 || desktopModel != "dspro-high" || desktopToolCount != 16 || !desktopSystemOK || !desktopExecOK || !desktopTraceMatch {
+	if !gotDesktopPreflight || gotDesktopLLMCalls != 1 || gotDesktopModel != "dspro-high" || gotDesktopToolCount != 16 || !gotDesktopSystemOK || !gotDesktopExecOK || !gotDesktopTraceMatch {
 		t.Fatalf("desktop client task protocol mismatch: preflight=%v calls=%d model=%q tools=%d sys=%v exec=%v trace=%v",
-			desktopPreflight, desktopLLMCalls, desktopModel, desktopToolCount, desktopSystemOK, desktopExecOK, desktopTraceMatch)
+			gotDesktopPreflight, gotDesktopLLMCalls, gotDesktopModel, gotDesktopToolCount, gotDesktopSystemOK, gotDesktopExecOK, gotDesktopTraceMatch)
 	}
-	if !binaryUploaded {
+	if !gotBinaryUploaded {
 		t.Fatalf("expected PDF binary upload with X-Storage-Param for Task 3")
 	}
 	for _, k := range []string{TaskKeyScienceSpaceWeb, TaskKeyScienceSpaceClient, TaskKeyLiteratureReading, TaskKeyAcademicWriting} {
-		if !reportedKeys[k] {
-			t.Fatalf("expected query-events report for %s, got %+v", k, reportedKeys)
+		if !gotReportedKeys[k] {
+			t.Fatalf("expected query-events report for %s, got %+v", k, gotReportedKeys)
 		}
 	}
 	if !res.AllWebDone {
@@ -613,8 +636,11 @@ func TestWaitForReaderDocumentReadyStatusDrivenPolling(t *testing.T) {
 	if err := cli.waitForReaderDocumentReady(context.Background(), "entry-1", "rev-1"); err != nil {
 		t.Fatalf("expected status polling to recover and succeed, got %v", err)
 	}
-	if postCalls != 2 || getCalls != 4 {
-		t.Fatalf("expected 2 POST + 4 GET status polls, got post=%d get=%d", postCalls, getCalls)
+	mu.Lock()
+	gotPost, gotGet := postCalls, getCalls
+	mu.Unlock()
+	if gotPost != 2 || gotGet != 4 {
+		t.Fatalf("expected 2 POST + 4 GET status polls, got post=%d get=%d", gotPost, gotGet)
 	}
 
 	// Case 2: upstream reports terminal failed status -> abort immediately with detail
@@ -693,7 +719,9 @@ func TestUploadReaderPDFRetryAndMD5Dedup(t *testing.T) {
 		}
 	}))
 	defer ts1.Close()
+	mu.Lock()
 	srvURL = ts1.URL
+	mu.Unlock()
 
 	httpCli, _ := chromehttp.New(chromehttp.Options{Timeout: 5 * time.Second})
 	cli := NewClient(httpCli, cfgMgr, st)
@@ -704,11 +732,16 @@ func TestUploadReaderPDFRetryAndMD5Dedup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected uploadReaderPDF to recover on retry, got %v", err)
 	}
-	if resID != "res-retry-ok" || multipartCalls != 2 || uploadCalls != 2 {
-		t.Fatalf("expected 2 prechecks + 2 uploads -> res-retry-ok, got id=%q mp=%d up=%d", resID, multipartCalls, uploadCalls)
+	mu.Lock()
+	gotMultipartCalls := multipartCalls
+	gotUploadCalls := uploadCalls
+	gotUploadTokens := append([]string(nil), uploadTokens...)
+	mu.Unlock()
+	if resID != "res-retry-ok" || gotMultipartCalls != 2 || gotUploadCalls != 2 {
+		t.Fatalf("expected 2 prechecks + 2 uploads -> res-retry-ok, got id=%q mp=%d up=%d", resID, gotMultipartCalls, gotUploadCalls)
 	}
-	if len(uploadTokens) != 2 || uploadTokens[0] != "Bearer tok-attempt-1" || uploadTokens[1] != "Bearer tok-attempt-2" {
-		t.Fatalf("expected refreshed upload token on retry, got %+v", uploadTokens)
+	if len(gotUploadTokens) != 2 || gotUploadTokens[0] != "Bearer tok-attempt-1" || gotUploadTokens[1] != "Bearer tok-attempt-2" {
+		t.Fatalf("expected refreshed upload token on retry, got %+v", gotUploadTokens)
 	}
 
 	// Case 2: First upload returns 503 after data already landed; retry precheck sees fileExist=true and skips re-upload.
@@ -745,15 +778,20 @@ func TestUploadReaderPDFRetryAndMD5Dedup(t *testing.T) {
 		}
 	}))
 	defer ts2.Close()
+	mu.Lock()
 	url2 = ts2.URL
+	mu.Unlock()
 	cli.SetEndpoints(Endpoints{WWWBase: ts2.URL})
 
 	resID2, err := cli.uploadReaderPDF(context.Background(), "dedup.pdf", []byte("%PDF-1.4 dedup payload"))
 	if err != nil {
 		t.Fatalf("expected MD5 dedup recovery on retry, got %v", err)
 	}
-	if resID2 != "res-dedup-ok" || mp2 != 2 || up2 != 1 {
-		t.Fatalf("expected 2 prechecks + 1 upload (skipped via fileExist=true), got id=%q mp=%d up=%d", resID2, mp2, up2)
+	mu.Lock()
+	gotMP2, gotUP2 := mp2, up2
+	mu.Unlock()
+	if resID2 != "res-dedup-ok" || gotMP2 != 2 || gotUP2 != 1 {
+		t.Fatalf("expected 2 prechecks + 1 upload (skipped via fileExist=true), got id=%q mp=%d up=%d", resID2, gotMP2, gotUP2)
 	}
 
 	// Case 3: Non-retryable 403 fails fast on first attempt.
@@ -784,14 +822,19 @@ func TestUploadReaderPDFRetryAndMD5Dedup(t *testing.T) {
 		}
 	}))
 	defer ts3.Close()
+	mu.Lock()
 	url3 = ts3.URL
+	mu.Unlock()
 	cli.SetEndpoints(Endpoints{WWWBase: ts3.URL})
 
 	if _, err := cli.uploadReaderPDF(context.Background(), "forbidden.pdf", []byte("%PDF-1.4 forbidden")); err == nil {
 		t.Fatalf("expected 403 upload to fail")
 	}
-	if up3 != 1 {
-		t.Fatalf("expected 403 to fail fast with 1 attempt, got %d", up3)
+	mu.Lock()
+	gotUP3 := up3
+	mu.Unlock()
+	if gotUP3 != 1 {
+		t.Fatalf("expected 403 to fail fast with 1 attempt, got %d", gotUP3)
 	}
 }
 

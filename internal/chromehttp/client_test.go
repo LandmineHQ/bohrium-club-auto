@@ -5,18 +5,24 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 func TestChromeHeadersInjected(t *testing.T) {
-	var gotUA, gotSecCH, gotMobile, gotPlatform, gotLang string
+	var (
+		mu                                             sync.Mutex
+		gotUA, gotSecCH, gotMobile, gotPlatform, gotLang string
+	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		gotUA = r.Header.Get("User-Agent")
 		gotSecCH = r.Header.Get("Sec-CH-UA")
 		gotMobile = r.Header.Get("Sec-CH-UA-Mobile")
 		gotPlatform = r.Header.Get("Sec-CH-UA-Platform")
 		gotLang = r.Header.Get("Accept-Language")
+		mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
@@ -30,17 +36,21 @@ func TestChromeHeadersInjected(t *testing.T) {
 		t.Fatalf("DoJSON: %v", err)
 	}
 
-	if strings.Contains(gotUA, "Go-http-client") {
-		t.Fatalf("leaked Go default User-Agent: %q", gotUA)
+	mu.Lock()
+	ua, secCH, mobile, platform, lang := gotUA, gotSecCH, gotMobile, gotPlatform, gotLang
+	mu.Unlock()
+
+	if strings.Contains(ua, "Go-http-client") {
+		t.Fatalf("leaked Go default User-Agent: %q", ua)
 	}
-	if !strings.Contains(gotUA, "Chrome/") || !strings.Contains(gotUA, "Safari/537.36") {
-		t.Fatalf("expected Chrome UA, got %q", gotUA)
+	if !strings.Contains(ua, "Chrome/") || !strings.Contains(ua, "Safari/537.36") {
+		t.Fatalf("expected Chrome UA, got %q", ua)
 	}
-	if !strings.Contains(gotSecCH, "Google Chrome") {
-		t.Fatalf("expected Sec-CH-UA with Google Chrome, got %q", gotSecCH)
+	if !strings.Contains(secCH, "Google Chrome") {
+		t.Fatalf("expected Sec-CH-UA with Google Chrome, got %q", secCH)
 	}
-	if gotMobile != "?0" || gotPlatform != `"Windows"` || gotLang == "" {
-		t.Fatalf("unexpected CH/lang headers: mobile=%q platform=%q lang=%q", gotMobile, gotPlatform, gotLang)
+	if mobile != "?0" || platform != `"Windows"` || lang == "" {
+		t.Fatalf("unexpected CH/lang headers: mobile=%q platform=%q lang=%q", mobile, platform, lang)
 	}
 }
 
@@ -57,10 +67,19 @@ func TestCustomChromeUADerivesSecCH(t *testing.T) {
 }
 
 func TestDoTransferBypassesShortRPCTimeout(t *testing.T) {
-	var gotUA string
+	var (
+		mu  sync.Mutex
+		uas = map[string]string{}
+	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotUA = r.Header.Get("User-Agent")
-		time.Sleep(120 * time.Millisecond)
+		mu.Lock()
+		uas[r.URL.Path] = r.Header.Get("User-Agent")
+		mu.Unlock()
+		select {
+		case <-time.After(120 * time.Millisecond):
+		case <-r.Context().Done():
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("uploaded-ok"))
 	}))
@@ -72,18 +91,21 @@ func TestDoTransferBypassesShortRPCTimeout(t *testing.T) {
 	}
 
 	// Standard DoRaw enforces short RPC Timeout (50ms) -> should fail with timeout
-	if _, err := cli.DoRaw(context.Background(), http.MethodPost, srv.URL, []byte("payload"), nil); err == nil {
+	if _, err := cli.DoRaw(context.Background(), http.MethodPost, srv.URL+"/rpc", []byte("payload"), nil); err == nil {
 		t.Fatalf("expected DoRaw to time out with 50ms RPC timeout")
 	}
 
 	// DoTransfer does not enforce short RPC Timeout -> should succeed and keep Chrome UA
-	resp, err := cli.DoTransfer(context.Background(), http.MethodPost, srv.URL, []byte("payload"), nil)
+	resp, err := cli.DoTransfer(context.Background(), http.MethodPost, srv.URL+"/transfer", []byte("payload"), nil)
 	if err != nil {
 		t.Fatalf("DoTransfer failed unexpectedly: %v", err)
 	}
 	if resp.StatusCode != http.StatusOK || string(resp.Body) != "uploaded-ok" {
 		t.Fatalf("unexpected DoTransfer response: status=%d body=%q", resp.StatusCode, string(resp.Body))
 	}
+	mu.Lock()
+	gotUA := uas["/transfer"]
+	mu.Unlock()
 	if !strings.Contains(gotUA, "Chrome/") {
 		t.Fatalf("expected Chrome UA on DoTransfer, got %q", gotUA)
 	}
