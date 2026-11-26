@@ -89,3 +89,11 @@
 .tabular-nums {
   font-variant-numeric: tabular-nums;
 }
+
+/* Ensure Tencent Cloud Captcha interactive overlay stays clickable while a Radix Dialog is open */
+#tcaptcha_transform_dy,
+#tcaptcha_transform_dy *,
+[id^="tcaptcha"],
+[class*="tcaptcha"] {
+  pointer-events: auto !important;
+}

@@ -23,11 +23,11 @@
 
 ## 方式三：手机 / 邮箱验证码登录
 
-在 **「验证码」** 标签页选择手机号或邮箱，点击 **「获取验证码」** 后输入收到的验证码即可登录（调用 `send_by_phone_v3` / `send_by_email_v3` 与 `/api/account/v2/login/{phone_code,email_code}`）。若触发图形验证码风控，请改用微信扫码或 OAuth 登录。
+在 **「验证码」** 标签页选择手机号或邮箱，点击 **「获取验证码」** 后，后端会调用 `/api/bohrium/captcha/prepare` 获取初始化参数，并在当前浏览器中弹出官方腾讯云人机图形验证（`TJCaptcha.js`）；您手动完成滑块/点选验证后，前端自动将验证票据（`ticket`、`randStr`、`captchaAppId`）随发送请求提交至 `send_by_phone_v3` / `send_by_email_v3`，输入收到的验证码即可登录。
 
 ## 方式四：账号密码登录（支持学术码）
 
-支持手机号、邮箱或学术码（Account ID）+ 密码登录，复现了 `platform.bohrium.com` 的 AES-128-CBC（PKCS7 + 双重 Base64）加密逻辑；仅在 `/api/captcha/check_user` 返回 `skip: true` 时执行，绝不绕过图形验证码。
+支持手机号、邮箱或学术码（Account ID）+ 密码登录，复现了 `platform.bohrium.com` 的 AES-128-CBC（PKCS7 + 双重 Base64）加密逻辑；提交前先通过 `/api/captcha/check_user` 判断是否免验，如需人机验证则自动在页面弹出官方腾讯云图形验证组件供您手动完成验证，再携带验证票据提交 `/api/account/v3/login`。
 
 ## 方式五：导入 `brmToken`
 

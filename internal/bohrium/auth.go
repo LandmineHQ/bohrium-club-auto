@@ -20,7 +20,25 @@ import (
 const (
 	platformAESKey = "pxQ$|2ydTBu<5@+P"
 	platformAESExt = "eyJlbmNyeXB0X3R5cGUiOiJhZXMifQ==" // base64({"encrypt_type":"aes"})
+
+	// DefaultTencentCaptchaAppID matches platform.bohrium.com's production web Tencent Cloud Captcha AppID.
+	DefaultTencentCaptchaAppID int64 = 194611140
 )
+
+// CaptchaPrepareResult provides Tencent Cloud Captcha widget initialization metadata
+// fetched from platform.bohrium.com so the user can manually complete verification in the UI.
+type CaptchaPrepareResult struct {
+	Skip         bool   `json:"skip"`
+	CaptchaAppID string `json:"captchaAppId"`
+	AidEncrypted string `json:"aidEncrypted,omitempty"`
+}
+
+// CaptchaProof carries the user-completed Tencent Cloud Captcha verification ticket and randStr.
+type CaptchaProof struct {
+	Ticket       string `json:"ticket,omitempty"`
+	RandStr      string `json:"randStr,omitempty"`
+	CaptchaAppID int64  `json:"captchaAppId,omitempty"`
+}
 
 // WeChatQRResponse is returned when requesting a remote WeChat Official Account QR code.
 type WeChatQRResponse struct {
@@ -338,9 +356,84 @@ func (c *Client) VerifyOAuthCallback(ctx context.Context, provider, callbackInpu
 	return c.CompleteLogin(ctx, tok, "oauth_"+name)
 }
 
+// PrepareCaptcha fetches Tencent Cloud Captcha widget parameters from platform.bohrium.com
+// so the user can complete interactive human verification in the Web Console.
+// For scene="password", it first queries /api/captcha/check_user and sets Skip=true when exempt.
+func (c *Client) PrepareCaptcha(ctx context.Context, scene, account string) (*CaptchaPrepareResult, error) {
+	headers := map[string]string{
+		"Origin":  c.endpoints.PlatformBase,
+		"Referer": c.endpoints.PlatformBase + "/login",
+	}
+	appIDStr := fmt.Sprintf("%d", DefaultTencentCaptchaAppID)
+
+	if strings.EqualFold(strings.TrimSpace(scene), "password") && strings.TrimSpace(account) != "" {
+		checkResp, err := c.http.DoJSON(ctx, http.MethodPost, c.endpoints.PlatformBase+"/api/captcha/check_user", map[string]any{
+			"account": strings.TrimSpace(account),
+		}, headers)
+		if err == nil && checkResp.StatusCode == http.StatusOK {
+			var checkBody map[string]any
+			if json.Unmarshal(checkResp.Body, &checkBody) == nil && asBool(asMap(checkBody["data"])["skip"]) {
+				return &CaptchaPrepareResult{
+					Skip:         true,
+					CaptchaAppID: appIDStr,
+				}, nil
+			}
+		}
+	}
+
+	resp, err := c.http.DoJSON(ctx, http.MethodPost, c.endpoints.PlatformBase+"/api/captcha/encrypt_appid", map[string]any{
+		"captchaAppId": DefaultTencentCaptchaAppID,
+	}, headers)
+	if err != nil {
+		return nil, fmt.Errorf("获取图形验证码初始化参数失败: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("encrypt_appid HTTP %d: %s", resp.StatusCode, truncateText(string(resp.Body), 180))
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(resp.Body, &parsed); err != nil {
+		return nil, fmt.Errorf("解析 encrypt_appid 响应失败: %w", err)
+	}
+	if codeNum := int(asInt64(parsed["code"])); codeNum != 0 {
+		msg := asString(parsed["msg"])
+		if msg == "" {
+			msg = asString(asMap(parsed["error"])["msg"])
+		}
+		return nil, fmt.Errorf("初始化图形验证码失败 (code=%d): %s", codeNum, nonEmpty(msg, truncateText(string(resp.Body), 160)))
+	}
+	signAppID := asString(asMap(parsed["data"])["signAppIdStr"])
+	if signAppID == "" {
+		return nil, fmt.Errorf("encrypt_appid 响应未包含 signAppIdStr")
+	}
+	return &CaptchaPrepareResult{
+		Skip:         false,
+		CaptchaAppID: appIDStr,
+		AidEncrypted: signAppID,
+	}, nil
+}
+
+func applyCaptchaProof(payload map[string]any, proof *CaptchaProof) bool {
+	if proof == nil {
+		return false
+	}
+	ticket := strings.TrimSpace(proof.Ticket)
+	randStr := strings.TrimSpace(proof.RandStr)
+	if ticket == "" || randStr == "" {
+		return false
+	}
+	appID := proof.CaptchaAppID
+	if appID <= 0 {
+		appID = DefaultTencentCaptchaAppID
+	}
+	payload["ticket"] = ticket
+	payload["randStr"] = randStr
+	payload["captchaAppId"] = appID
+	return true
+}
+
 // SendVerifyCode sends a phone SMS or email OTP verification code via platform.bohrium.com.
-// If upstream requires graphical CAPTCHA, returns an explanatory error without bypassing CAPTCHA.
-func (c *Client) SendVerifyCode(ctx context.Context, kind, target, countryCode string) error {
+// When the user completes Tencent Cloud Captcha in the UI, proof carries (ticket, randStr, captchaAppId).
+func (c *Client) SendVerifyCode(ctx context.Context, kind, target, countryCode string, captcha *CaptchaProof) error {
 	kind = strings.ToLower(strings.TrimSpace(kind))
 	target = strings.TrimSpace(target)
 	if target == "" {
@@ -379,6 +472,7 @@ func (c *Client) SendVerifyCode(ctx context.Context, kind, target, countryCode s
 	default:
 		return fmt.Errorf("不支持的验证码类型: %s（支持 phone / email）", kind)
 	}
+	hasProof := applyCaptchaProof(payload, captcha)
 
 	resp, err := c.http.DoJSON(ctx, http.MethodPost, c.endpoints.PlatformBase+endpoint, payload, headers)
 	if err != nil {
@@ -391,8 +485,8 @@ func (c *Client) SendVerifyCode(ctx context.Context, kind, target, countryCode s
 		if msg == "" {
 			msg = asString(asMap(parsed["error"])["msg"])
 		}
-		if strings.Contains(strings.ToLower(msg+string(resp.Body)), "captcha") || strings.Contains(msg, "验证") {
-			return fmt.Errorf("发送验证码触发了图形验证码限制，请改用「微信扫码」、「Google / 第三方 OAuth」或「导入 brmToken」登录")
+		if !hasProof && (strings.Contains(strings.ToLower(msg+string(resp.Body)), "captcha") || strings.Contains(msg, "验证")) {
+			return fmt.Errorf("发送验证码需要先完成人机图形验证，请在界面中点击「获取验证码」并完成腾讯验证弹窗")
 		}
 		return fmt.Errorf("发送验证码失败 (code=%d): %s", codeNum, nonEmpty(msg, truncateText(string(resp.Body), 140)))
 	}
@@ -484,9 +578,11 @@ func normalizePhone(phone, countryCode string) string {
 	return "+" + cc + p
 }
 
-// LoginWithPassword attempts direct password login ONLY if /api/captcha/check_user explicitly skips CAPTCHA.
-// It never attempts to solve or bypass Tencent Captcha; if CAPTCHA is required, it instructs the user to use WeChat QR or OAuth.
-func (c *Client) LoginWithPassword(ctx context.Context, account, password string) (*store.AuthState, error) {
+// LoginWithPassword logs in via /api/account/v3/login.
+// When captcha proof (ticket + randStr) is provided by the user completing Tencent Cloud Captcha in the UI,
+// it is forwarded directly; otherwise /api/captcha/check_user is consulted and non-exempt accounts are asked
+// to complete interactive verification.
+func (c *Client) LoginWithPassword(ctx context.Context, account, password string, captcha *CaptchaProof) (*store.AuthState, error) {
 	account = strings.TrimSpace(account)
 	if account == "" || password == "" {
 		return nil, fmt.Errorf("account and password are required")
@@ -495,23 +591,26 @@ func (c *Client) LoginWithPassword(ctx context.Context, account, password string
 		"Origin":  c.endpoints.PlatformBase,
 		"Referer": c.endpoints.PlatformBase + "/login",
 	}
-	checkResp, err := c.http.DoJSON(ctx, http.MethodPost, c.endpoints.PlatformBase+"/api/captcha/check_user", map[string]any{
-		"account": account,
-	}, headers)
-	if err != nil {
-		return nil, fmt.Errorf("check captcha requirement: %w", err)
-	}
-	var checkBody map[string]any
-	_ = json.Unmarshal(checkResp.Body, &checkBody)
-	if !asBool(asMap(checkBody["data"])["skip"]) {
-		return nil, fmt.Errorf("该账号登录触发了图形验证码，请使用「微信扫码」、「Google / 第三方 OAuth」或「导入 brmToken」完成远程登录")
+	hasProof := captcha != nil && strings.TrimSpace(captcha.Ticket) != "" && strings.TrimSpace(captcha.RandStr) != ""
+	if !hasProof {
+		checkResp, err := c.http.DoJSON(ctx, http.MethodPost, c.endpoints.PlatformBase+"/api/captcha/check_user", map[string]any{
+			"account": account,
+		}, headers)
+		if err != nil {
+			return nil, fmt.Errorf("check captcha requirement: %w", err)
+		}
+		var checkBody map[string]any
+		_ = json.Unmarshal(checkResp.Body, &checkBody)
+		if !asBool(asMap(checkBody["data"])["skip"]) {
+			return nil, fmt.Errorf("该账号登录需要先完成人机图形验证，请在界面中完成腾讯验证弹窗后重试")
+		}
 	}
 
 	encPW, err := EncryptPlatformPassword(password)
 	if err != nil {
 		return nil, fmt.Errorf("encrypt password: %w", err)
 	}
-	loginResp, err := c.http.DoJSON(ctx, http.MethodPost, c.endpoints.PlatformBase+"/api/account/v3/login", map[string]any{
+	payload := map[string]any{
 		"account":      account,
 		"password":     encPW,
 		"channel":      "web",
@@ -520,7 +619,10 @@ func (c *Client) LoginWithPassword(ctx context.Context, account, password string
 		"ext":          platformAESExt,
 		"businessLine": "bohrium",
 		"refer":        map[string]any{},
-	}, headers)
+	}
+	applyCaptchaProof(payload, captcha)
+
+	loginResp, err := c.http.DoJSON(ctx, http.MethodPost, c.endpoints.PlatformBase+"/api/account/v3/login", payload, headers)
 	if err != nil {
 		return nil, fmt.Errorf("password login request: %w", err)
 	}
@@ -531,9 +633,12 @@ func (c *Client) LoginWithPassword(ctx context.Context, account, password string
 	if int(asInt64(loginBody["code"])) != 0 {
 		msg := asString(loginBody["msg"])
 		if msg == "" {
+			msg = asString(asMap(loginBody["error"])["msg"])
+		}
+		if msg == "" {
 			msg = asString(loginBody["error"])
 		}
-		return nil, fmt.Errorf("登录失败 (code=%d): %s", asInt64(loginBody["code"]), msg)
+		return nil, fmt.Errorf("登录失败 (code=%d): %s", asInt64(loginBody["code"]), nonEmpty(msg, truncateText(string(loginResp.Body), 140)))
 	}
 	token := extractTokenFromResponse(loginResp.Headers, asMap(loginBody["data"]))
 	if token == "" {

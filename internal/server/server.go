@@ -90,6 +90,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/bohrium/wechat/poll", s.requireAdmin(s.handleWeChatPoll))
 	s.mux.HandleFunc("POST /api/bohrium/oauth/url", s.requireAdmin(s.handleOAuthURL))
 	s.mux.HandleFunc("POST /api/bohrium/oauth/verify", s.requireAdmin(s.handleOAuthVerify))
+	s.mux.HandleFunc("POST /api/bohrium/captcha/prepare", s.requireAdmin(s.handlePrepareCaptcha))
 	s.mux.HandleFunc("POST /api/bohrium/code/send", s.requireAdmin(s.handleSendCode))
 	s.mux.HandleFunc("POST /api/bohrium/login/code", s.requireAdmin(s.handleCodeLogin))
 	s.mux.HandleFunc("POST /api/bohrium/login/token", s.requireAdmin(s.handleImportToken))
@@ -445,11 +446,30 @@ func (s *Server) handleOAuthVerify(w http.ResponseWriter, r *http.Request) {
 	s.finalizeLoginResponse(ctx, w, scope)
 }
 
+func (s *Server) handlePrepareCaptcha(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Scene   string `json:"scene"`   // "otp" | "password"
+		Account string `json:"account"` // optional, used by password scene for /api/captcha/check_user
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	res, err := s.mgr.Ephemeral().PrepareCaptcha(ctx, body.Scene, body.Account)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "data": res})
+}
+
 func (s *Server) handleSendCode(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Kind        string `json:"kind"`
-		Target      string `json:"target"`
-		CountryCode string `json:"countryCode"`
+		Kind         string `json:"kind"`
+		Target       string `json:"target"`
+		CountryCode  string `json:"countryCode"`
+		Ticket       string `json:"ticket"`
+		RandStr      string `json:"randStr"`
+		CaptchaAppID int64  `json:"captchaAppId"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "无效请求体"})
@@ -457,7 +477,15 @@ func (s *Server) handleSendCode(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	if err := s.mgr.Ephemeral().SendVerifyCode(ctx, body.Kind, body.Target, body.CountryCode); err != nil {
+	var proof *bohrium.CaptchaProof
+	if strings.TrimSpace(body.Ticket) != "" && strings.TrimSpace(body.RandStr) != "" {
+		proof = &bohrium.CaptchaProof{
+			Ticket:       body.Ticket,
+			RandStr:      body.RandStr,
+			CaptchaAppID: body.CaptchaAppID,
+		}
+	}
+	if err := s.mgr.Ephemeral().SendVerifyCode(ctx, body.Kind, body.Target, body.CountryCode, proof); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
@@ -507,9 +535,12 @@ func (s *Server) handleImportToken(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Account  string `json:"account"`
-		Password string `json:"password"`
-		Label    string `json:"label"`
+		Account      string `json:"account"`
+		Password     string `json:"password"`
+		Label        string `json:"label"`
+		Ticket       string `json:"ticket"`
+		RandStr      string `json:"randStr"`
+		CaptchaAppID int64  `json:"captchaAppId"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "无效请求体"})
@@ -517,8 +548,16 @@ func (s *Server) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
+	var proof *bohrium.CaptchaProof
+	if strings.TrimSpace(body.Ticket) != "" && strings.TrimSpace(body.RandStr) != "" {
+		proof = &bohrium.CaptchaProof{
+			Ticket:       body.Ticket,
+			RandStr:      body.RandStr,
+			CaptchaAppID: body.CaptchaAppID,
+		}
+	}
 	cli, scope := s.mgr.ForLogin(body.Label)
-	if _, err := cli.LoginWithPassword(ctx, body.Account, body.Password); err != nil {
+	if _, err := cli.LoginWithPassword(ctx, body.Account, body.Password, proof); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}

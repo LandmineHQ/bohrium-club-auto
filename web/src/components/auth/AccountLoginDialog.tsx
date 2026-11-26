@@ -3,6 +3,11 @@ import { toast } from "sonner"
 import { ExternalLink, QrCode } from "lucide-react"
 import { apiRequest } from "@/lib/api"
 import {
+  runTencentCaptcha,
+  TencentCaptchaCancelledError,
+  type CaptchaProofResult,
+} from "@/lib/tencentCaptcha"
+import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -62,6 +67,7 @@ export function AccountLoginDialog({
   const [otpTarget, setOtpTarget] = useState("")
   const [otpCode, setOtpCode] = useState("")
   const [otpSending, setOtpSending] = useState(false)
+  const [otpCooldown, setOtpCooldown] = useState(0)
   const [otpSubmitting, setOtpSubmitting] = useState(false)
 
   // Password state
@@ -69,9 +75,48 @@ export function AccountLoginDialog({
   const [pwSecret, setPwSecret] = useState("")
   const [pwBusy, setPwBusy] = useState(false)
 
+  // Interactive Tencent Captcha modal guard (prevents Radix Dialog from blocking pointer events or dismissing)
+  const [captchaOpen, setCaptchaOpen] = useState(false)
+
   // Manual token state
   const [rawToken, setRawToken] = useState("")
   const [tokenBusy, setTokenBusy] = useState(false)
+
+  useEffect(() => {
+    if (otpCooldown <= 0) return
+    const timer = window.setInterval(() => {
+      setOtpCooldown((prev) => (prev <= 1 ? 0 : prev - 1))
+    }, 1000)
+    return () => window.clearInterval(timer)
+  }, [otpCooldown])
+
+  async function acquireCaptchaProof(
+    scene: "otp" | "password",
+    account?: string
+  ): Promise<CaptchaProofResult | null> {
+    const prep = await apiRequest<{
+      data?: { skip?: boolean; captchaAppId?: string; aidEncrypted?: string }
+    }>("/api/bohrium/captcha/prepare", {
+      method: "POST",
+      body: JSON.stringify({ scene, account: account || "" }),
+    })
+    const info = prep.data
+    if (!info || info.skip) {
+      return null
+    }
+    if (!info.captchaAppId || !info.aidEncrypted) {
+      throw new Error("未获取到有效的图形验证码初始化参数")
+    }
+    setCaptchaOpen(true)
+    try {
+      return await runTencentCaptcha({
+        captchaAppId: info.captchaAppId,
+        aidEncrypted: info.aidEncrypted,
+      })
+    } finally {
+      setCaptchaOpen(false)
+    }
+  }
 
   function stopPolling() {
     if (pollTimerRef.current !== null) {
@@ -194,19 +239,29 @@ export function AccountLoginDialog({
       toast.warning(otpKind === "phone" ? "请输入手机号" : "请输入邮箱")
       return
     }
+    if (otpCooldown > 0) return
     setOtpSending(true)
     try {
+      const proof = await acquireCaptchaProof("otp")
       const res = await apiRequest<{ message?: string }>("/api/bohrium/code/send", {
         method: "POST",
         body: JSON.stringify({
           kind: otpKind,
           target: otpTarget.trim(),
           countryCode: otpCountryCode.trim() || "86",
+          ticket: proof?.ticket || "",
+          randStr: proof?.randStr || "",
+          captchaAppId: proof?.captchaAppId || 0,
         }),
       })
+      setOtpCooldown(60)
       toast.success(res.message || "验证码已发送")
     } catch (err) {
-      toast.warning(err instanceof Error ? err.message : "发送验证码失败")
+      if (err instanceof TencentCaptchaCancelledError) {
+        toast.info(err.message)
+      } else {
+        toast.warning(err instanceof Error ? err.message : "发送验证码失败")
+      }
     } finally {
       setOtpSending(false)
     }
@@ -245,18 +300,26 @@ export function AccountLoginDialog({
     }
     setPwBusy(true)
     try {
+      const proof = await acquireCaptchaProof("password", pwAccount.trim())
       const res = await apiRequest<AccountLoginResult>("/api/bohrium/login/password", {
         method: "POST",
         body: JSON.stringify({
           account: pwAccount.trim(),
           password: pwSecret,
           label: label.trim(),
+          ticket: proof?.ticket || "",
+          randStr: proof?.randStr || "",
+          captchaAppId: proof?.captchaAppId || 0,
         }),
       })
       setPwSecret("")
       await finishLogin(res, "密码登录")
     } catch (err) {
-      toast.warning(err instanceof Error ? err.message : "密码登录失败")
+      if (err instanceof TencentCaptchaCancelledError) {
+        toast.info(err.message)
+      } else {
+        toast.warning(err instanceof Error ? err.message : "密码登录失败")
+      }
     } finally {
       setPwBusy(false)
     }
@@ -283,8 +346,24 @@ export function AccountLoginDialog({
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
+    <Dialog
+      open={open}
+      modal={!captchaOpen}
+      onOpenChange={(next) => {
+        if (!captchaOpen) onOpenChange(next)
+      }}
+    >
+      <DialogContent
+        onInteractOutside={(e) => {
+          if (captchaOpen) e.preventDefault()
+        }}
+        onPointerDownOutside={(e) => {
+          if (captchaOpen) e.preventDefault()
+        }}
+        onEscapeKeyDown={(e) => {
+          if (captchaOpen) e.preventDefault()
+        }}
+      >
         <DialogHeader>
           <DialogTitle>添加 / 登录玻尔账号</DialogTitle>
           <DialogDescription>
@@ -391,7 +470,7 @@ export function AccountLoginDialog({
 
           <TabsContent value="otp" className="space-y-3">
             <p className="text-xs text-muted-foreground">
-              支持手机号短信验证码或邮箱验证码登录（若触发图形验证码风控，请改用微信扫码或 OAuth）。
+              支持手机号短信验证码或邮箱验证码登录；点击「获取验证码」后将弹出官方腾讯云人机图形验证，请手动完成滑块/点选验证。
             </p>
             <div className="flex items-center gap-4 text-xs">
               <label className="flex items-center gap-1.5 cursor-pointer">
@@ -433,8 +512,18 @@ export function AccountLoginDialog({
                   onChange={(e) => setOtpTarget(e.target.value)}
                   placeholder={otpKind === "phone" ? "13800138000" : "name@example.com"}
                 />
-                <Button variant="outline" size="sm" onClick={sendOTP} disabled={otpSending}>
-                  {otpSending ? "发送中..." : "获取验证码"}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={sendOTP}
+                  disabled={otpSending || otpCooldown > 0}
+                  className="shrink-0 tabular-nums"
+                >
+                  {otpSending
+                    ? "验证中..."
+                    : otpCooldown > 0
+                      ? `${otpCooldown}s 后重发`
+                      : "获取验证码"}
                 </Button>
               </div>
             </div>
@@ -456,7 +545,7 @@ export function AccountLoginDialog({
 
           <TabsContent value="password" className="space-y-3">
             <p className="text-xs text-muted-foreground">
-              支持手机号 / 邮箱 / 学术码（Account ID）+ 密码登录；仅当账号未触发图形验证码时可用。
+              支持手机号 / 邮箱 / 学术码（Account ID）+ 密码登录；若触发安全风控，将自动弹出官方腾讯云人机图形验证供您手动验证。
             </p>
             <div className="space-y-1.5">
               <Label htmlFor="pw-account">手机号 / 邮箱 / 学术码</Label>
@@ -479,7 +568,7 @@ export function AccountLoginDialog({
             </div>
             <div className="flex justify-end">
               <Button onClick={submitPassword} disabled={pwBusy}>
-                尝试密码登录
+                {pwBusy ? "验证登录中..." : "密码登录"}
               </Button>
             </div>
           </TabsContent>

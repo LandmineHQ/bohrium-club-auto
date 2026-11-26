@@ -794,3 +794,114 @@ func TestUploadReaderPDFRetryAndMD5Dedup(t *testing.T) {
 		t.Fatalf("expected 403 to fail fast with 1 attempt, got %d", up3)
 	}
 }
+
+func TestPrepareCaptchaAndLoginWithProof(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("BOHRIUM_DATA_DIR", tmp)
+	cfgMgr, _ := config.Load()
+	st, _ := store.Open(tmp)
+	t.Cleanup(func() { _ = st.Close() })
+	tok := makeTestJWT(901, 902, time.Now().Add(24*time.Hour))
+
+	var (
+		mu              sync.Mutex
+		skipUser        bool
+		lastSendPayload map[string]any
+		lastPwPayload   map[string]any
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/captcha/check_user":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 0,
+				"data": map[string]any{"skip": skipUser},
+			})
+		case "/api/captcha/encrypt_appid":
+			var b map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			if int64(asInt64(b["captchaAppId"])) != DefaultTencentCaptchaAppID {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_, _ = w.Write([]byte(`{"code":0,"data":{"signAppIdStr":"enc-aid-xyz"}}`))
+		case "/api/account/code/send_by_phone_v3", "/api/account/code/send_by_email_v3":
+			var b map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			lastSendPayload = b
+			_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
+		case "/api/account/v3/login":
+			var b map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			lastPwPayload = b
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 0,
+				"data": map[string]any{"token": tok},
+			})
+		case "/bohrapi/v1/account/info":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"userId":901,"orgId":902,"name":"CaptchaUser"}}`))
+		case "/api/platform/session":
+			_, _ = w.Write([]byte(`{"logged_in":true,"binding":{"nickname":"CaptchaUser"}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	httpCli, _ := chromehttp.New(chromehttp.Options{})
+	cli := NewClient(httpCli, cfgMgr, st)
+	cli.SetEndpoints(Endpoints{ClubBase: srv.URL, PlatformBase: srv.URL, WWWBase: srv.URL})
+
+	// 1. PrepareCaptcha for password when account is NOT exempt -> returns encrypted AppID
+	prep, err := cli.PrepareCaptcha(context.Background(), "password", "user@example.com")
+	if err != nil {
+		t.Fatalf("PrepareCaptcha(password, !skip): %v", err)
+	}
+	if prep.Skip || prep.CaptchaAppID != "194611140" || prep.AidEncrypted != "enc-aid-xyz" {
+		t.Fatalf("unexpected PrepareCaptcha result: %+v", prep)
+	}
+
+	// 2. PrepareCaptcha for password when account IS exempt -> skip=true
+	mu.Lock()
+	skipUser = true
+	mu.Unlock()
+	prepSkip, err := cli.PrepareCaptcha(context.Background(), "password", "exempt@example.com")
+	if err != nil || !prepSkip.Skip {
+		t.Fatalf("expected skip=true for exempt account, got %+v err=%v", prepSkip, err)
+	}
+
+	// 3. SendVerifyCode forwards user-completed Tencent Captcha proof
+	proof := &CaptchaProof{Ticket: "t03-user-ticket", RandStr: "@ab12", CaptchaAppID: DefaultTencentCaptchaAppID}
+	if err := cli.SendVerifyCode(context.Background(), "phone", "13800138000", "86", proof); err != nil {
+		t.Fatalf("SendVerifyCode(phone): %v", err)
+	}
+	mu.Lock()
+	gotSend := lastSendPayload
+	mu.Unlock()
+	if asString(gotSend["ticket"]) != "t03-user-ticket" || asString(gotSend["randStr"]) != "@ab12" || asInt64(gotSend["captchaAppId"]) != DefaultTencentCaptchaAppID {
+		t.Fatalf("SendVerifyCode did not forward captcha proof: %+v", gotSend)
+	}
+
+	// 4. LoginWithPassword with proof bypasses check_user rejection and forwards proof to /v3/login
+	mu.Lock()
+	skipUser = false
+	mu.Unlock()
+	if _, err := cli.LoginWithPassword(context.Background(), "user@example.com", "secret123", nil); err == nil {
+		t.Fatalf("expected password login without proof to fail when check_user skip=false")
+	}
+	auth, err := cli.LoginWithPassword(context.Background(), "user@example.com", "secret123", proof)
+	if err != nil {
+		t.Fatalf("LoginWithPassword with proof: %v", err)
+	}
+	if auth.UserID != 901 || auth.Nickname != "CaptchaUser" {
+		t.Fatalf("unexpected auth state: %+v", auth)
+	}
+	mu.Lock()
+	gotPw := lastPwPayload
+	mu.Unlock()
+	if asString(gotPw["ticket"]) != "t03-user-ticket" || asString(gotPw["randStr"]) != "@ab12" || asInt64(gotPw["captchaAppId"]) != DefaultTencentCaptchaAppID {
+		t.Fatalf("LoginWithPassword did not forward captcha proof: %+v", gotPw)
+	}
+}

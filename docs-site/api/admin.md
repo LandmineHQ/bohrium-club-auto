@@ -29,10 +29,11 @@
 | <span class="api-method get">GET</span> | `/api/bohrium/wechat/poll?sceneId=...&label=...` | 管理员 | 轮询扫码结果，登录成功后入库（默认不入池）并绑定社区 |
 | <span class="api-method post">POST</span> | `/api/bohrium/oauth/url` | 管理员 | 获取官方第三方 OAuth 授权 URL（Body: `{"provider":"google|apple|carsi|feishu|pku"}`） |
 | <span class="api-method post">POST</span> | `/api/bohrium/oauth/verify` | 管理员 | 提交回调 URL 或 `code` 完成第三方 OAuth 换票登录（可选 `label`） |
-| <span class="api-method post">POST</span> | `/api/bohrium/code/send` | 管理员 | 发送手机/邮箱验证码（Body: `{"kind":"phone|email","target":"...","countryCode":"86"}`） |
+| <span class="api-method post">POST</span> | `/api/bohrium/captcha/prepare` | 管理员 | 获取腾讯图形验证码初始化参数（Body: `{"scene":"otp|password","account":"..."}`），返回 `skip`、`captchaAppId` 与 `aidEncrypted` 供浏览器端唤起官方人机验证 |
+| <span class="api-method post">POST</span> | `/api/bohrium/code/send` | 管理员 | 发送手机/邮箱验证码（Body: `{"kind":"phone|email","target":"...","countryCode":"86","ticket":"...","randStr":"...","captchaAppId":194611140}`） |
 | <span class="api-method post">POST</span> | `/api/bohrium/login/code` | 管理员 | 使用手机/邮箱验证码登录（可选 `label`） |
 | <span class="api-method post">POST</span> | `/api/bohrium/login/token` | 管理员 | 手动导入 `brmToken`（Body: `{"token":"...","label":"..."}`） |
-| <span class="api-method post">POST</span> | `/api/bohrium/login/password` | 管理员 | 无图形验证码时的密码登录（Body: `{"account":"...","password":"...","label":"..."}`） |
+| <span class="api-method post">POST</span> | `/api/bohrium/login/password` | 管理员 | 账号密码登录（Body: `{"account":"...","password":"...","label":"...","ticket":"...","randStr":"...","captchaAppId":194611140}`） |
 | <span class="api-method post">POST</span> | `/api/bohrium/refresh-token` | 管理员 | 手动触发指定或全部账号的 JWT 续期 |
 | <span class="api-method post">POST</span> | `/api/bohrium/logout` | 管理员 | 删除指定账号（`{"accountId":"..."}`）或首个账号凭据 |
 

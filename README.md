@@ -158,8 +158,9 @@ docs-site/               VitePress 文档工程
 | `POST` | `/api/accounts/{id}/tasks/{claim-all,claim,run,run-all}` | 领取或执行指定账号的每日任务 |
 | `POST` | `/api/bohrium/wechat/qr` & `GET /api/bohrium/wechat/poll` | 微信二维码登录与轮询 |
 | `POST` | `/api/bohrium/oauth/url` & `oauth/verify` | 第三方 OAuth 登录 |
-| `POST` | `/api/bohrium/code/send` & `login/code` | 手机/邮箱验证码登录 |
-| `POST` | `/api/bohrium/login/password` & `login/token` | 密码登录或导入 `brmToken` |
+| `POST` | `/api/bohrium/captcha/prepare` | 获取登录图形验证码初始化参数（供控制台弹出官方腾讯云人机验证组件） |
+| `POST` | `/api/bohrium/code/send` & `login/code` | 手机/邮箱验证码登录（支持传入人工验证票据） |
+| `POST` | `/api/bohrium/login/password` & `login/token` | 密码登录（支持传入人工验证票据）或导入 `brmToken` |
 | `GET` / `PUT` | `/api/settings` | 读取与更新调度及运行参数 |
 | `GET` | `/api/logs` | 查询 SQLite 执行日志（支持 `accountId`、`limit`） |
 | `GET` / `POST` | `/api/recon/{status,pull,diff}` | 前端快照状态、拉取基线与漂移检测 |
