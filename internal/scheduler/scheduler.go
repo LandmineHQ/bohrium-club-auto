@@ -78,8 +78,13 @@ type Scheduler struct {
 
 	checkinGate chan struct{} // serializes scheduled Web check-ins across accounts to avoid burst spikes
 
-	accLockMu sync.Mutex
-	accLocks  map[string]*sync.Mutex
+	accLockMu   sync.Mutex
+	accLocks    map[string]*sync.Mutex
+	allManualMu sync.Mutex
+
+	jobsMu   sync.RWMutex
+	jobs     map[string]*TaskJob
+	jobOrder []string
 
 	stateMu         sync.RWMutex
 	running         bool
@@ -87,9 +92,9 @@ type Scheduler struct {
 	activeAccountID string
 	runningAccounts map[string]bool
 
-	maintMu             sync.Mutex
-	lastPurgeAt         time.Time
-	lastBalanceSyncAt   time.Time
+	maintMu              sync.Mutex
+	lastPurgeAt          time.Time
+	lastBalanceSyncAt    time.Time
 	nextAllowedCheckinAt time.Time
 
 	stopCh chan struct{}
@@ -104,6 +109,7 @@ func New(mgr *bohrium.Manager, cfg *config.Manager, st *store.Store) *Scheduler 
 		store:           st,
 		checkinGate:     make(chan struct{}, 1),
 		accLocks:        make(map[string]*sync.Mutex),
+		jobs:            make(map[string]*TaskJob),
 		runningAccounts: make(map[string]bool),
 		stopCh:          make(chan struct{}),
 		doneCh:          make(chan struct{}),

@@ -100,6 +100,8 @@ func (s *Server) routes() {
 
 	// Backward-compatible task/asset endpoints (accept ?accountId=... or body.accountId, defaulting to first account)
 	s.mux.HandleFunc("GET /api/tasks", s.requireAdmin(s.handleGetTasks))
+	s.mux.HandleFunc("GET /api/tasks/jobs", s.requireAdmin(s.handleListTaskJobs))
+	s.mux.HandleFunc("GET /api/tasks/jobs/{id}", s.requireAdmin(s.handleGetTaskJob))
 	s.mux.HandleFunc("POST /api/tasks/claim-all", s.requireAdmin(s.handleAccountClaimAll))
 	s.mux.HandleFunc("POST /api/tasks/claim", s.requireAdmin(s.handleAccountClaimOne))
 	s.mux.HandleFunc("POST /api/tasks/run", s.requireAdmin(s.handleAccountRunOne))
@@ -333,6 +335,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 		"assets":            assetsResp,
 		"assetsError":       assetsErr,
 		"scheduler":         s.scheduler.Status(),
+		"activeJobs":        s.scheduler.ActiveTaskJobs(),
 		"promptStats":       prompts.GetStats(),
 		"pdfStats": map[string]int{
 			"cached": cachedPDFs,

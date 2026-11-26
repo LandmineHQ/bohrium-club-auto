@@ -170,6 +170,42 @@ export interface RunLogItem {
   }
 }
 
+export interface TaskJob {
+  id: string
+  kind: "single_task" | "account_all" | "all_accounts" | string
+  accountId?: string
+  accountName?: string
+  taskKey?: string
+  status: "running" | "completed" | "failed" | string
+  message?: string
+  error?: string
+  startedAt: string
+  completedAt?: string
+  durationMs: number
+  singleResult?: {
+    success?: boolean
+    skipped?: boolean
+    message?: string
+    taskTitle?: string
+  }
+  accountResult?: {
+    summary?: string
+    allWebDone?: boolean
+    results?: Array<{
+      success: boolean
+      skipped?: boolean
+      taskTitle?: string
+      message?: string
+    }>
+  }
+  allResults?: Array<{
+    accountId: string
+    displayName: string
+    success: boolean
+    error?: string
+  }>
+}
+
 export interface OverviewResponse {
   ok: boolean
   version: string
@@ -182,6 +218,7 @@ export interface OverviewResponse {
   assets?: PointsAndCapacity | null
   assetsError?: string
   scheduler: SchedulerStatus
+  activeJobs?: TaskJob[]
   promptStats: PromptStats
   pdfStats: { cached: number; custom: number }
   reconDir: string

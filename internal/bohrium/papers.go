@@ -15,25 +15,35 @@ import (
 	"bohrium-club-auto/internal/prompts"
 )
 
+const (
+	minCachedPDFPool      = 3
+	cachedPDFReusePercent = 80
+	arxivDownloadTimeout  = 35 * time.Second
+)
+
 // SelectedPDF holds the binary payload and metadata for Task 3 (Literature Reading).
 type SelectedPDF struct {
 	Filename string
 	Title    string
 	PaperID  string
-	Source   string // "custom_local" | "cache" | "arxiv_download" | "synthetic_fallback"
+	Source   string // "custom_local" | "cache" | "cache_fallback" | "arxiv_download" | "synthetic_fallback"
 	Data     []byte
 }
 
 // AcquireRandomPaperPDF selects a random scientific PDF for Task 3:
 // 1. If user placed custom .pdf files in data/custom_pdfs/, randomly includes them.
-// 2. Otherwise picks randomly from the embedded 100-paper arXiv catalog, reading from data/pdfs/ cache
-//    or downloading via Chrome HTTP client (with mirror fallback and up to 5 catalog retries).
-// 3. Only if all external downloads fail (e.g., offline environment), generates a minimal valid PDF.
+// 2. When >= minCachedPDFPool valid cached PDFs exist, reuses the local PDF cache ~80% of the time
+//    to avoid redundant slow cross-border arXiv downloads during interactive/scheduled runs.
+// 3. Otherwise picks randomly from the embedded 100-paper arXiv catalog, reading from data/pdfs/ cache
+//    or downloading via Chrome HTTP client (with mirror fallback and up to 6 catalog retries).
+// 4. Only if all external downloads and cache fallbacks fail (and ctx is still active), generates a minimal valid PDF.
 func (c *Client) AcquireRandomPaperPDF(ctx context.Context) (*SelectedPDF, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	cfg := c.cfg.Get()
 
-	// Check optional user-supplied local PDFs first (if any exist, 30% chance or primary if desired;
-	// if user puts PDFs in custom_pdfs, pick randomly among them).
+	// Check optional user-supplied local PDFs first.
 	if customPDFs := listLocalPDFs(cfg.LocalPDFDir, cfg.MaxPDFSizeBytes); len(customPDFs) > 0 {
 		idx := secureRandInt(len(customPDFs))
 		p := customPDFs[idx]
@@ -54,6 +64,18 @@ func (c *Client) AcquireRandomPaperPDF(ctx context.Context) (*SelectedPDF, error
 		return nil, err
 	}
 
+	paperByFilename := make(map[string]prompts.Paper, len(shuffled))
+	for _, p := range shuffled {
+		paperByFilename[p.Filename] = p
+	}
+
+	cachedFiles := listLocalPDFs(cfg.PDFCacheDir, cfg.MaxPDFSizeBytes)
+	if len(cachedFiles) >= minCachedPDFPool && secureRandInt(100) < cachedPDFReusePercent {
+		if picked := loadCachedPaperPDF(cachedFiles, paperByFilename, "cache"); picked != nil {
+			return picked, nil
+		}
+	}
+
 	// Try up to 6 distinct random papers from our 100-paper catalog.
 	maxAttempts := 6
 	if len(shuffled) < maxAttempts {
@@ -61,6 +83,9 @@ func (c *Client) AcquireRandomPaperPDF(ctx context.Context) (*SelectedPDF, error
 	}
 	var lastErr error
 	for i := 0; i < maxAttempts; i++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		paper := shuffled[i]
 		cachePath := filepath.Join(cfg.PDFCacheDir, paper.Filename)
 
@@ -81,13 +106,19 @@ func (c *Client) AcquireRandomPaperPDF(ctx context.Context) (*SelectedPDF, error
 			urls = append(urls, paper.MirrorPDFURL)
 		}
 		for _, dlURL := range urls {
-			dlCtx, dlCancel := context.WithTimeout(ctx, 5*time.Minute)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			dlCtx, dlCancel := context.WithTimeout(ctx, arxivDownloadTimeout)
 			resp, dlErr := c.http.DoTransfer(dlCtx, http.MethodGet, dlURL, nil, map[string]string{
 				"Accept":  "application/pdf,*/*;q=0.8",
 				"Referer": "https://arxiv.org/abs/" + paper.ID,
 			})
 			dlCancel()
 			if dlErr != nil {
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
 				lastErr = dlErr
 				continue
 			}
@@ -118,6 +149,15 @@ func (c *Client) AcquireRandomPaperPDF(ctx context.Context) (*SelectedPDF, error
 		}
 	}
 
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if len(cachedFiles) > 0 {
+		if picked := loadCachedPaperPDF(cachedFiles, paperByFilename, "cache_fallback"); picked != nil {
+			return picked, nil
+		}
+	}
+
 	// Offline/air-gapped fallback: construct a valid minimal PDF based on a catalog paper's title & abstract.
 	paper := shuffled[0]
 	fallbackData := buildMinimalScientificPDF(paper)
@@ -128,6 +168,38 @@ func (c *Client) AcquireRandomPaperPDF(ctx context.Context) (*SelectedPDF, error
 		Source:   fmt.Sprintf("synthetic_fallback (%v)", lastErr),
 		Data:     fallbackData,
 	}, nil
+}
+
+func loadCachedPaperPDF(files []string, byFilename map[string]prompts.Paper, source string) *SelectedPDF {
+	if len(files) == 0 {
+		return nil
+	}
+	start := secureRandInt(len(files))
+	for i := 0; i < len(files); i++ {
+		p := files[(start+i)%len(files)]
+		data, err := os.ReadFile(p)
+		if err != nil || !isValidPDF(data) {
+			continue
+		}
+		name := filepath.Base(p)
+		if meta, ok := byFilename[name]; ok {
+			return &SelectedPDF{
+				Filename: name,
+				Title:    meta.Title,
+				PaperID:  meta.ID,
+				Source:   source,
+				Data:     data,
+			}
+		}
+		return &SelectedPDF{
+			Filename: name,
+			Title:    strings.TrimSuffix(name, filepath.Ext(name)),
+			PaperID:  "cache:" + name,
+			Source:   source,
+			Data:     data,
+		}
+	}
+	return nil
 }
 
 // CountCachedPDFs returns counts of cached arXiv PDFs and user custom PDFs.

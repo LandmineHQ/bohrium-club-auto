@@ -17,6 +17,7 @@ import (
 
 	"bohrium-club-auto/internal/chromehttp"
 	"bohrium-club-auto/internal/config"
+	"bohrium-club-auto/internal/prompts"
 	"bohrium-club-auto/internal/store"
 )
 
@@ -962,5 +963,49 @@ func TestPrepareCaptchaAndLoginWithProof(t *testing.T) {
 	mu.Unlock()
 	if asString(gotPw["ticket"]) != "t03-user-ticket" || asString(gotPw["randStr"]) != "@ab12" || asInt64(gotPw["captchaAppId"]) != DefaultTencentCaptchaAppID {
 		t.Fatalf("LoginWithPassword did not forward captcha proof: %+v", gotPw)
+	}
+}
+
+func TestAcquireRandomPaperPDFCacheReuseAndContextCancel(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("BOHRIUM_DATA_DIR", tmp)
+	cfgMgr, _ := config.Load()
+	st, _ := store.Open(tmp)
+	t.Cleanup(func() { _ = st.Close() })
+
+	// Seed >= minCachedPDFPool (3) valid PDFs in PDFCacheDir (filenames outside catalog or arbitrary valid PDFs).
+	pdfDir := cfgMgr.Get().PDFCacheDir
+	sample := buildMinimalScientificPDF(prompts.Paper{
+		ID: "2611.99999", Title: "Cached Study", Category: "cs.CL", Filename: "arxiv_cached.pdf", AbstractSnippet: "Cached",
+	})
+	for _, name := range []string{"cached_a.pdf", "cached_b.pdf", "cached_c.pdf"} {
+		if err := os.WriteFile(filepath.Join(pdfDir, name), sample, 0o644); err != nil {
+			t.Fatalf("write cached pdf %s: %v", name, err)
+		}
+	}
+
+	httpCli, _ := chromehttp.New(chromehttp.Options{Timeout: 2 * time.Second})
+	cli := NewClient(httpCli, cfgMgr, st)
+
+	// 1. Canceled context must return ctx.Err() immediately without hitting synthetic_fallback.
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := cli.AcquireRandomPaperPDF(cancelCtx); err != context.Canceled {
+		t.Fatalf("expected context.Canceled from canceled AcquireRandomPaperPDF, got %v", err)
+	}
+
+	// 2. When 3 valid cached PDFs exist, reuse hits cache cleanly over repeated draws without slow network.
+	cacheHits := 0
+	for i := 0; i < 15; i++ {
+		if c := listLocalPDFs(pdfDir, cfgMgr.Get().MaxPDFSizeBytes); len(c) < 3 {
+			t.Fatalf("expected 3 cached pdfs, got %d", len(c))
+		}
+		picked := loadCachedPaperPDF(listLocalPDFs(pdfDir, cfgMgr.Get().MaxPDFSizeBytes), nil, "cache")
+		if picked != nil && picked.Source == "cache" && isValidPDF(picked.Data) {
+			cacheHits++
+		}
+	}
+	if cacheHits != 15 {
+		t.Fatalf("expected loadCachedPaperPDF to return valid cached PDFs consistently, got %d/15", cacheHits)
 	}
 }

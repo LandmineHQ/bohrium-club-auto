@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"bohrium-club-auto/internal/bohrium"
@@ -19,8 +20,9 @@ import (
 )
 
 const (
-	maxRequestBodyBytes = 32 * 1024 * 1024 // 32 MiB to accommodate multimodal base64 images
-	maxFailoverAttempts = 3
+	maxRequestBodyBytes       = 32 * 1024 * 1024 // 32 MiB to accommodate multimodal base64 images
+	maxFailoverAttempts       = 3
+	statusClientClosedRequest = 499 // Nginx / OpenResty convention for caller/CDN disconnects
 )
 
 type ctxKey string
@@ -72,20 +74,39 @@ func apiKeyIdentityFromCtx(ctx context.Context) (string, string) {
 // Gateway exposes full OpenAI-compatible /v1/models, /v1/balance, /v1/chat/completions, and /v1/responses endpoints
 // backed by a multi-account weighted-balance routing pool over Bohrium desktop client's native Sigma LLM protocol.
 type Gateway struct {
-	cfg     *config.Manager
-	mgr     *bohrium.Manager
-	router  *PoolRouter
-	respDir *ResponseStore
+	cfg            *config.Manager
+	mgr            *bohrium.Manager
+	router         *PoolRouter
+	respDir        *ResponseStore
+	keepaliveNanos atomic.Int64
 }
 
 // NewGateway constructs a multi-account OpenAI-compatible Bohrium gateway.
 func NewGateway(cfg *config.Manager, mgr *bohrium.Manager) *Gateway {
-	return &Gateway{
+	gw := &Gateway{
 		cfg:     cfg,
 		mgr:     mgr,
 		router:  NewPoolRouter(mgr),
 		respDir: OpenResponseStore(mgr.Store()),
 	}
+	gw.keepaliveNanos.Store(int64(defaultKeepaliveInterval))
+	return gw
+}
+
+// SetKeepaliveInterval overrides the periodic SSE / non-stream keepalive interval (used in tests).
+func (g *Gateway) SetKeepaliveInterval(d time.Duration) {
+	g.keepaliveNanos.Store(int64(d))
+}
+
+func (g *Gateway) keepaliveInterval() time.Duration {
+	return time.Duration(g.keepaliveNanos.Load())
+}
+
+func classifyStreamErrorStatus(ctx context.Context) int {
+	if ctx != nil && ctx.Err() != nil {
+		return statusClientClosedRequest
+	}
+	return http.StatusBadGateway
 }
 
 // Router returns the underlying multi-account PoolRouter.
@@ -747,6 +768,10 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 		model, _, mErr := g.resolveEnabledModel(ctx, decision.Client, req.Model)
 		if mErr != nil {
+			if ctx.Err() != nil {
+				g.recordFailure(ctx, "/v1/chat/completions", "", req.Model, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, statusClientClosedRequest, start, ctx.Err().Error(), tel)
+				return
+			}
 			var disErr *modelDisabledError
 			if errors.As(mErr, &disErr) {
 				WriteError(w, http.StatusForbidden, "invalid_request_error", "model_disabled", disErr.Error())
@@ -780,6 +805,10 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 		if !isToolCont {
 			if status, errType, code, reason, ok := g.runPreflightIfEnabled(ctx, decision.Client, model.ID, traceparent); !ok {
+				if ctx.Err() != nil {
+					g.recordFailure(ctx, "/v1/chat/completions", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, statusClientClosedRequest, start, ctx.Err().Error(), tel)
+					return
+				}
 				if status == http.StatusPaymentRequired && explicitAcc == "" {
 					g.markAccountInsufficient(decision.Account.ID, reason)
 					excluded[decision.Account.ID] = true
@@ -836,8 +865,11 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 		upResp, err := decision.Client.DoSciXLLM(ctx, subPath, payloadBytes, true, execHdr, traceparent)
 		if err != nil {
-			WriteError(w, http.StatusBadGateway, "upstream_error", "upstream_transport_error", err.Error())
-			g.recordFailure(ctx, "/v1/chat/completions", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, http.StatusBadGateway, start, err.Error(), tel)
+			status := classifyStreamErrorStatus(ctx)
+			if ctx.Err() == nil {
+				WriteError(w, http.StatusBadGateway, "upstream_error", "upstream_transport_error", err.Error())
+			}
+			g.recordFailure(ctx, "/v1/chat/completions", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, status, start, err.Error(), tel)
 			return
 		}
 		tel.RequestID = extractUpstreamRequestID(upResp)
@@ -887,12 +919,14 @@ func (g *Gateway) finishChatFromChatUpstream(ctx context.Context, w http.Respons
 	keyID, keyName := apiKeyIdentityFromCtx(ctx)
 	ttft := newTTFTTracker(upResp.Body, isSSEContentType(upResp) || req.Stream)
 	if req.Stream {
-		usage, sErr := PipeChatSSE(w, ttft)
+		usage, sErr := pipeChatSSE(ctx, w, ttft, g.keepaliveInterval())
+		status := http.StatusOK
 		errStr := ""
 		if sErr != nil {
 			errStr = sErr.Error()
+			status = classifyStreamErrorStatus(ctx)
 		}
-		g.respDir.RecordRequest(buildLogEntry(keyID, keyName, "/v1/chat/completions", "chat_completions", model.ID, decision, true, http.StatusOK, start, ttft.FirstTokenMs(start), usage, errStr, tel))
+		g.respDir.RecordRequest(buildLogEntry(keyID, keyName, "/v1/chat/completions", "chat_completions", model.ID, decision, true, status, start, ttft.FirstTokenMs(start), usage, errStr, tel))
 		return
 	}
 
@@ -901,29 +935,45 @@ func (g *Gateway) finishChatFromChatUpstream(ctx context.Context, w http.Respons
 		err    error
 	)
 	if isSSEContentType(upResp) {
+		stopKA := beginNonStreamJSONKeepalive(ctx, w, g.keepaliveInterval())
 		parsed, err = AggregateChatSSE(ttft, model.ID)
+		stopKA()
 		if err != nil {
-			WriteError(w, http.StatusBadGateway, "upstream_error", "stream_aggregate_error", err.Error())
-			g.recordFailure(ctx, "/v1/chat/completions", "chat_completions", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, http.StatusBadGateway, start, err.Error(), tel)
+			status := classifyStreamErrorStatus(ctx)
+			if ctx.Err() == nil {
+				writeCommittedJSONError(w, "upstream_error", "stream_aggregate_error", err.Error())
+			}
+			g.recordFailure(ctx, "/v1/chat/completions", "chat_completions", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, status, start, err.Error(), tel)
 			return
 		}
-	} else {
-		rawResp, rErr := io.ReadAll(io.LimitReader(ttft, 32*1024*1024))
-		if rErr != nil {
-			WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", rErr.Error())
-			g.recordFailure(ctx, "/v1/chat/completions", "chat_completions", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, http.StatusBadGateway, start, rErr.Error(), tel)
-			return
+		var usage UsageMetrics
+		if parsed != nil && parsed.Usage != nil {
+			usage = usageFromChat(parsed.Usage)
 		}
-		var direct ChatCompletionResponse
-		if json.Unmarshal(rawResp, &direct) != nil {
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			w.Header().Set("Cache-Control", "no-store")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(rawResp)
-			return
-		}
-		parsed = &direct
+		_ = json.NewEncoder(w).Encode(parsed)
+		flushWriter(w)
+		g.respDir.RecordRequest(buildLogEntry(keyID, keyName, "/v1/chat/completions", "chat_completions", model.ID, decision, false, http.StatusOK, start, ttft.FirstTokenMs(start), usage, "", tel))
+		return
 	}
+
+	rawResp, rErr := io.ReadAll(io.LimitReader(ttft, 32*1024*1024))
+	if rErr != nil {
+		status := classifyStreamErrorStatus(ctx)
+		if ctx.Err() == nil {
+			WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", rErr.Error())
+		}
+		g.recordFailure(ctx, "/v1/chat/completions", "chat_completions", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, status, start, rErr.Error(), tel)
+		return
+	}
+	var direct ChatCompletionResponse
+	if json.Unmarshal(rawResp, &direct) != nil {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(rawResp)
+		return
+	}
+	parsed = &direct
 
 	var usage UsageMetrics
 	if parsed != nil && parsed.Usage != nil {
@@ -939,12 +989,14 @@ func (g *Gateway) finishChatFromResponsesUpstream(ctx context.Context, w http.Re
 	ttft := newTTFTTracker(upResp.Body, isSSEContentType(upResp) || req.Stream)
 	if req.Stream {
 		includeUsage := req.StreamOptions == nil || req.StreamOptions.IncludeUsage
-		usage, sErr := StreamResponsesToChatSSE(w, ttft, model.ID, includeUsage)
+		usage, sErr := streamResponsesToChatSSE(ctx, w, ttft, model.ID, includeUsage, g.keepaliveInterval())
+		status := http.StatusOK
 		errStr := ""
 		if sErr != nil {
 			errStr = sErr.Error()
+			status = classifyStreamErrorStatus(ctx)
 		}
-		g.respDir.RecordRequest(buildLogEntry(keyID, keyName, "/v1/chat/completions", "responses", model.ID, decision, true, http.StatusOK, start, ttft.FirstTokenMs(start), usage, errStr, tel))
+		g.respDir.RecordRequest(buildLogEntry(keyID, keyName, "/v1/chat/completions", "responses", model.ID, decision, true, status, start, ttft.FirstTokenMs(start), usage, errStr, tel))
 		return
 	}
 
@@ -953,23 +1005,37 @@ func (g *Gateway) finishChatFromResponsesUpstream(ctx context.Context, w http.Re
 		err     error
 	)
 	if isSSEContentType(upResp) {
+		stopKA := beginNonStreamJSONKeepalive(ctx, w, g.keepaliveInterval())
 		respMap, err = AggregateResponsesSSE(ttft, nil, model.ID)
+		stopKA()
 		if err != nil {
-			WriteError(w, http.StatusBadGateway, "upstream_error", "stream_aggregate_error", err.Error())
-			g.recordFailure(ctx, "/v1/chat/completions", "responses", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, http.StatusBadGateway, start, err.Error(), tel)
+			status := classifyStreamErrorStatus(ctx)
+			if ctx.Err() == nil {
+				writeCommittedJSONError(w, "upstream_error", "stream_aggregate_error", err.Error())
+			}
+			g.recordFailure(ctx, "/v1/chat/completions", "responses", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, status, start, err.Error(), tel)
 			return
 		}
-	} else {
-		rawResp, rErr := io.ReadAll(io.LimitReader(ttft, 32*1024*1024))
-		if rErr != nil {
+		chatResp := OpenAIResponseToChatResponse(respMap, model.ID)
+		usage := usageFromChat(chatResp.Usage)
+		_ = json.NewEncoder(w).Encode(chatResp)
+		flushWriter(w)
+		g.respDir.RecordRequest(buildLogEntry(keyID, keyName, "/v1/chat/completions", "responses", model.ID, decision, false, http.StatusOK, start, ttft.FirstTokenMs(start), usage, "", tel))
+		return
+	}
+
+	rawResp, rErr := io.ReadAll(io.LimitReader(ttft, 32*1024*1024))
+	if rErr != nil {
+		status := classifyStreamErrorStatus(ctx)
+		if ctx.Err() == nil {
 			WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", rErr.Error())
-			g.recordFailure(ctx, "/v1/chat/completions", "responses", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, http.StatusBadGateway, start, rErr.Error(), tel)
-			return
 		}
-		if err := json.Unmarshal(rawResp, &respMap); err != nil {
-			WriteError(w, http.StatusBadGateway, "upstream_error", "invalid_upstream_json", err.Error())
-			return
-		}
+		g.recordFailure(ctx, "/v1/chat/completions", "responses", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, status, start, rErr.Error(), tel)
+		return
+	}
+	if err := json.Unmarshal(rawResp, &respMap); err != nil {
+		WriteError(w, http.StatusBadGateway, "upstream_error", "invalid_upstream_json", err.Error())
+		return
 	}
 	chatResp := OpenAIResponseToChatResponse(respMap, model.ID)
 	usage := usageFromChat(chatResp.Usage)
@@ -1094,6 +1160,10 @@ func (g *Gateway) handleCreateResponse(w http.ResponseWriter, r *http.Request) {
 
 		model, _, mErr := g.resolveEnabledModel(ctx, decision.Client, req.Model)
 		if mErr != nil {
+			if ctx.Err() != nil {
+				g.recordFailure(ctx, "/v1/responses", "", req.Model, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, statusClientClosedRequest, start, ctx.Err().Error(), tel)
+				return
+			}
 			var disErr *modelDisabledError
 			if errors.As(mErr, &disErr) {
 				WriteError(w, http.StatusForbidden, "invalid_request_error", "model_disabled", disErr.Error())
@@ -1127,6 +1197,10 @@ func (g *Gateway) handleCreateResponse(w http.ResponseWriter, r *http.Request) {
 
 		if !isToolCont {
 			if status, errType, code, reason, ok := g.runPreflightIfEnabled(ctx, decision.Client, model.ID, traceparent); !ok {
+				if ctx.Err() != nil {
+					g.recordFailure(ctx, "/v1/responses", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, statusClientClosedRequest, start, ctx.Err().Error(), tel)
+					return
+				}
 				if status == http.StatusPaymentRequired && explicitAcc == "" {
 					g.markAccountInsufficient(decision.Account.ID, reason)
 					excluded[decision.Account.ID] = true
@@ -1183,8 +1257,11 @@ func (g *Gateway) handleCreateResponse(w http.ResponseWriter, r *http.Request) {
 
 		upResp, err := decision.Client.DoSciXLLM(ctx, subPath, payloadBytes, true, execHdr, traceparent)
 		if err != nil {
-			WriteError(w, http.StatusBadGateway, "upstream_error", "upstream_transport_error", err.Error())
-			g.recordFailure(ctx, "/v1/responses", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, http.StatusBadGateway, start, err.Error(), tel)
+			status := classifyStreamErrorStatus(ctx)
+			if ctx.Err() == nil {
+				WriteError(w, http.StatusBadGateway, "upstream_error", "upstream_transport_error", err.Error())
+			}
+			g.recordFailure(ctx, "/v1/responses", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, status, start, err.Error(), tel)
 			return
 		}
 		tel.RequestID = extractUpstreamRequestID(upResp)
@@ -1232,7 +1309,7 @@ func (g *Gateway) finishResponsesFromResponsesUpstream(ctx context.Context, w ht
 	keyID, keyName := apiKeyIdentityFromCtx(ctx)
 	ttft := newTTFTTracker(upResp.Body, isSSEContentType(upResp) || req.Stream)
 	if req.Stream {
-		terminalResp, usage, sErr := PipeResponsesSSE(w, ttft, req)
+		terminalResp, usage, sErr := pipeResponsesSSE(ctx, w, ttft, req, g.keepaliveInterval())
 		if shouldStore && terminalResp != nil {
 			if id, _ := terminalResp["id"].(string); id != "" {
 				g.respDir.Save(&StoredResponse{
@@ -1248,11 +1325,13 @@ func (g *Gateway) finishResponsesFromResponsesUpstream(ctx context.Context, w ht
 				})
 			}
 		}
+		status := http.StatusOK
 		errStr := ""
 		if sErr != nil {
 			errStr = sErr.Error()
+			status = classifyStreamErrorStatus(ctx)
 		}
-		g.respDir.RecordRequest(buildLogEntry(keyID, keyName, "/v1/responses", "responses", model.ID, decision, true, http.StatusOK, start, ttft.FirstTokenMs(start), usage, errStr, tel))
+		g.respDir.RecordRequest(buildLogEntry(keyID, keyName, "/v1/responses", "responses", model.ID, decision, true, status, start, ttft.FirstTokenMs(start), usage, errStr, tel))
 		return
 	}
 
@@ -1261,25 +1340,53 @@ func (g *Gateway) finishResponsesFromResponsesUpstream(ctx context.Context, w ht
 		err     error
 	)
 	if isSSEContentType(upResp) {
+		stopKA := beginNonStreamJSONKeepalive(ctx, w, g.keepaliveInterval())
 		respMap, err = AggregateResponsesSSE(ttft, req, model.ID)
+		stopKA()
 		if err != nil {
-			WriteError(w, http.StatusBadGateway, "upstream_error", "stream_aggregate_error", err.Error())
-			g.recordFailure(ctx, "/v1/responses", "responses", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, http.StatusBadGateway, start, err.Error(), tel)
+			status := classifyStreamErrorStatus(ctx)
+			if ctx.Err() == nil {
+				writeCommittedJSONError(w, "upstream_error", "stream_aggregate_error", err.Error())
+			}
+			g.recordFailure(ctx, "/v1/responses", "responses", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, status, start, err.Error(), tel)
 			return
 		}
-	} else {
-		rawResp, rErr := io.ReadAll(io.LimitReader(ttft, 32*1024*1024))
-		if rErr != nil {
-			WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", rErr.Error())
-			g.recordFailure(ctx, "/v1/responses", "responses", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, http.StatusBadGateway, start, rErr.Error(), tel)
-			return
+		usage := usageFromResponseMap(respMap)
+		if shouldStore {
+			if id, _ := respMap["id"].(string); id != "" {
+				g.respDir.Save(&StoredResponse{
+					ID:                 id,
+					PreviousResponseID: req.PreviousResponseID,
+					AccountID:          decision.Account.ID,
+					SessionHash:        decision.SessionHash,
+					Model:              model.ID,
+					Instructions:       effectiveInstr,
+					InputItems:         turnItems,
+					OutputItems:        extractOutputItems(respMap),
+					Response:           respMap,
+				})
+			}
 		}
-		if err := json.Unmarshal(rawResp, &respMap); err != nil {
-			WriteError(w, http.StatusBadGateway, "upstream_error", "invalid_upstream_json", err.Error())
-			return
-		}
-		patchClientResponseMeta(respMap, req)
+		_ = json.NewEncoder(w).Encode(respMap)
+		flushWriter(w)
+		g.respDir.RecordRequest(buildLogEntry(keyID, keyName, "/v1/responses", "responses", model.ID, decision, false, http.StatusOK, start, ttft.FirstTokenMs(start), usage, "", tel))
+		return
 	}
+
+	rawResp, rErr := io.ReadAll(io.LimitReader(ttft, 32*1024*1024))
+	if rErr != nil {
+		status := classifyStreamErrorStatus(ctx)
+		if ctx.Err() == nil {
+			WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", rErr.Error())
+		}
+		g.recordFailure(ctx, "/v1/responses", "responses", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, status, start, rErr.Error(), tel)
+		return
+	}
+	if err := json.Unmarshal(rawResp, &respMap); err != nil {
+		WriteError(w, http.StatusBadGateway, "upstream_error", "invalid_upstream_json", err.Error())
+		return
+	}
+	patchClientResponseMeta(respMap, req)
 	usage := usageFromResponseMap(respMap)
 	if shouldStore {
 		if id, _ := respMap["id"].(string); id != "" {
@@ -1307,7 +1414,7 @@ func (g *Gateway) finishResponsesFromChatUpstream(ctx context.Context, w http.Re
 	respID := RandomID("resp_")
 
 	if req.Stream {
-		finalResp, usage, sErr := StreamChatToResponsesSSE(w, ttft, req, model.ID, respID)
+		finalResp, usage, sErr := streamChatToResponsesSSE(ctx, w, ttft, req, model.ID, respID, g.keepaliveInterval())
 		if shouldStore && finalResp != nil && finalResp.Status != "failed" {
 			respMap := structToMap(finalResp)
 			g.respDir.Save(&StoredResponse{
@@ -1322,11 +1429,13 @@ func (g *Gateway) finishResponsesFromChatUpstream(ctx context.Context, w http.Re
 				Response:           respMap,
 			})
 		}
+		status := http.StatusOK
 		errStr := ""
 		if sErr != nil {
 			errStr = sErr.Error()
+			status = classifyStreamErrorStatus(ctx)
 		}
-		g.respDir.RecordRequest(buildLogEntry(keyID, keyName, "/v1/responses", "chat_completions", model.ID, decision, true, http.StatusOK, start, ttft.FirstTokenMs(start), usage, errStr, tel))
+		g.respDir.RecordRequest(buildLogEntry(keyID, keyName, "/v1/responses", "chat_completions", model.ID, decision, true, status, start, ttft.FirstTokenMs(start), usage, errStr, tel))
 		return
 	}
 
@@ -1335,26 +1444,56 @@ func (g *Gateway) finishResponsesFromChatUpstream(ctx context.Context, w http.Re
 		err      error
 	)
 	if isSSEContentType(upResp) {
+		stopKA := beginNonStreamJSONKeepalive(ctx, w, g.keepaliveInterval())
 		chatResp, err = AggregateChatSSE(ttft, model.ID)
+		stopKA()
 		if err != nil {
-			WriteError(w, http.StatusBadGateway, "upstream_error", "stream_aggregate_error", err.Error())
-			g.recordFailure(ctx, "/v1/responses", "chat_completions", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, http.StatusBadGateway, start, err.Error(), tel)
+			status := classifyStreamErrorStatus(ctx)
+			if ctx.Err() == nil {
+				writeCommittedJSONError(w, "upstream_error", "stream_aggregate_error", err.Error())
+			}
+			g.recordFailure(ctx, "/v1/responses", "chat_completions", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, status, start, err.Error(), tel)
 			return
 		}
-	} else {
-		rawResp, rErr := io.ReadAll(io.LimitReader(ttft, 32*1024*1024))
-		if rErr != nil {
-			WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", rErr.Error())
-			g.recordFailure(ctx, "/v1/responses", "chat_completions", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, http.StatusBadGateway, start, rErr.Error(), tel)
-			return
+		if chatResp.ID != "" && !strings.HasPrefix(chatResp.ID, "resp_") {
+			respID = "resp_" + strings.ReplaceAll(chatResp.ID, "-", "")
 		}
-		var direct ChatCompletionResponse
-		if err := json.Unmarshal(rawResp, &direct); err != nil {
-			WriteError(w, http.StatusBadGateway, "upstream_error", "invalid_upstream_json", err.Error())
-			return
+		openAIResp := ChatResponseToOpenAIResponse(chatResp, req, model.ID, respID)
+		usage := usageFromChat(chatResp.Usage)
+		if shouldStore {
+			g.respDir.Save(&StoredResponse{
+				ID:                 openAIResp.ID,
+				PreviousResponseID: req.PreviousResponseID,
+				AccountID:          decision.Account.ID,
+				SessionHash:        decision.SessionHash,
+				Model:              model.ID,
+				Instructions:       effectiveInstr,
+				InputItems:         turnItems,
+				OutputItems:        openAIResp.Output,
+				Response:           structToMap(openAIResp),
+			})
 		}
-		chatResp = &direct
+		_ = json.NewEncoder(w).Encode(openAIResp)
+		flushWriter(w)
+		g.respDir.RecordRequest(buildLogEntry(keyID, keyName, "/v1/responses", "chat_completions", model.ID, decision, false, http.StatusOK, start, ttft.FirstTokenMs(start), usage, "", tel))
+		return
 	}
+
+	rawResp, rErr := io.ReadAll(io.LimitReader(ttft, 32*1024*1024))
+	if rErr != nil {
+		status := classifyStreamErrorStatus(ctx)
+		if ctx.Err() == nil {
+			WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", rErr.Error())
+		}
+		g.recordFailure(ctx, "/v1/responses", "chat_completions", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, status, start, rErr.Error(), tel)
+		return
+	}
+	var direct ChatCompletionResponse
+	if err := json.Unmarshal(rawResp, &direct); err != nil {
+		WriteError(w, http.StatusBadGateway, "upstream_error", "invalid_upstream_json", err.Error())
+		return
+	}
+	chatResp = &direct
 	if chatResp.ID != "" && !strings.HasPrefix(chatResp.ID, "resp_") {
 		respID = "resp_" + strings.ReplaceAll(chatResp.ID, "-", "")
 	}

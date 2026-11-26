@@ -98,6 +98,7 @@ export function OverviewTab({
         accounts={accounts}
         selectedAccountId={selectedAccountId}
         poolCount={poolAcc}
+        activeJobs={data?.activeJobs}
         onSelectAccount={onSelectAccount}
         onOpenLogin={onOpenLogin}
         onRefreshAll={onRefreshAll}
@@ -109,6 +110,7 @@ export function OverviewTab({
         onSelectAccount={onSelectAccount}
         tasks={data?.tasks}
         tasksError={data?.tasksError}
+        activeJobs={data?.activeJobs}
         onRefresh={onRefreshAll}
       />
 

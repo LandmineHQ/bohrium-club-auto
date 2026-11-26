@@ -298,7 +298,15 @@ export function UsageLogsTable({
                         {/* 时间 / 状态 */}
                         <TableCell className="whitespace-nowrap align-top">
                           <div className="flex items-center gap-1.5">
-                            <Badge variant={isOk ? "ok" : "err"} className="font-mono text-[10px] px-1.5">
+                            <Badge
+                              variant={isOk ? "ok" : item.status === 499 ? "warn" : "err"}
+                              className="font-mono text-[10px] px-1.5"
+                              title={
+                                item.status === 499
+                                  ? "客户端或 CDN 主动断开连接 (HTTP 499)"
+                                  : undefined
+                              }
+                            >
                               {item.status || "ERR"}
                             </Badge>
                             <span className="font-mono text-[11px] font-medium tabular-nums">
@@ -529,8 +537,8 @@ export function UsageLogsTable({
               <DialogHeader>
                 <div className="flex flex-wrap items-center gap-2">
                   <DialogTitle>使用记录详情</DialogTitle>
-                  <Badge variant={selectedOk ? "ok" : "err"} className="font-mono">
-                    HTTP {selected.status || "ERR"}
+                  <Badge variant={selectedOk ? "ok" : selected.status === 499 ? "warn" : "err"} className="font-mono">
+                    {selected.status === 499 ? "HTTP 499 (客户端/CDN断连)" : `HTTP ${selected.status || "ERR"}`}
                   </Badge>
                   <Badge variant={selected.stream ? "info" : "muted"}>
                     {selected.stream ? "流式 SSE" : "非流式 JSON"}

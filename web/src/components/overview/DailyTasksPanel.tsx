@@ -2,13 +2,14 @@ import { useState } from "react"
 import { toast } from "sonner"
 import { RefreshCw } from "lucide-react"
 import { apiRequest } from "@/lib/api"
+import { pollTaskJob, type TaskJobStartResponse } from "@/lib/taskJobs"
 import { formatNum } from "@/lib/utils"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { NativeSelect } from "@/components/ui/input"
 import { AlertBox } from "@/components/ui/table"
-import type { AccountSummaryView, DailyTasksResponse } from "@/types/console"
+import type { AccountSummaryView, DailyTasksResponse, TaskJob } from "@/types/console"
 
 interface DailyTasksPanelProps {
   accounts: AccountSummaryView[]
@@ -16,6 +17,7 @@ interface DailyTasksPanelProps {
   onSelectAccount: (id: string) => void
   tasks?: DailyTasksResponse | null
   tasksError?: string
+  activeJobs?: TaskJob[]
   onRefresh: () => Promise<void>
 }
 
@@ -25,6 +27,7 @@ export function DailyTasksPanel({
   onSelectAccount,
   tasks,
   tasksError,
+  activeJobs = [],
   onRefresh,
 }: DailyTasksPanelProps) {
   const [busyKey, setBusyKey] = useState("")
@@ -34,6 +37,15 @@ export function DailyTasksPanel({
     : accounts.length > 0
       ? "未加载"
       : "暂无账号"
+
+  const accountJobs = activeJobs.filter(
+    (j) =>
+      j.status === "running" &&
+      (j.kind === "all_accounts" || !j.accountId || j.accountId === selectedAccountId)
+  )
+  const accountAllRunning =
+    busyKey === "run-all" ||
+    accountJobs.some((j) => j.kind === "account_all" || j.kind === "all_accounts")
 
   async function claimAll() {
     if (!selectedAccountId) return toast.warning("请先添加账号")
@@ -56,14 +68,26 @@ export function DailyTasksPanel({
     if (!selectedAccountId) return toast.warning("请先添加账号")
     setBusyKey("run-all")
     try {
-      const res = await apiRequest<{ data?: { summary?: string } }>(
+      const res = await apiRequest<TaskJobStartResponse>(
         `/api/accounts/${encodeURIComponent(selectedAccountId)}/tasks/run-all`,
         { method: "POST" }
       )
-      toast.success(res.data?.summary || "全部任务已执行")
+      if (res.async && res.job?.id) {
+        const finalJob = await pollTaskJob(res.job.id)
+        if (finalJob.status === "failed") {
+          toast.error("执行失败: " + (finalJob.error || finalJob.message || "任务失败"))
+        } else if (finalJob.accountResult && !finalJob.accountResult.allWebDone) {
+          toast.warning(finalJob.message || finalJob.accountResult.summary || "部分任务未完成")
+        } else {
+          toast.success(finalJob.message || finalJob.accountResult?.summary || "全部任务已执行")
+        }
+      } else {
+        toast.success(res.data?.summary || "全部任务已执行")
+      }
       await onRefresh()
     } catch (err) {
       toast.error("执行失败: " + (err instanceof Error ? err.message : ""))
+      await onRefresh()
     } finally {
       setBusyKey("")
     }
@@ -90,11 +114,21 @@ export function DailyTasksPanel({
     if (!selectedAccountId) return toast.warning("请先添加账号")
     setBusyKey(`run:${taskKey}`)
     try {
-      const res = await apiRequest<{ data?: { message?: string; success?: boolean } }>(
+      const res = await apiRequest<TaskJobStartResponse>(
         `/api/accounts/${encodeURIComponent(selectedAccountId)}/tasks/run`,
         { method: "POST", body: JSON.stringify({ taskKey }) }
       )
-      if (res.data?.success) {
+      if (res.async && res.job?.id) {
+        const finalJob = await pollTaskJob(res.job.id)
+        const sr = finalJob.singleResult
+        if (finalJob.status === "completed" && sr?.success) {
+          toast.success(sr.message || finalJob.message || "任务已执行")
+        } else if (finalJob.status === "completed") {
+          toast.warning(sr?.message || finalJob.message || "任务已执行")
+        } else {
+          toast.error("执行失败: " + (finalJob.error || sr?.message || finalJob.message || "未知错误"))
+        }
+      } else if (res.data?.success) {
         toast.success(res.data?.message || "任务已执行")
       } else {
         toast.warning(res.data?.message || "任务已执行")
@@ -151,8 +185,8 @@ export function DailyTasksPanel({
           <Button variant="outline" size="sm" disabled={busyKey === "claim-all"} onClick={claimAll}>
             {busyKey === "claim-all" ? "领取中..." : "一键领取任务"}
           </Button>
-          <Button size="sm" disabled={busyKey === "run-all"} onClick={runAll}>
-            {busyKey === "run-all" ? "执行中..." : "执行该账号任务"}
+          <Button size="sm" disabled={accountAllRunning} onClick={runAll}>
+            {accountAllRunning ? "后台执行中..." : "执行该账号任务"}
           </Button>
         </div>
       </CardHeader>
@@ -171,7 +205,15 @@ export function DailyTasksPanel({
         ) : (
           tasks.tasks.map((t, idx) => {
             const num = String(idx + 1).padStart(2, "0")
-            const running = busyKey === `run:${t.taskKey}`
+            const running =
+              busyKey === `run:${t.taskKey}` ||
+              accountJobs.some(
+                (j) =>
+                  j.kind === "account_all" ||
+                  j.kind === "all_accounts" ||
+                  (j.kind === "single_task" &&
+                    (j.taskKey === t.taskKey || j.taskKey === t.actionKey))
+              )
             const claiming = busyKey === `claim:${t.taskKey}`
             return (
               <div
@@ -236,7 +278,7 @@ export function DailyTasksPanel({
                         disabled={running}
                         onClick={() => runOne(t.taskKey)}
                       >
-                        {running ? "执行中..." : t.status === 1 ? "重新执行" : "手动执行"}
+                        {running ? "后台执行中..." : t.status === 1 ? "重新执行" : "手动执行"}
                       </Button>
                     </>
                   )}

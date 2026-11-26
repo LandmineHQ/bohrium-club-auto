@@ -106,6 +106,19 @@ export function App() {
   )
 
   useEffect(() => {
+    const hasRunningJob =
+      Boolean(overview?.scheduler?.running) ||
+      (overview?.activeJobs?.some((j) => j.status === "running") ?? false)
+    if (authState !== "authed" || activeTab !== "overview" || !hasRunningJob) {
+      return
+    }
+    const timer = window.setInterval(() => {
+      void loadOverview()
+    }, 3000)
+    return () => window.clearInterval(timer)
+  }, [authState, activeTab, overview?.scheduler?.running, overview?.activeJobs, loadOverview])
+
+  useEffect(() => {
     ;(async () => {
       try {
         const st = await apiRequest<{ authenticated?: boolean; version?: string }>(

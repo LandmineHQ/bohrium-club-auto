@@ -3,6 +3,7 @@ package openai_test
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -1624,5 +1625,121 @@ func TestModelVisibilityToggleAndStandardOpenAIModels(t *testing.T) {
 	}
 	if r, raw := doReq(http.MethodPost, "/v1/responses", `{"model":"vision","stream":false,"input":"hi"}`); r.StatusCode != http.StatusForbidden || !strings.Contains(raw, "model_disabled") {
 		t.Fatalf("expected 403 model_disabled for disabled vision, got %d %s", r.StatusCode, raw)
+	}
+}
+
+func TestCDNSSEAndNonStreamJSONKeepaliveAndClientDisconnect499(t *testing.T) {
+	var holdUpstream atomic.Bool
+	gw, gwSrv, st, _, apiKey, _ := setupTestGatewayEnv(t, true, func(w http.ResponseWriter, r *http.Request) {
+		fl, _ := w.(http.Flusher)
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		if fl != nil {
+			fl.Flush()
+		}
+		if holdUpstream.Load() {
+			_, _ = io.WriteString(w, ": heartbeat\n\n")
+			if fl != nil {
+				fl.Flush()
+			}
+			select {
+			case <-r.Context().Done():
+			case <-time.After(3 * time.Second):
+			}
+			return
+		}
+		// Delay longer than keepalive interval (40ms) before emitting first token so both SSE & non-stream keepalives fire.
+		time.Sleep(110 * time.Millisecond)
+		if r.URL.Path == "/responses" {
+			_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ka\",\"object\":\"response\",\"model\":\"vision\",\"status\":\"in_progress\"}}\n\n")
+			_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Keepalive OK\"}\n\n")
+			_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ka\",\"object\":\"response\",\"model\":\"vision\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Keepalive OK\"}]}],\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"total_tokens\":12}}}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, `data: {"id":"chatcmpl-ka","object":"chat.completion.chunk","created":1700000900,"model":"dsflash-high","choices":[{"index":0,"delta":{"role":"assistant","content":"Keepalive OK"},"finish_reason":null}]}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"id":"chatcmpl-ka","object":"chat.completion.chunk","created":1700000900,"model":"dsflash-high","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`+"\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	})
+
+	gw.SetKeepaliveInterval(40 * time.Millisecond)
+
+	// 1. Streaming /v1/chat/completions emits SSE ": keepalive" while waiting, then full response.
+	req1, _ := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/chat/completions", strings.NewReader(`{
+		"model":"dsflash-high","stream":true,"messages":[{"role":"user","content":"hi"}]
+	}`))
+	req1.Header.Set("Authorization", "Bearer "+apiKey)
+	req1.Header.Set("Content-Type", "application/json")
+	resp1, err := http.DefaultClient.Do(req1)
+	if err != nil {
+		t.Fatalf("streaming chat keepalive: %v", err)
+	}
+	raw1, _ := io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+	if !strings.Contains(string(raw1), ": keepalive\n\n") || !strings.Contains(string(raw1), `"content":"Keepalive OK"`) || !strings.Contains(string(raw1), "data: [DONE]") {
+		t.Fatalf("expected : keepalive + completion chunks in SSE stream, got: %q", string(raw1))
+	}
+
+	// 2. Non-streaming /v1/chat/completions AND /v1/responses emit leading whitespace keepalives AND valid JSON.
+	for _, tc := range []struct {
+		path string
+		body string
+	}{
+		{"/v1/chat/completions", `{"model":"dsflash-high","stream":false,"messages":[{"role":"user","content":"hi"}]}`},
+		{"/v1/responses", `{"model":"vision","stream":false,"input":"hi"}`},
+	} {
+		reqN, _ := http.NewRequest(http.MethodPost, gwSrv.URL+tc.path, strings.NewReader(tc.body))
+		reqN.Header.Set("Authorization", "Bearer "+apiKey)
+		reqN.Header.Set("Content-Type", "application/json")
+		respN, err := http.DefaultClient.Do(reqN)
+		if err != nil {
+			t.Fatalf("non-stream %s: %v", tc.path, err)
+		}
+		rawN, _ := io.ReadAll(respN.Body)
+		respN.Body.Close()
+		if respN.StatusCode != http.StatusOK {
+			t.Fatalf("non-stream %s HTTP %d: %s", tc.path, respN.StatusCode, string(rawN))
+		}
+		if !bytes.HasPrefix(rawN, []byte(" ")) {
+			t.Fatalf("expected leading whitespace keepalive before JSON on slow %s, got %q", tc.path, string(rawN[:min(24, len(rawN))]))
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal(rawN, &parsed); err != nil {
+			t.Fatalf("expected leading-whitespace JSON to unmarshal cleanly on %s: %v; raw=%q", tc.path, err, string(rawN))
+		}
+	}
+
+	// 3. Caller/CDN disconnect mid-wait MUST be logged with status 499 (NOT 502).
+	holdUpstream.Store(true)
+	cancelCtx, cancel := context.WithTimeout(context.Background(), 90*time.Millisecond)
+	defer cancel()
+	reqAbort, _ := http.NewRequestWithContext(cancelCtx, http.MethodPost, gwSrv.URL+"/v1/chat/completions", strings.NewReader(`{
+		"model":"dsflash-high","stream":false,"messages":[{"role":"user","content":"abort test"}]
+	}`))
+	reqAbort.Header.Set("Authorization", "Bearer "+apiKey)
+	reqAbort.Header.Set("Content-Type", "application/json")
+	if respAbort, err := http.DefaultClient.Do(reqAbort); err == nil {
+		respAbort.Body.Close()
+	}
+
+	// Wait briefly for handler defer / RecordRequest to finish inserting into SQLite.
+	var found499 bool
+	for i := 0; i < 20; i++ {
+		page, err := st.ListGatewayUsageLogs(store.UsageLogsQueryOptions{RangeDays: 1, Page: 1, PageSize: 20})
+		if err == nil {
+			for _, it := range page.Items {
+				if it.Status == 499 {
+					found499 = true
+					break
+				}
+			}
+			if found499 {
+				break
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !found499 {
+		page, _ := st.ListGatewayUsageLogs(store.UsageLogsQueryOptions{RangeDays: 1, Page: 1, PageSize: 20})
+		t.Fatalf("expected client/CDN disconnect to log status 499, got items=%+v", page.Items)
 	}
 }

@@ -2,16 +2,21 @@ package openai
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
-const maxSSELineBytes = 16 * 1024 * 1024
+const (
+	maxSSELineBytes          = 16 * 1024 * 1024
+	defaultKeepaliveInterval = 15 * time.Second
+)
 
 func setSSEHeaders(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
@@ -27,6 +32,99 @@ func flushWriter(w http.ResponseWriter) {
 	}
 }
 
+type syncKeepaliveWriter struct {
+	mu        sync.Mutex
+	w         http.ResponseWriter
+	lastWrite time.Time
+}
+
+func newSyncKeepaliveWriter(w http.ResponseWriter) *syncKeepaliveWriter {
+	return &syncKeepaliveWriter{
+		w:         w,
+		lastWrite: time.Now(),
+	}
+}
+
+func (sw *syncKeepaliveWriter) writeString(s string) error {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	_, err := io.WriteString(sw.w, s)
+	flushWriter(sw.w)
+	sw.lastWrite = time.Now()
+	return err
+}
+
+func (sw *syncKeepaliveWriter) writeKeepalive(minIdle time.Duration, payload string) {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	if time.Since(sw.lastWrite) < minIdle {
+		return
+	}
+	_, _ = io.WriteString(sw.w, payload)
+	flushWriter(sw.w)
+	sw.lastWrite = time.Now()
+}
+
+func startKeepalive(ctx context.Context, sw *syncKeepaliveWriter, interval time.Duration, payload string) (stop func()) {
+	if interval <= 0 {
+		return func() {}
+	}
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case <-ticker.C:
+				sw.writeKeepalive(interval, payload)
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(done)
+		})
+		wg.Wait()
+	}
+}
+
+// beginNonStreamJSONKeepalive commits 200 OK headers with application/json and emits
+// a single leading whitespace byte every interval while waiting on slow upstream aggregation,
+// preventing Cloudflare (100s) / Aliyun ESA (30s) origin read timeouts. JSON allows arbitrary
+// leading whitespace before the root object. Callers MUST invoke stop() before writing the body.
+func beginNonStreamJSONKeepalive(ctx context.Context, w http.ResponseWriter, interval time.Duration) (stop func()) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store, no-transform")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flushWriter(w)
+	return startKeepalive(ctx, newSyncKeepaliveWriter(w), interval, " ")
+}
+
+func writeCommittedJSONError(w http.ResponseWriter, errType, code, message string) {
+	var codeVal any
+	if code != "" {
+		codeVal = code
+	}
+	_ = json.NewEncoder(w).Encode(ErrorEnvelope{
+		Error: ErrorDetail{
+			Message: message,
+			Type:    errType,
+			Param:   nil,
+			Code:    codeVal,
+		},
+	})
+	flushWriter(w)
+}
+
 func newSSEScanner(r io.Reader) *bufio.Scanner {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64*1024), maxSSELineBytes)
@@ -36,8 +134,15 @@ func newSSEScanner(r io.Reader) *bufio.Scanner {
 // PipeChatSSE streams Bohrium's native /chat/completions SSE directly to an OpenAI client,
 // filtering `: heartbeat` keepalive comments, guaranteeing a trailing `data: [DONE]`, and capturing usage.
 func PipeChatSSE(w http.ResponseWriter, body io.Reader) (UsageMetrics, error) {
+	return pipeChatSSE(context.Background(), w, body, defaultKeepaliveInterval)
+}
+
+func pipeChatSSE(ctx context.Context, w http.ResponseWriter, body io.Reader, keepaliveInterval time.Duration) (UsageMetrics, error) {
 	setSSEHeaders(w)
 	flushWriter(w)
+	sw := newSyncKeepaliveWriter(w)
+	stopKA := startKeepalive(ctx, sw, keepaliveInterval, ": keepalive\n\n")
+	defer stopKA()
 
 	var usage UsageMetrics
 	sawDone := false
@@ -55,8 +160,7 @@ func PipeChatSSE(w http.ResponseWriter, body io.Reader) (UsageMetrics, error) {
 		data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
 		if data == "[DONE]" {
 			sawDone = true
-			_, _ = io.WriteString(w, "data: [DONE]\n\n")
-			flushWriter(w)
+			_ = sw.writeString("data: [DONE]\n\n")
 			break
 		}
 		// Extract token usage if present on chunk
@@ -64,15 +168,13 @@ func PipeChatSSE(w http.ResponseWriter, body io.Reader) (UsageMetrics, error) {
 		if json.Unmarshal([]byte(data), &chunk) == nil && chunk.Usage != nil {
 			usage = usageFromChat(chunk.Usage)
 		}
-		_, _ = io.WriteString(w, "data: "+data+"\n\n")
-		flushWriter(w)
+		_ = sw.writeString("data: " + data + "\n\n")
 	}
 	if err := sc.Err(); err != nil {
 		return usage, err
 	}
 	if !sawDone {
-		_, _ = io.WriteString(w, "data: [DONE]\n\n")
-		flushWriter(w)
+		_ = sw.writeString("data: [DONE]\n\n")
 	}
 	return usage, nil
 }
@@ -80,8 +182,15 @@ func PipeChatSSE(w http.ResponseWriter, body io.Reader) (UsageMetrics, error) {
 // PipeResponsesSSE streams Bohrium's native /responses SSE directly to an OpenAI client,
 // filtering `: heartbeat` comments and capturing the completed response object for storage & usage.
 func PipeResponsesSSE(w http.ResponseWriter, body io.Reader, req *ResponsesRequest) (map[string]any, UsageMetrics, error) {
+	return pipeResponsesSSE(context.Background(), w, body, req, defaultKeepaliveInterval)
+}
+
+func pipeResponsesSSE(ctx context.Context, w http.ResponseWriter, body io.Reader, req *ResponsesRequest, keepaliveInterval time.Duration) (map[string]any, UsageMetrics, error) {
 	setSSEHeaders(w)
 	flushWriter(w)
+	sw := newSyncKeepaliveWriter(w)
+	stopKA := startKeepalive(ctx, sw, keepaliveInterval, ": keepalive\n\n")
+	defer stopKA()
 
 	var terminalResp map[string]any
 	var usage UsageMetrics
@@ -113,8 +222,7 @@ func PipeResponsesSSE(w http.ResponseWriter, body io.Reader, req *ResponsesReque
 				}
 			}
 		}
-		_, _ = io.WriteString(w, formatSSEEvent(curEvent, []byte(payload)))
-		flushWriter(w)
+		_ = sw.writeString(formatSSEEvent(curEvent, []byte(payload)))
 		curEvent = ""
 		dataLines = dataLines[:0]
 	}
@@ -147,8 +255,15 @@ func PipeResponsesSSE(w http.ResponseWriter, body io.Reader, req *ResponsesReque
 // the full official OpenAI Responses API SSE event sequence (response.created, response.in_progress,
 // reasoning/message/function_call output items + deltas + done, response.completed/incomplete).
 func StreamChatToResponsesSSE(w http.ResponseWriter, body io.Reader, req *ResponsesRequest, modelID, respID string) (*ResponseObject, UsageMetrics, error) {
+	return streamChatToResponsesSSE(context.Background(), w, body, req, modelID, respID, defaultKeepaliveInterval)
+}
+
+func streamChatToResponsesSSE(ctx context.Context, w http.ResponseWriter, body io.Reader, req *ResponsesRequest, modelID, respID string, keepaliveInterval time.Duration) (*ResponseObject, UsageMetrics, error) {
 	setSSEHeaders(w)
 	flushWriter(w)
+	sw := newSyncKeepaliveWriter(w)
+	stopKA := startKeepalive(ctx, sw, keepaliveInterval, ": keepalive\n\n")
+	defer stopKA()
 
 	now := time.Now().UTC().Unix()
 	seq := 0
@@ -157,8 +272,7 @@ func StreamChatToResponsesSSE(w http.ResponseWriter, body io.Reader, req *Respon
 		body["sequence_number"] = seq
 		seq++
 		b, _ := json.Marshal(body)
-		_, _ = io.WriteString(w, formatSSEEvent(evType, b))
-		flushWriter(w)
+		_ = sw.writeString(formatSSEEvent(evType, b))
 	}
 
 	// Emit response.created & response.in_progress
@@ -496,8 +610,15 @@ func StreamChatToResponsesSSE(w http.ResponseWriter, body io.Reader, req *Respon
 // StreamResponsesToChatSSE translates a Bohrium native /responses SSE stream into
 // standard OpenAI /v1/chat/completions chunks (`chat.completion.chunk` + `[DONE]`).
 func StreamResponsesToChatSSE(w http.ResponseWriter, body io.Reader, modelID string, includeUsage bool) (UsageMetrics, error) {
+	return streamResponsesToChatSSE(context.Background(), w, body, modelID, includeUsage, defaultKeepaliveInterval)
+}
+
+func streamResponsesToChatSSE(ctx context.Context, w http.ResponseWriter, body io.Reader, modelID string, includeUsage bool, keepaliveInterval time.Duration) (UsageMetrics, error) {
 	setSSEHeaders(w)
 	flushWriter(w)
+	sw := newSyncKeepaliveWriter(w)
+	stopKA := startKeepalive(ctx, sw, keepaliveInterval, ": keepalive\n\n")
+	defer stopKA()
 
 	chatID := RandomID("chatcmpl-")
 	created := time.Now().UTC().Unix()
@@ -524,8 +645,7 @@ func StreamResponsesToChatSSE(w http.ResponseWriter, body io.Reader, modelID str
 			Usage: u,
 		}
 		b, _ := json.Marshal(chunk)
-		_, _ = io.WriteString(w, "data: "+string(b)+"\n\n")
-		flushWriter(w)
+		_ = sw.writeString("data: " + string(b) + "\n\n")
 	}
 
 	ensureRole := func() {
@@ -639,8 +759,7 @@ func StreamResponsesToChatSSE(w http.ResponseWriter, body io.Reader, modelID str
 		emitU = finalChatUsage
 	}
 	emitChunk(ChatCompletionDelta{}, &fr, emitU)
-	_, _ = io.WriteString(w, "data: [DONE]\n\n")
-	flushWriter(w)
+	_ = sw.writeString("data: [DONE]\n\n")
 	return usage, nil
 }
 

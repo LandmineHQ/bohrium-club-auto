@@ -21,9 +21,9 @@
 | <span class="api-method delete">DELETE</span> | `/api/accounts/{id}` | 管理员 | 删除账号并级联清理其 SQLite 会话绑定 |
 | <span class="api-method post">POST</span> | `/api/accounts/{id}/refresh-token` | 管理员 | 为指定账号触发 `refresh_token` 续期 |
 | <span class="api-method post">POST</span> | `/api/accounts/{id}/refresh-balance` | 管理员 | 为指定账号刷新实时光子/组织/钱包余额快照 |
-| <span class="api-method post">POST</span> | `/api/accounts/{id}/tasks/run-all` | 管理员 | 为指定账号立即执行全部 Web 每日任务 |
-| <span class="api-method post">POST</span> | `/api/accounts/{id}/tasks/run` | 管理员 | 为指定账号执行单项 Web 任务（Body: `{"taskKey":"..."}`） |
-| <span class="api-method post">POST</span> | `/api/accounts/tasks/run-all` | 管理员 | 顺序错峰触发全部已启用签到的账号执行每日 Web 任务 |
+| <span class="api-method post">POST</span> | `/api/accounts/{id}/tasks/run-all` | 管理员 | 异步触发指定账号在 Go 后台执行全部 Web 每日任务（返回 HTTP `202 Accepted` 与 `job.id`） |
+| <span class="api-method post">POST</span> | `/api/accounts/{id}/tasks/run` | 管理员 | 异步触发指定账号执行单项 Web 任务（Body: `{"taskKey":"..."}`，返回 HTTP `202` 与 `job.id`） |
+| <span class="api-method post">POST</span> | `/api/accounts/run-all` | 管理员 | 异步顺序错峰触发全部已启用签到的账号执行每日 Web 任务（返回 HTTP `202` 与 `job.id`） |
 | <span class="api-method get">GET</span> | `/api/bohrium/session?accountId=...` | 管理员 | 实时检测指定（或首个）账号的 `brmToken` 登录与社区绑定状态 |
 | <span class="api-method post">POST</span> | `/api/bohrium/wechat/qr` | 管理员 | 申请官方微信扫码二维码（可传 `{"label":"..."}` 备注名） |
 | <span class="api-method get">GET</span> | `/api/bohrium/wechat/poll?sceneId=...&label=...` | 管理员 | 轮询扫码结果，登录成功后入库（默认不入池）并绑定社区 |
@@ -62,10 +62,12 @@
 | --- | --- | --- | --- |
 | <span class="api-method get">GET</span> | `/api/overview` | 管理员 | 一次性聚合会话、积分容量、每日任务、调度状态、语料池统计与近期日志 |
 | <span class="api-method get">GET</span> | `/api/tasks` | 管理员 | 拉取当日 4 项每日任务最新状态 |
+| <span class="api-method get">GET</span> | `/api/tasks/jobs` | 管理员 | 查询最近 30 条后台异步任务执行记录及运行态 |
+| <span class="api-method get">GET</span> | `/api/tasks/jobs/{id}` | 管理员 | 轮询单个异步任务详情与完成结果（`running` / `completed` / `failed`） |
 | <span class="api-method post">POST</span> | `/api/tasks/claim-all` | 管理员 | **一键领取全部每日任务** |
 | <span class="api-method post">POST</span> | `/api/tasks/claim` | 管理员 | 领取单项任务（Body: `{"taskKey":"..."}`） |
-| <span class="api-method post">POST</span> | `/api/tasks/run` | 管理员 | 手动执行单项每日任务（Web 任务或客户端原生 tools 任务）并立即终止（Body: `{"taskKey":"...","accountId":"..."}`） |
-| <span class="api-method post">POST</span> | `/api/tasks/run-all` | 管理员 | 一键领取并顺序执行全部 4 项未完成的每日任务（含桌面客户端任务） |
+| <span class="api-method post">POST</span> | `/api/tasks/run` | 管理员 | 异步触发单项每日任务并在 Go 后台执行（Body: `{"taskKey":"...","accountId":"..."}`，返回 `202` + `job.id`） |
+| <span class="api-method post">POST</span> | `/api/tasks/run-all` | 管理员 | 异步触发一键领取并顺序执行全部 4 项未完成的每日任务（返回 `202` + `job.id`） |
 | <span class="api-method get">GET</span> | `/api/assets` | 管理员 | 刷新光子余额、过期批次、近期流水、会员配额与知识库存储容量 |
 | <span class="api-method get">GET</span> | `/api/prompts/catalog` | 管理员 | 查看题库统计与 100 篇 arXiv 文献目录 |
 

@@ -2,6 +2,7 @@ import { useState } from "react"
 import { toast } from "sonner"
 import { Plus, RefreshCw, Play } from "lucide-react"
 import { apiRequest } from "@/lib/api"
+import { pollTaskJob, type TaskJobStartResponse } from "@/lib/taskJobs"
 import { cn, formatNum } from "@/lib/utils"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -15,12 +16,13 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import type { AccountSummaryView } from "@/types/console"
+import type { AccountSummaryView, TaskJob } from "@/types/console"
 
 interface AccountsTableProps {
   accounts: AccountSummaryView[]
   selectedAccountId: string
   poolCount: number
+  activeJobs?: TaskJob[]
   onSelectAccount: (id: string) => void
   onOpenLogin: () => void
   onRefreshAll: () => Promise<void>
@@ -30,11 +32,15 @@ export function AccountsTable({
   accounts,
   selectedAccountId,
   poolCount,
+  activeJobs = [],
   onSelectAccount,
   onOpenLogin,
   onRefreshAll,
 }: AccountsTableProps) {
   const [busyAction, setBusyAction] = useState<string>("")
+  const batchRunning =
+    busyAction === "run-all" ||
+    activeJobs.some((j) => j.status === "running" && j.kind === "all_accounts")
 
   async function toggleCheckin(acc: AccountSummaryView, enabled: boolean) {
     try {
@@ -67,14 +73,26 @@ export function AccountsTable({
   async function runSingleCheckin(acc: AccountSummaryView) {
     setBusyAction(`run:${acc.id}`)
     try {
-      const res = await apiRequest<{ data?: { summary?: string } }>(
+      const res = await apiRequest<TaskJobStartResponse>(
         `/api/accounts/${encodeURIComponent(acc.id)}/tasks/run-all`,
         { method: "POST" }
       )
-      toast.success(res.data?.summary || "签到执行完成")
+      if (res.async && res.job?.id) {
+        const finalJob = await pollTaskJob(res.job.id)
+        if (finalJob.status === "failed") {
+          toast.error("执行失败: " + (finalJob.error || finalJob.message || "未知错误"))
+        } else if (finalJob.accountResult && !finalJob.accountResult.allWebDone) {
+          toast.warning(finalJob.message || finalJob.accountResult.summary || "部分任务未完成")
+        } else {
+          toast.success(finalJob.message || finalJob.accountResult?.summary || "签到执行完成")
+        }
+      } else {
+        toast.success(res.data?.summary || "签到执行完成")
+      }
       await onRefreshAll()
     } catch (err) {
       toast.error("执行失败: " + (err instanceof Error ? err.message : ""))
+      await onRefreshAll()
     } finally {
       setBusyAction("")
     }
@@ -126,20 +144,34 @@ export function AccountsTable({
   async function runAllAccounts() {
     setBusyAction("run-all")
     try {
-      const res = await apiRequest<{ results?: Array<{ success: boolean }> }>(
-        "/api/accounts/run-all",
-        { method: "POST" }
-      )
-      const list = res.results || []
-      const okCnt = list.filter((x) => x.success).length
-      if (okCnt === list.length) {
-        toast.success(`多账号批量签到完成：${okCnt}/${list.length} 成功`)
+      const res = await apiRequest<TaskJobStartResponse>("/api/accounts/run-all", {
+        method: "POST",
+      })
+      let list: Array<{ success: boolean }> = res.results || []
+      let errMsg = ""
+      if (res.async && res.job?.id) {
+        const finalJob = await pollTaskJob(res.job.id)
+        if (finalJob.status === "failed") {
+          errMsg = finalJob.error || finalJob.message || "批量签到失败"
+        }
+        if (finalJob.allResults) {
+          list = finalJob.allResults
+        }
+      }
+      if (errMsg) {
+        toast.error("批量签到失败: " + errMsg)
       } else {
-        toast.warning(`多账号批量签到完成：${okCnt}/${list.length} 成功`)
+        const okCnt = list.filter((x) => x.success).length
+        if (okCnt === list.length) {
+          toast.success(`多账号批量签到完成：${okCnt}/${list.length} 成功`)
+        } else {
+          toast.warning(`多账号批量签到完成：${okCnt}/${list.length} 成功`)
+        }
       }
       await onRefreshAll()
     } catch (err) {
       toast.error("批量签到失败: " + (err instanceof Error ? err.message : ""))
+      await onRefreshAll()
     } finally {
       setBusyAction("")
     }
@@ -173,9 +205,9 @@ export function AccountsTable({
             <RefreshCw className={cn("h-3.5 w-3.5", busyAction === "bal-all" && "animate-spin")} />
             刷新全部余额
           </Button>
-          <Button size="sm" disabled={busyAction === "run-all"} onClick={runAllAccounts}>
+          <Button size="sm" disabled={batchRunning} onClick={runAllAccounts}>
             <Play className="h-3.5 w-3.5" />
-            {busyAction === "run-all" ? "全部签到中..." : "全部账号立即签到"}
+            {batchRunning ? "后台签到中..." : "全部账号立即签到"}
           </Button>
         </div>
       </CardHeader>
@@ -286,10 +318,18 @@ export function AccountsTable({
                       <Button
                         variant="outline"
                         size="xs"
-                        disabled={busyAction === `run:${a.id}`}
+                        disabled={
+                          busyAction === `run:${a.id}` ||
+                          sc.running ||
+                          activeJobs.some(
+                            (j) =>
+                              j.status === "running" &&
+                              (j.kind === "all_accounts" || j.accountId === a.id)
+                          )
+                        }
                         onClick={() => runSingleCheckin(a)}
                       >
-                        {busyAction === `run:${a.id}` ? "签到中..." : "签到"}
+                        {busyAction === `run:${a.id}` || sc.running ? "签到中..." : "签到"}
                       </Button>
                       <Button variant="ghost" size="xs" onClick={() => renameAccount(a)}>
                         备注

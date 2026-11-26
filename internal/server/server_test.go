@@ -2,10 +2,12 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -313,5 +315,124 @@ func TestMultiAccountPoolAndBindingsAdminAPI(t *testing.T) {
 	recGwSt := doAdmin(http.MethodGet, "/api/gateway/status", nil)
 	if recGwSt.Code != http.StatusOK || !strings.Contains(recGwSt.Body.String(), `"standard":true`) || !strings.Contains(recGwSt.Body.String(), `"vision":false`) {
 		t.Fatalf("GET /api/gateway/status missing modelEnabled overrides: %d %s", recGwSt.Code, recGwSt.Body.String())
+	}
+}
+
+func TestAsyncManualTaskExecutionAndPolling(t *testing.T) {
+	var (
+		mu        sync.Mutex
+		chatCount int
+	)
+	upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/plaza/tasks":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 0,
+				"data": map[string]any{
+					"taskDate": "2026-11-26",
+					"list": []map[string]any{
+						{"id": 1, "taskKey": "bohrium_science_space_web", "titleZh": "体验玻尔科学空间「Web端」", "rewardAmount": 1000, "status": 0},
+					},
+				},
+			})
+		case r.URL.Path == "/api/v1/chat":
+			// Simulate slow execution (~120ms) after the caller's HTTP POST context would have been canceled.
+			time.Sleep(120 * time.Millisecond)
+			mu.Lock()
+			chatCount++
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"workflowId":"wf-async-1","sessionId":"sess-async-1","queryId":"q-async-1"}`))
+		case r.URL.Path == "/api/v1/query-events":
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case strings.HasPrefix(r.URL.Path, "/api/v1/chat/") && strings.HasSuffix(r.URL.Path, "/cancel"):
+			_, _ = w.Write([]byte(`{"durationMs":120}`))
+		default:
+			_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
+		}
+	}))
+	t.Cleanup(upSrv.Close)
+
+	srv, st, pw := setupTestServer(t)
+	srv.mgr.SetEndpoints(bohrium.Endpoints{
+		ClubBase:     upSrv.URL,
+		PlatformBase: upSrv.URL,
+		WWWBase:      upSrv.URL,
+		SBCloudBase:  upSrv.URL,
+		AgentBase:    upSrv.URL,
+		SigmaLLMBase: upSrv.URL,
+	})
+	acc, _, err := st.UpsertAccountFromAuth(store.AuthState{
+		Token: "tok-async-1", UserID: 9101, OrgID: 9102, Nickname: "AsyncTester", ExpiresAt: time.Now().Add(24 * time.Hour),
+	}, "Async")
+	if err != nil {
+		t.Fatalf("UpsertAccountFromAuth: %v", err)
+	}
+
+	// Trigger single manual task with a short HTTP request context that is canceled immediately after 202 returns.
+	reqCtx, cancelReq := context.WithCancel(context.Background())
+	bodyBytes, _ := json.Marshal(map[string]string{"taskKey": "bohrium_science_space_web"})
+	req := httptest.NewRequest(http.MethodPost, "/api/accounts/"+acc.ID+"/tasks/run", bytes.NewReader(bodyBytes)).WithContext(reqCtx)
+	req.Header.Set("X-Admin-Password", pw)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	cancelReq() // Simulate CDN/browser closing the POST request immediately after receiving 202.
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted for async manual task, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var startRes struct {
+		OK    bool              `json:"ok"`
+		Async bool              `json:"async"`
+		Job   scheduler.TaskJob `json:"job"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &startRes); err != nil || !startRes.Async || startRes.Job.ID == "" {
+		t.Fatalf("unexpected async start payload: err=%v body=%s", err, rec.Body.String())
+	}
+
+	// Second concurrent start for the same account while running MUST return 409 Conflict.
+	reqConflict := httptest.NewRequest(http.MethodPost, "/api/accounts/"+acc.ID+"/tasks/run", bytes.NewReader(bodyBytes))
+	reqConflict.Header.Set("X-Admin-Password", pw)
+	reqConflict.Header.Set("Content-Type", "application/json")
+	recConflict := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(recConflict, reqConflict)
+	if recConflict.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict while task running, got %d: %s", recConflict.Code, recConflict.Body.String())
+	}
+
+	// Poll GET /api/tasks/jobs/{id} until completed despite reqCtx cancellation.
+	var finalJob scheduler.TaskJob
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		pollReq := httptest.NewRequest(http.MethodGet, "/api/tasks/jobs/"+startRes.Job.ID, nil)
+		pollReq.Header.Set("X-Admin-Password", pw)
+		pollRec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(pollRec, pollReq)
+		if pollRec.Code != http.StatusOK {
+			t.Fatalf("GET /api/tasks/jobs/{id} failed: %d %s", pollRec.Code, pollRec.Body.String())
+		}
+		var pollRes struct {
+			OK  bool              `json:"ok"`
+			Job scheduler.TaskJob `json:"job"`
+		}
+		_ = json.Unmarshal(pollRec.Body.Bytes(), &pollRes)
+		if pollRes.Job.Status == "completed" || pollRes.Job.Status == "failed" {
+			finalJob = pollRes.Job
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if finalJob.Status != "completed" || finalJob.SingleRes == nil || !finalJob.SingleRes.Success || finalJob.SingleRes.WorkflowID != "wf-async-1" {
+		t.Fatalf("expected background job to succeed after caller disconnect, got %+v", finalJob)
+	}
+
+	// GET /api/tasks/jobs lists the job.
+	listReq := httptest.NewRequest(http.MethodGet, "/api/tasks/jobs", nil)
+	listReq.Header.Set("X-Admin-Password", pw)
+	listRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(listRec, listReq)
+	if listRec.Code != http.StatusOK || !strings.Contains(listRec.Body.String(), startRes.Job.ID) {
+		t.Fatalf("GET /api/tasks/jobs missing job: %d %s", listRec.Code, listRec.Body.String())
 	}
 }

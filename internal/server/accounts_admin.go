@@ -306,17 +306,15 @@ func (s *Server) handleRefreshAllBalances(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleRunAllAccounts(w http.ResponseWriter, r *http.Request) {
-	results, err := s.scheduler.RunAllAccountsManual(r.Context())
+	job, err := s.scheduler.StartAllAccountsManual()
 	if err != nil {
-		writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "error": err.Error(), "results": results})
+		writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	views, summary := s.buildAccountViews()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":       true,
-		"results":  results,
-		"accounts": views,
-		"summary":  summary,
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"ok":    true,
+		"async": true,
+		"job":   job,
 	})
 }
 
@@ -374,22 +372,16 @@ func (s *Server) handleAccountRunOne(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "尚未登录任何账号"})
 		return
 	}
-	ctx := r.Context()
-	res, err := s.scheduler.RunAccountSingleTaskManual(ctx, id, body.TaskKey)
+	job, err := s.scheduler.StartAccountSingleTaskManual(id, body.TaskKey)
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	after, _ := s.mgr.ForAccount(id).ListDailyTasks(ctx)
-	respBody := map[string]any{
-		"ok":         res.Success,
-		"data":       res,
-		"tasksAfter": after,
-	}
-	if !res.Success {
-		respBody["error"] = res.Message
-	}
-	writeJSON(w, http.StatusOK, respBody)
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"ok":    true,
+		"async": true,
+		"job":   job,
+	})
 }
 
 func (s *Server) handleAccountRunAll(w http.ResponseWriter, r *http.Request) {
@@ -402,12 +394,36 @@ func (s *Server) handleAccountRunAll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "尚未登录任何账号"})
 		return
 	}
-	res, err := s.scheduler.RunAccountManual(r.Context(), id)
+	job, err := s.scheduler.StartAccountManual(id)
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "data": res})
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"ok":    true,
+		"async": true,
+		"job":   job,
+	})
+}
+
+func (s *Server) handleListTaskJobs(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":   true,
+		"jobs": s.scheduler.ListTaskJobs(30),
+	})
+}
+
+func (s *Server) handleGetTaskJob(w http.ResponseWriter, r *http.Request) {
+	jobID := strings.TrimSpace(r.PathValue("id"))
+	job, ok := s.scheduler.GetTaskJob(jobID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "任务执行记录不存在"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":  true,
+		"job": job,
+	})
 }
 
 func (s *Server) finalizeLoginResponse(ctx context.Context, w http.ResponseWriter, scope *store.LoginScope) {
