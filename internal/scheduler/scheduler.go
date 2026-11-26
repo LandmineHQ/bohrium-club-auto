@@ -162,6 +162,13 @@ func (s *Scheduler) tick() {
 		if purged, err := s.store.PurgeExpiredSessionBindings(nowUTC); err == nil && purged > 0 {
 			log.Printf("[scheduler] purged %d expired OpenAI session binding(s) (>7d TTL)", purged)
 		}
+		retDays := cfg.Gateway.AnalyticsRetentionDays
+		if retDays <= 0 {
+			retDays = config.DefaultAnalyticsRetentionDays
+		}
+		if purged, err := s.store.PurgeExpiredGatewayUsage(nowUTC, retDays); err == nil && purged > 0 {
+			log.Printf("[scheduler] purged %d expired OpenAI usage log(s) (>%dd retention)", purged, retDays)
+		}
 	}
 
 	accounts, err := s.store.ListAccounts()
@@ -278,7 +285,7 @@ func (s *Scheduler) tick() {
 		s.markRunning(acc.ID, true, "scheduled:"+acc.DisplayName())
 		defer s.markRunning(acc.ID, false, "")
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		ctx, cancel := s.jobContext()
 		defer cancel()
 
 		log.Printf("[scheduler] starting daily Bohrium Web tasks for %s (%s)", acc.DisplayName(), day)
@@ -507,6 +514,18 @@ func (s *Scheduler) Status() Status {
 		st.NextRunAt = PlannedTimeForAccount(nowLocal, "default", cfg.Schedule.TimeHHMM, cfg.Schedule.JitterMinutes).Format("2006-01-02 15:04:05 MST")
 	}
 	return st
+}
+
+func (s *Scheduler) jobContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-s.stopCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
 }
 
 func (s *Scheduler) accountMutex(accountID string) *sync.Mutex {

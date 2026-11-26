@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"bohrium-club-auto/internal/config"
 	"bohrium-club-auto/internal/openai"
 	"bohrium-club-auto/internal/prompts"
+	"bohrium-club-auto/internal/store"
 )
 
 func (s *Server) handleGatewayStatus(w http.ResponseWriter, r *http.Request) {
@@ -49,14 +51,15 @@ func (s *Server) handleGatewayStatus(w http.ResponseWriter, r *http.Request) {
 		"ok":              true,
 		"bohriumLoggedIn": len(allViews) > 0,
 		"config": map[string]any{
-			"enabled":         gwCfg.Enabled,
-			"defaultModel":    gwCfg.DefaultModel,
-			"allowNoAuth":     gwCfg.AllowNoAuth,
-			"corsOrigins":     gwCfg.CORSOrigins,
-			"preflightMode":   gwCfg.PreflightMode,
-			"sciMasterPrompt": gwCfg.SciMasterPrompt,
-			"storeId":         gwCfg.StoreID,
-			"apiKeys":         gwCfg.APIKeys,
+			"enabled":                gwCfg.Enabled,
+			"defaultModel":           gwCfg.DefaultModel,
+			"allowNoAuth":            gwCfg.AllowNoAuth,
+			"corsOrigins":            gwCfg.CORSOrigins,
+			"preflightMode":          gwCfg.PreflightMode,
+			"sciMasterPrompt":        gwCfg.SciMasterPrompt,
+			"analyticsRetentionDays": gwCfg.AnalyticsRetentionDays,
+			"storeId":                gwCfg.StoreID,
+			"apiKeys":                gwCfg.APIKeys,
 		},
 		"pool": map[string]any{
 			"pooled":                poolViews,
@@ -258,12 +261,13 @@ func (s *Server) handleGatewayDeleteKey(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) handleGatewayUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Enabled         *bool   `json:"enabled"`
-		DefaultModel    *string `json:"defaultModel"`
-		AllowNoAuth     *bool   `json:"allowNoAuth"`
-		CORSOrigins     *string `json:"corsOrigins"`
-		PreflightMode   *bool   `json:"preflightMode"`
-		SciMasterPrompt *bool   `json:"sciMasterPrompt"`
+		Enabled                *bool   `json:"enabled"`
+		DefaultModel           *string `json:"defaultModel"`
+		AllowNoAuth            *bool   `json:"allowNoAuth"`
+		CORSOrigins            *string `json:"corsOrigins"`
+		PreflightMode          *bool   `json:"preflightMode"`
+		SciMasterPrompt        *bool   `json:"sciMasterPrompt"`
+		AnalyticsRetentionDays *int    `json:"analyticsRetentionDays"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "无效请求体"})
@@ -288,16 +292,189 @@ func (s *Server) handleGatewayUpdateSettings(w http.ResponseWriter, r *http.Requ
 		if body.SciMasterPrompt != nil {
 			c.Gateway.SciMasterPrompt = *body.SciMasterPrompt
 		}
+		if body.AnalyticsRetentionDays != nil {
+			d := *body.AnalyticsRetentionDays
+			if d < 1 || d > 3650 {
+				return &badInputError{"数据保留天数需在 1 ~ 3650 天之间"}
+			}
+			c.Gateway.AnalyticsRetentionDays = d
+		}
 		return nil
 	})
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
+	var purged int64
+	if body.AnalyticsRetentionDays != nil {
+		purged, _ = s.store.PurgeExpiredGatewayUsage(time.Now().UTC(), updated.Gateway.AnalyticsRetentionDays)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":      true,
 		"config":  updated.Gateway,
+		"purged":  purged,
 		"message": "OpenAI 网关配置已保存并立即生效",
+	})
+}
+
+func (s *Server) handleGatewayAnalytics(w http.ResponseWriter, r *http.Request) {
+	cfg := s.cfg.Get()
+	retDays := cfg.Gateway.AnalyticsRetentionDays
+	if retDays <= 0 {
+		retDays = config.DefaultAnalyticsRetentionDays
+	}
+
+	rangeDays := 30
+	if raw := strings.TrimSpace(r.URL.Query().Get("days")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 && n <= 3650 {
+			rangeDays = n
+		}
+	}
+	granularity := strings.TrimSpace(r.URL.Query().Get("granularity"))
+	apiKeyID := strings.TrimSpace(r.URL.Query().Get("apiKeyId"))
+	model := strings.TrimSpace(r.URL.Query().Get("model"))
+	accountID := strings.TrimSpace(r.URL.Query().Get("accountId"))
+
+	analytics, err := s.store.QueryGatewayAnalytics(store.UsageQueryOptions{
+		RangeDays:   rangeDays,
+		Granularity: granularity,
+		APIKeyID:    apiKeyID,
+		Model:       model,
+		AccountID:   accountID,
+		Timezone:    cfg.Schedule.Timezone,
+		Now:         time.Now().UTC(),
+	})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+
+	// Merge currently configured API keys so users can filter/see names cleanly even before or after renames.
+	keyNameMap := make(map[string]string, len(cfg.Gateway.APIKeys)+2)
+	keyNameMap["playground"] = "控制台调试"
+	keyNameMap["public"] = "无鉴权访问 (Public)"
+	seenKeys := make(map[string]bool, len(analytics.AvailableKeys)+len(cfg.Gateway.APIKeys))
+	for _, k := range cfg.Gateway.APIKeys {
+		if strings.TrimSpace(k.Name) != "" {
+			keyNameMap[k.ID] = strings.TrimSpace(k.Name)
+		}
+	}
+	for i := range analytics.AvailableKeys {
+		id := analytics.AvailableKeys[i].ID
+		seenKeys[id] = true
+		if n, ok := keyNameMap[id]; ok {
+			analytics.AvailableKeys[i].Name = n
+		}
+	}
+	for _, k := range cfg.Gateway.APIKeys {
+		if !seenKeys[k.ID] {
+			name := strings.TrimSpace(k.Name)
+			if name == "" {
+				name = k.ID
+			}
+			analytics.AvailableKeys = append(analytics.AvailableKeys, store.FilterOption{ID: k.ID, Name: name})
+			seenKeys[k.ID] = true
+		}
+	}
+	for i := range analytics.ByKey {
+		if n, ok := keyNameMap[analytics.ByKey[i].ID]; ok {
+			analytics.ByKey[i].Name = n
+		}
+	}
+	for i := range analytics.ByKeyModel {
+		if n, ok := keyNameMap[analytics.ByKeyModel[i].APIKeyID]; ok {
+			analytics.ByKeyModel[i].APIKeyName = n
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":                     true,
+		"analyticsRetentionDays": retDays,
+		"analytics":              analytics,
+	})
+}
+
+func (s *Server) handleGatewayAnalyticsLogs(w http.ResponseWriter, r *http.Request) {
+	cfg := s.cfg.Get()
+	q := r.URL.Query()
+	rangeDays := 30
+	if raw := strings.TrimSpace(q.Get("days")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 && n <= 3650 {
+			rangeDays = n
+		}
+	}
+	page, _ := strconv.Atoi(q.Get("page"))
+	pageSize, _ := strconv.Atoi(q.Get("pageSize"))
+
+	res, err := s.store.ListGatewayUsageLogs(store.UsageLogsQueryOptions{
+		RangeDays: rangeDays,
+		APIKeyID:  strings.TrimSpace(q.Get("apiKeyId")),
+		Model:     strings.TrimSpace(q.Get("model")),
+		AccountID: strings.TrimSpace(q.Get("accountId")),
+		Status:    strings.TrimSpace(q.Get("status")),
+		Stream:    strings.TrimSpace(q.Get("stream")),
+		Query:     strings.TrimSpace(q.Get("q")),
+		Timezone:  cfg.Schedule.Timezone,
+		Now:       time.Now().UTC(),
+		Page:      page,
+		PageSize:  pageSize,
+	})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+
+	// Map current API key names so renamed keys display consistently.
+	keyNameMap := map[string]string{
+		"playground": "控制台调试",
+		"public":     "无鉴权访问 (Public)",
+	}
+	for _, k := range cfg.Gateway.APIKeys {
+		if strings.TrimSpace(k.Name) != "" {
+			keyNameMap[k.ID] = strings.TrimSpace(k.Name)
+		}
+	}
+	for i := range res.Items {
+		if n, ok := keyNameMap[res.Items[i].APIKeyID]; ok {
+			res.Items[i].APIKeyName = n
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"items":      res.Items,
+		"total":      res.Total,
+		"page":       res.Page,
+		"pageSize":   res.PageSize,
+		"totalPages": res.TotalPages,
+	})
+}
+
+func (s *Server) handleGatewayPurgeAnalytics(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ClearAll bool `json:"clearAll"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	var (
+		purged int64
+		err    error
+	)
+	if body.ClearAll {
+		purged, err = s.store.ClearGatewayUsage()
+	} else {
+		retDays := s.cfg.Get().Gateway.AnalyticsRetentionDays
+		if retDays <= 0 {
+			retDays = config.DefaultAnalyticsRetentionDays
+		}
+		purged, err = s.store.PurgeExpiredGatewayUsage(time.Now().UTC(), retDays)
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"purged": purged,
 	})
 }
 
@@ -391,7 +568,7 @@ func (s *Server) handleGatewayPlayground(w http.ResponseWriter, r *http.Request)
 	}
 
 	b, _ := json.Marshal(reqPayload)
-	subCtx := r.Context()
+	subCtx := openai.WithCallerKeyIdentity(r.Context(), "playground", "控制台调试")
 	if strings.TrimSpace(body.AccountID) != "" {
 		subCtx = openai.WithExplicitAccountID(subCtx, body.AccountID)
 	}
@@ -400,7 +577,19 @@ func (s *Server) handleGatewayPlayground(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
+	subReq.RemoteAddr = r.RemoteAddr
 	subReq.Header.Set("Content-Type", "application/json")
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		subReq.Header.Set("X-Forwarded-For", xff)
+	}
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		subReq.Header.Set("X-Real-IP", xri)
+	}
+	if ua := r.Header.Get("User-Agent"); ua != "" {
+		subReq.Header.Set("User-Agent", ua)
+	} else {
+		subReq.Header.Set("User-Agent", "Bohrium-Console-Playground")
+	}
 	gwCfg := s.cfg.Get().Gateway
 	for _, k := range gwCfg.APIKeys {
 		if k.Enabled && k.Key != "" {

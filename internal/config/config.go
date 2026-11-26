@@ -25,16 +25,20 @@ type APIKey struct {
 	Enabled   bool   `json:"enabled"`
 }
 
+// DefaultAnalyticsRetentionDays is the default retention window for OpenAI gateway token usage logs.
+const DefaultAnalyticsRetentionDays = 180
+
 // GatewayConfig configures the Bohrium desktop-compatible OpenAI /v1/* API gateway.
 type GatewayConfig struct {
-	Enabled         bool     `json:"enabled"`
-	APIKeys         []APIKey `json:"apiKeys"`
-	DefaultModel    string   `json:"defaultModel"`
-	AllowNoAuth     bool     `json:"allowNoAuth"`
-	CORSOrigins     string   `json:"corsOrigins"`
-	PreflightMode   bool     `json:"preflightMode"`
-	SciMasterPrompt bool     `json:"sciMasterPrompt"`
-	StoreID         string   `json:"storeId"`
+	Enabled                bool     `json:"enabled"`
+	APIKeys                []APIKey `json:"apiKeys"`
+	DefaultModel           string   `json:"defaultModel"`
+	AllowNoAuth            bool     `json:"allowNoAuth"`
+	CORSOrigins            string   `json:"corsOrigins"`
+	PreflightMode          bool     `json:"preflightMode"`
+	SciMasterPrompt        bool     `json:"sciMasterPrompt"`
+	AnalyticsRetentionDays int      `json:"analyticsRetentionDays"`
+	StoreID                string   `json:"storeId"`
 }
 
 // Config holds persisted and environment-overridden application settings.
@@ -168,6 +172,11 @@ func Load() (*Manager, error) {
 	if v := strings.TrimSpace(os.Getenv("BOHRIUM_GATEWAY_SCIMASTER_PROMPT")); v != "" {
 		cfg.Gateway.SciMasterPrompt = parseBool(v, cfg.Gateway.SciMasterPrompt)
 	}
+	if v := strings.TrimSpace(os.Getenv("BOHRIUM_GATEWAY_RETENTION_DAYS")); v != "" {
+		if d, err := strconv.Atoi(v); err == nil && d >= 1 && d <= 3650 {
+			cfg.Gateway.AnalyticsRetentionDays = d
+		}
+	}
 	if v := strings.TrimSpace(os.Getenv("BOHRIUM_API_KEYS")); v != "" {
 		var envKeys []APIKey
 		nowISO := time.Now().UTC().Format(time.RFC3339)
@@ -258,12 +267,13 @@ func defaultConfig(dataDir string) Config {
 			AutoRefresh:   true,
 		},
 		Gateway: GatewayConfig{
-			Enabled:         true,
-			DefaultModel:    "dspro-high",
-			AllowNoAuth:     false,
-			CORSOrigins:     "*",
-			PreflightMode:   true,
-			SciMasterPrompt: true,
+			Enabled:                true,
+			DefaultModel:           "dspro-high",
+			AllowNoAuth:            false,
+			CORSOrigins:            "*",
+			PreflightMode:          true,
+			SciMasterPrompt:        true,
+			AnalyticsRetentionDays: DefaultAnalyticsRetentionDays,
 		},
 	}
 }
@@ -314,6 +324,9 @@ func fillMissingDefaults(cfg *Config, dataDir string) {
 	}
 	if strings.TrimSpace(cfg.Gateway.CORSOrigins) == "" {
 		cfg.Gateway.CORSOrigins = def.Gateway.CORSOrigins
+	}
+	if cfg.Gateway.AnalyticsRetentionDays <= 0 {
+		cfg.Gateway.AnalyticsRetentionDays = DefaultAnalyticsRetentionDays
 	}
 }
 

@@ -50,6 +50,7 @@ export function GatewayTab({ data, onRefresh, onRefreshAll }: GatewayTabProps) {
   const [sciMasterPrompt, setSciMasterPrompt] = useState(true)
   const [defaultModel, setDefaultModel] = useState("dspro-high")
   const [corsOrigins, setCorsOrigins] = useState("*")
+  const [retentionDays, setRetentionDays] = useState(180)
   const [savingSettings, setSavingSettings] = useState(false)
 
   const [newKeyName, setNewKeyName] = useState("")
@@ -65,6 +66,7 @@ export function GatewayTab({ data, onRefresh, onRefreshAll }: GatewayTabProps) {
     setSciMasterPrompt(cfg.sciMasterPrompt !== false)
     setDefaultModel(cfg.defaultModel || "dspro-high")
     setCorsOrigins(cfg.corsOrigins || "*")
+    setRetentionDays(cfg.analyticsRetentionDays || 180)
   }, [cfg])
 
   const sortedModels = useMemo(() => {
@@ -116,6 +118,7 @@ export function GatewayTab({ data, onRefresh, onRefreshAll }: GatewayTabProps) {
           sciMasterPrompt,
           defaultModel: defaultModel.trim() || "dspro-high",
           corsOrigins: corsOrigins.trim() || "*",
+          analyticsRetentionDays: Number(retentionDays) || 180,
         }),
       })
       toast.success("OpenAI 网关配置已保存")
@@ -305,7 +308,7 @@ export function GatewayTab({ data, onRefresh, onRefreshAll }: GatewayTabProps) {
               ))}
             </div>
 
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
               <div className="space-y-1.5">
                 <Label htmlFor="gw-default-model">默认模型</Label>
                 <Input
@@ -322,6 +325,18 @@ export function GatewayTab({ data, onRefresh, onRefreshAll }: GatewayTabProps) {
                   value={corsOrigins}
                   onChange={(e) => setCorsOrigins(e.target.value)}
                   placeholder="*"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="gw-retention">看板保留天数</Label>
+                <Input
+                  id="gw-retention"
+                  type="number"
+                  min={1}
+                  max={3650}
+                  value={retentionDays}
+                  onChange={(e) => setRetentionDays(Number(e.target.value))}
+                  placeholder="180"
                 />
               </div>
             </div>
@@ -514,6 +529,7 @@ export function GatewayTab({ data, onRefresh, onRefreshAll }: GatewayTabProps) {
           <TableHeader>
             <TableRow>
               <TableHead>时间</TableHead>
+              <TableHead>API Key</TableHead>
               <TableHead>接口</TableHead>
               <TableHead>模型</TableHead>
               <TableHead>命中账号 / 路由</TableHead>
@@ -525,7 +541,7 @@ export function GatewayTab({ data, onRefresh, onRefreshAll }: GatewayTabProps) {
           <TableBody>
             {!stats?.recentRequests?.length ? (
               <TableRow>
-                <TableCell colSpan={7} className="py-6 text-center text-muted-foreground">
+                <TableCell colSpan={8} className="py-6 text-center text-muted-foreground">
                   暂无网关调用记录
                 </TableCell>
               </TableRow>
@@ -539,6 +555,9 @@ export function GatewayTab({ data, onRefresh, onRefreshAll }: GatewayTabProps) {
                   <TableRow key={idx}>
                     <TableCell className="tabular-nums whitespace-nowrap">
                       {formatTime(r.timestamp)}
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant="mono">{r.apiKeyName || r.apiKeyId || "--"}</Badge>
                     </TableCell>
                     <TableCell>
                       <code className="rounded bg-muted px-1.5 py-0.5 text-[11px]">

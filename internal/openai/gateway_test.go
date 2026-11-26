@@ -1302,3 +1302,67 @@ func TestMultiAccountAggregatedBalance(t *testing.T) {
 		t.Fatalf("expected 20%% / 80%% pool weights, got %+v", bal.PoolAccounts)
 	}
 }
+
+func TestGatewayDetailedUsageTelemetryAndTTFT(t *testing.T) {
+	_, gwSrv, st, _, apiKey, _ := setupTestGatewayEnv(t, true, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("X-Request-Id", "up-req-telemetry-99")
+		w.WriteHeader(http.StatusOK)
+		fl, _ := w.(http.Flusher)
+		// Send Bohrium keepalive heartbeat first, then sleep briefly so TTFT measures real first token arrival
+		_, _ = io.WriteString(w, ": heartbeat\n\n")
+		if fl != nil {
+			fl.Flush()
+		}
+		time.Sleep(25 * time.Millisecond)
+		_, _ = io.WriteString(w, `data: {"id":"chatcmpl-tel1","object":"chat.completion.chunk","created":1700000000,"model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"id":"chatcmpl-tel1","object":"chat.completion.chunk","created":1700000000,"model":"kimi-k3","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":120,"completion_tokens":30,"total_tokens":150,"prompt_tokens_details":{"cached_tokens":20},"completion_tokens_details":{"reasoning_tokens":10}}}`+"\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	})
+
+	// Send /v1/responses targeting kimi-k3 (native chat_completions -> bridged=true, multiplier=2.0) via alias "Kimi-K3"
+	body := `{
+		"model": "Kimi-K3",
+		"stream": true,
+		"input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"describe"},{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}],
+		"reasoning": {"effort": "high"},
+		"tools": [{"type":"function","name":"lookup","parameters":{"type":"object","properties":{}}}]
+	}`
+	req, _ := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "OpenAI-TestClient/9.9")
+	req.Header.Set("X-Forwarded-For", "203.0.113.42, 10.0.0.1")
+	req.Header.Set("x-session-id", "telemetry-sess-1")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /v1/responses: %v", err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	page, err := st.ListGatewayUsageLogs(store.UsageLogsQueryOptions{RangeDays: 1, Page: 1, PageSize: 10})
+	if err != nil || page.Total != 1 || len(page.Items) != 1 {
+		t.Fatalf("expected 1 logged usage record, got page=%+v err=%v", page, err)
+	}
+	rec := page.Items[0]
+	if rec.Model != "kimi-k3" || rec.RequestedModel != "Kimi-K3" {
+		t.Fatalf("unexpected model alias recording: model=%q requested=%q", rec.Model, rec.RequestedModel)
+	}
+	if rec.ReasoningEffort != "high" || !rec.Bridged || !rec.Stream || !rec.HasTools || !rec.HasVision {
+		t.Fatalf("unexpected capability/bridge flags: %+v", rec)
+	}
+	if rec.ClientIP != "203.0.113.42" || rec.UserAgent != "OpenAI-TestClient/9.9" || rec.RequestID != "up-req-telemetry-99" {
+		t.Fatalf("unexpected caller/upstream metadata: ip=%q ua=%q reqId=%q", rec.ClientIP, rec.UserAgent, rec.RequestID)
+	}
+	if rec.PreflightMode != "preflight" || !rec.SciMasterPrompt || rec.UsageMultiplier != 2 || rec.WeightedTokens != 300 {
+		t.Fatalf("unexpected billing/policy telemetry: pf=%q sci=%v mult=%.2f weighted=%.2f", rec.PreflightMode, rec.SciMasterPrompt, rec.UsageMultiplier, rec.WeightedTokens)
+	}
+	if rec.FirstTokenMs < 20 || rec.DurationMs < rec.FirstTokenMs {
+		t.Fatalf("expected realistic TTFT >= 20ms and duration >= TTFT, got ttft=%d dur=%d", rec.FirstTokenMs, rec.DurationMs)
+	}
+}

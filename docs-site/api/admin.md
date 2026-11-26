@@ -41,7 +41,10 @@
 | 方法 | 路径 | 鉴权 | 说明 |
 | --- | --- | --- | --- |
 | <span class="api-method get">GET</span> | `/api/gateway/status` | 管理员 | 返回网关状态、模型目录、路由池权重明细（`pool`）、活跃绑定统计与账号列表 |
-| <span class="api-method put">PUT</span> | `/api/gateway/settings` | 管理员 | 更新网关开关、默认模型、Preflight 开关与 SciMaster 提示词开关 |
+| <span class="api-method get">GET</span> | `/api/gateway/analytics` | 管理员 | 按时间（`days`、`granularity`）、`apiKeyId`、`model`、`accountId` 聚合 Token 消耗、倍率折算、平均首字 TTFT 与调用统计（默认保留 180 天） |
+| <span class="api-method get">GET</span> | `/api/gateway/analytics/logs` | 管理员 | 分页检索详细使用记录（支持 `days`、`apiKeyId`、`model`、`accountId`、`status`、`stream`、`q`、`page`、`pageSize`），返回密钥、模型/别名、推理强度、端点/协议桥接、路由账号/Session Hash、计费预检策略/倍率、Token 明细、首字 TTFT/总耗时、IP 与 User-Agent |
+| <span class="api-method post">POST</span> | `/api/gateway/analytics/purge` | 管理员 | 立即按保留天数清理过期记录（或传 `{"clearAll":true}` 清空全部用量历史） |
+| <span class="api-method put">PUT</span> | `/api/gateway/settings` | 管理员 | 更新网关开关、默认模型、Preflight 开关、SciMaster 提示词开关与数据保留天数（`analyticsRetentionDays`） |
 | <span class="api-method put">PUT</span> | `/api/gateway/pool` | 管理员 | 手动编排 OpenAI 路由池成员与顺序（Body: `{"accountIds":["acc_1","acc_2"]}`） |
 | <span class="api-method get">GET</span> | `/api/gateway/bindings` | 管理员 | 查看 SQLite 中所有未过期的 7 天会话绑定（`sessionHash`、归属账号、命中次数、到期时间） |
 | <span class="api-method delete">DELETE</span> | `/api/gateway/bindings/{hash}` | 管理员 | 手动解绑单个会话哈希 |

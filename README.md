@@ -135,6 +135,7 @@ docs-site/               VitePress 文档工程
 | `BOHRIUM_GATEWAY_ALLOW_NO_AUTH` | `false` | 是否允许无 Key 访问 `/v1/*` |
 | `BOHRIUM_GATEWAY_PREFLIGHT` | `true` | 新对话前执行计费预检 |
 | `BOHRIUM_GATEWAY_SCIMASTER_PROMPT` | `true` | 主模型前置系统提示词开关 |
+| `BOHRIUM_GATEWAY_RETENTION_DAYS` | `180` | OpenAI 用量看板数据保留天数（1–3650） |
 
 ---
 
@@ -162,7 +163,8 @@ docs-site/               VitePress 文档工程
 | `GET` / `PUT` | `/api/settings` | 读取与更新调度及运行参数 |
 | `GET` | `/api/logs` | 查询 SQLite 执行日志（支持 `accountId`、`limit`） |
 | `GET` / `POST` | `/api/recon/{status,pull,diff}` | 前端快照状态、拉取基线与漂移检测 |
-| `GET` / `PUT` | `/api/gateway/{status,settings,pool}` | 网关状态、配置与路由池成员调整 |
+| `GET` / `PUT` | `/api/gateway/{status,settings,pool}` | 网关状态、配置（含数据保留天数）与路由池成员调整 |
+| `GET` / `POST` | `/api/gateway/analytics`、`analytics/logs`、`analytics/purge` | 按时间/Key/模型/账号聚合 Token 看板、详细调用记录分页检索（含推理强度/端点/桥接/计费策略/首字 TTFT/IP/UA）与手动清理 |
 | `GET` / `DELETE` | `/api/gateway/bindings` & `bindings/{hash}` | 查询、解绑或清空 7 天会话绑定 |
 | `POST` / `PATCH` / `DELETE` | `/api/gateway/keys` & `keys/{id}` | 管理 `/v1/*` API Key |
 | `POST` | `/api/gateway/{models/refresh,preflight,playground}` | 刷新模型目录、额度预检与在线调试 |

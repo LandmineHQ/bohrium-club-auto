@@ -24,6 +24,7 @@
 | `BOHRIUM_GATEWAY_CORS_ORIGINS` | `*` | `/v1/*` 响应的 `Access-Control-Allow-Origin` |
 | `BOHRIUM_GATEWAY_PREFLIGHT` | `true` | 是否在新用户轮次前调用 `/billing/preflight`（与客户端一致，工具续跑步骤自动跳过） |
 | `BOHRIUM_GATEWAY_SCIMASTER_PROMPT` | `true` | 是否在主模型请求中自动前置 Bohrium 客户端原生 SciMaster 系统提示词（关闭后纯透传原始 Prompt） |
+| `BOHRIUM_GATEWAY_RETENTION_DAYS` | `180` | OpenAI 用量看板 SQLite 记录保留天数（范围 1–3650，超过自动清理） |
 
 ## `data/config.json` 示例
 

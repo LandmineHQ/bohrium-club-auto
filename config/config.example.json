@@ -29,6 +29,7 @@
     "corsOrigins": "*",
     "preflightMode": true,
     "sciMasterPrompt": true,
+    "analyticsRetentionDays": 180,
     "storeId": ""
   },
   "taskDelaySec": 3,

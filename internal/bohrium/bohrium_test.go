@@ -558,3 +558,86 @@ func TestAccountProfileNicknameParsingAndBackfill(t *testing.T) {
 		t.Fatalf("expected extend.nickName priority, got %q", updated.Nickname)
 	}
 }
+
+func TestWaitForReaderDocumentReadyStatusDrivenPolling(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("BOHRIUM_DATA_DIR", tmp)
+	cfgMgr, _ := config.Load()
+	st, _ := store.Open(tmp)
+	t.Cleanup(func() { _ = st.Close() })
+	_ = st.SetAuth(store.AuthState{Token: makeTestJWT(1, 2, time.Now().Add(time.Hour))})
+
+	// Case 1: upgrade_required -> preparing -> transient 502 -> processing -> ready (no timeout)
+	var (
+		mu         sync.Mutex
+		postCalls  int
+		getCalls   int
+		statusSeq  = []string{"preparing", "502", "processing", "ready"}
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.URL.Path != "/api/v1/scix/reader/entries/entry-1/document" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Method == http.MethodPost {
+			postCalls++
+			if postCalls == 1 {
+				_, _ = w.Write([]byte(`{"code":0,"data":{"kind":"upgrade_required"}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"code":0,"data":{"kind":"preparing"}}`))
+			return
+		}
+		idx := getCalls
+		getCalls++
+		if idx >= len(statusSeq) {
+			idx = len(statusSeq) - 1
+		}
+		next := statusSeq[idx]
+		if next == "502" {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`upstream blip`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"code":0,"data":{"kind":"` + next + `"}}`))
+	}))
+	defer ts.Close()
+
+	httpCli, _ := chromehttp.New(chromehttp.Options{Timeout: 5 * time.Second})
+	cli := NewClient(httpCli, cfgMgr, st)
+	cli.SetEndpoints(Endpoints{SBCloudBase: ts.URL, WWWBase: ts.URL})
+	cli.readerPollInterval = 5 * time.Millisecond
+
+	if err := cli.waitForReaderDocumentReady(context.Background(), "entry-1", "rev-1"); err != nil {
+		t.Fatalf("expected status polling to recover and succeed, got %v", err)
+	}
+	if postCalls != 2 || getCalls != 4 {
+		t.Fatalf("expected 2 POST + 4 GET status polls, got post=%d get=%d", postCalls, getCalls)
+	}
+
+	// Case 2: upstream reports terminal failed status -> abort immediately with detail
+	tsFail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"code":0,"data":{"kind":"failed","error":"corrupted pdf"}}`))
+	}))
+	defer tsFail.Close()
+	cli.SetEndpoints(Endpoints{SBCloudBase: tsFail.URL, WWWBase: tsFail.URL})
+	err := cli.waitForReaderDocumentReady(context.Background(), "entry-bad", "")
+	if err == nil || !strings.Contains(err.Error(), "corrupted pdf") {
+		t.Fatalf("expected terminal failure error with detail, got %v", err)
+	}
+
+	// Case 3: caller context cancellation exits cleanly while status stays preparing
+	tsPrep := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"code":0,"data":{"kind":"preparing"}}`))
+	}))
+	defer tsPrep.Close()
+	cli.SetEndpoints(Endpoints{SBCloudBase: tsPrep.URL, WWWBase: tsPrep.URL})
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Millisecond)
+	defer cancel()
+	err = cli.waitForReaderDocumentReady(ctx, "entry-slow", "")
+	if err == nil || err != context.DeadlineExceeded {
+		t.Fatalf("expected caller context cancellation, got %v", err)
+	}
+}

@@ -88,6 +88,9 @@ type Client struct {
 	catalogCache     *SciXModelCatalog
 	catalogFetchedAt time.Time
 	catalogUserID    int64
+
+	// Optional override for reader document status polling interval (tests only; defaults to 2s/3s).
+	readerPollInterval time.Duration
 }
 
 // NewClient creates a Bohrium API client bound to the given AccountStore.

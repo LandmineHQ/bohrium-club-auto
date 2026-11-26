@@ -114,8 +114,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/recon/pull", s.requireAdmin(s.handleReconPull))
 	s.mux.HandleFunc("POST /api/recon/diff", s.requireAdmin(s.handleReconDiff))
 
-	// Admin OpenAI Gateway, Routing Pool & 7-Day Session Binding endpoints
+	// Admin OpenAI Gateway, Routing Pool, Analytics & 7-Day Session Binding endpoints
 	s.mux.HandleFunc("GET /api/gateway/status", s.requireAdmin(s.handleGatewayStatus))
+	s.mux.HandleFunc("GET /api/gateway/analytics", s.requireAdmin(s.handleGatewayAnalytics))
+	s.mux.HandleFunc("GET /api/gateway/analytics/logs", s.requireAdmin(s.handleGatewayAnalyticsLogs))
+	s.mux.HandleFunc("POST /api/gateway/analytics/purge", s.requireAdmin(s.handleGatewayPurgeAnalytics))
 	s.mux.HandleFunc("PUT /api/gateway/pool", s.requireAdmin(s.handleGatewaySetPool))
 	s.mux.HandleFunc("GET /api/gateway/bindings", s.requireAdmin(s.handleGatewayListBindings))
 	s.mux.HandleFunc("DELETE /api/gateway/bindings/{hash}", s.requireAdmin(s.handleGatewayDeleteBinding))

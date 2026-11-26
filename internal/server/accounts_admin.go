@@ -306,9 +306,7 @@ func (s *Server) handleRefreshAllBalances(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleRunAllAccounts(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Minute)
-	defer cancel()
-	results, err := s.scheduler.RunAllAccountsManual(ctx)
+	results, err := s.scheduler.RunAllAccountsManual(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "error": err.Error(), "results": results})
 		return
@@ -376,8 +374,7 @@ func (s *Server) handleAccountRunOne(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "尚未登录任何账号"})
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
-	defer cancel()
+	ctx := r.Context()
 	res, err := s.scheduler.RunAccountSingleTaskManual(ctx, id, body.TaskKey)
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "error": err.Error()})
@@ -405,9 +402,7 @@ func (s *Server) handleAccountRunAll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "尚未登录任何账号"})
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
-	defer cancel()
-	res, err := s.scheduler.RunAccountManual(ctx, id)
+	res, err := s.scheduler.RunAccountManual(r.Context(), id)
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "error": err.Error()})
 		return

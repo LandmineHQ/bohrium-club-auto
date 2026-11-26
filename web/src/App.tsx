@@ -8,6 +8,7 @@ import { AccountLoginDialog } from "@/components/auth/AccountLoginDialog"
 import { OverviewTab } from "@/components/overview/OverviewTab"
 import { AssetsTab } from "@/components/assets/AssetsTab"
 import { GatewayTab } from "@/components/gateway/GatewayTab"
+import { AnalyticsTab } from "@/components/analytics/AnalyticsTab"
 import { LogsTab } from "@/components/logs/LogsTab"
 import { ReconTab } from "@/components/recon/ReconTab"
 import { SettingsTab } from "@/components/settings/SettingsTab"
@@ -204,6 +205,10 @@ export function App() {
                     await Promise.all([loadOverview(), loadGateway()])
                   }}
                 />
+              )}
+
+              {activeTab === "analytics" && (
+                <AnalyticsTab active={activeTab === "analytics"} onRetentionUpdated={loadGateway} />
               )}
 
               {activeTab === "logs" && (

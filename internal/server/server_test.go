@@ -241,4 +241,63 @@ func TestMultiAccountPoolAndBindingsAdminAPI(t *testing.T) {
 	if len(afterAccs) != 1 || afterAccs[0].ID != acc1.ID {
 		t.Fatalf("expected only acc1 remaining, got %+v", afterAccs)
 	}
+
+	// 6. OpenAI usage analytics & configurable retention (default 180d -> custom 90d)
+	_ = st.RecordGatewayUsage(store.GatewayUsageRecord{
+		CreatedAt:        now.Add(-1 * time.Hour),
+		APIKeyID:         "key_test",
+		APIKeyName:       "Codex",
+		AccountID:        acc1.ID,
+		AccountLabel:     "Lab-A",
+		Model:            "dspro-high",
+		ReasoningEffort:  "high",
+		Endpoint:         "/v1/chat/completions",
+		UpstreamAPI:      "chat_completions",
+		RoutingMode:      "bound",
+		ClientIP:         "10.1.2.3",
+		UserAgent:        "CodexCLI/1.5",
+		Stream:           true,
+		PreflightMode:    "preflight",
+		UsageMultiplier:  1.0,
+		Status:           200,
+		FirstTokenMs:     240,
+		DurationMs:       950,
+		PromptTokens:     1200,
+		CompletionTokens: 300,
+		ReasoningTokens:  100,
+	})
+	_ = st.RecordGatewayUsage(store.GatewayUsageRecord{
+		CreatedAt:        now.AddDate(0, 0, -120),
+		APIKeyID:         "key_test",
+		APIKeyName:       "Codex",
+		AccountID:        acc1.ID,
+		AccountLabel:     "Lab-A",
+		Model:            "dspro-high",
+		Endpoint:         "/v1/chat/completions",
+		Status:           200,
+		PromptTokens:     5000,
+		CompletionTokens: 1000,
+	})
+
+	recAn := doAdmin(http.MethodGet, "/api/gateway/analytics?days=180", nil)
+	if recAn.Code != http.StatusOK || !strings.Contains(recAn.Body.String(), `"analyticsRetentionDays":180`) || !strings.Contains(recAn.Body.String(), `"totalTokens":7500`) {
+		t.Fatalf("GET /api/gateway/analytics failed: %d %s", recAn.Code, recAn.Body.String())
+	}
+
+	recLogs := doAdmin(http.MethodGet, "/api/gateway/analytics/logs?days=180&q=CodexCLI&page=1&pageSize=10", nil)
+	if recLogs.Code != http.StatusOK || !strings.Contains(recLogs.Body.String(), `"total":1`) || !strings.Contains(recLogs.Body.String(), `"clientIp":"10.1.2.3"`) || !strings.Contains(recLogs.Body.String(), `"firstTokenMs":240`) {
+		t.Fatalf("GET /api/gateway/analytics/logs failed: %d %s", recLogs.Code, recLogs.Body.String())
+	}
+
+	// Update retention to 90 days -> immediately purges the 120-day-old record
+	recSet := doAdmin(http.MethodPut, "/api/gateway/settings", map[string]any{
+		"analyticsRetentionDays": 90,
+	})
+	if recSet.Code != http.StatusOK || !strings.Contains(recSet.Body.String(), `"purged":1`) {
+		t.Fatalf("PUT /api/gateway/settings retention update failed: %d %s", recSet.Code, recSet.Body.String())
+	}
+	recAn2 := doAdmin(http.MethodGet, "/api/gateway/analytics?days=180", nil)
+	if recAn2.Code != http.StatusOK || !strings.Contains(recAn2.Body.String(), `"analyticsRetentionDays":90`) || !strings.Contains(recAn2.Body.String(), `"totalTokens":1500`) {
+		t.Fatalf("GET /api/gateway/analytics after 90d purge failed: %d %s", recAn2.Code, recAn2.Body.String())
+	}
 }

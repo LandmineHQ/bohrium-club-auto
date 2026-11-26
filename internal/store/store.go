@@ -360,9 +360,52 @@ CREATE TABLE IF NOT EXISTS run_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_run_logs_ts ON run_logs(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_run_logs_acc ON run_logs(account_id, timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS gateway_usage_logs (
+    id                TEXT PRIMARY KEY,
+    created_at        INTEGER NOT NULL,
+    api_key_id        TEXT NOT NULL DEFAULT '',
+    api_key_name      TEXT NOT NULL DEFAULT '',
+    account_id        TEXT NOT NULL DEFAULT '',
+    account_label     TEXT NOT NULL DEFAULT '',
+    model             TEXT NOT NULL DEFAULT '',
+    requested_model   TEXT NOT NULL DEFAULT '',
+    reasoning_effort  TEXT NOT NULL DEFAULT '',
+    endpoint          TEXT NOT NULL DEFAULT '',
+    upstream_api      TEXT NOT NULL DEFAULT '',
+    bridged           INTEGER NOT NULL DEFAULT 0,
+    routing_mode      TEXT NOT NULL DEFAULT '',
+    session_hash      TEXT NOT NULL DEFAULT '',
+    request_id        TEXT NOT NULL DEFAULT '',
+    client_ip         TEXT NOT NULL DEFAULT '',
+    user_agent        TEXT NOT NULL DEFAULT '',
+    stream            INTEGER NOT NULL DEFAULT 0,
+    has_tools         INTEGER NOT NULL DEFAULT 0,
+    has_vision        INTEGER NOT NULL DEFAULT 0,
+    preflight_mode    TEXT NOT NULL DEFAULT '',
+    sci_master_prompt INTEGER NOT NULL DEFAULT 0,
+    usage_multiplier  REAL NOT NULL DEFAULT 0,
+    weighted_tokens   REAL NOT NULL DEFAULT 0,
+    status            INTEGER NOT NULL DEFAULT 0,
+    first_token_ms    INTEGER NOT NULL DEFAULT 0,
+    duration_ms       INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens  INTEGER NOT NULL DEFAULT 0,
+    cached_tokens     INTEGER NOT NULL DEFAULT 0,
+    total_tokens      INTEGER NOT NULL DEFAULT 0,
+    error             TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_usage_created ON gateway_usage_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_key_created ON gateway_usage_logs(api_key_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_model_created ON gateway_usage_logs(model, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_account_created ON gateway_usage_logs(account_id, created_at DESC);
 `
 	if _, err := s.db.Exec(ddl); err != nil {
 		return fmt.Errorf("init sqlite schema: %w", err)
+	}
+	if err := s.ensureUsageColumns(); err != nil {
+		return fmt.Errorf("migrate gateway_usage_logs columns: %w", err)
 	}
 	return nil
 }

@@ -12,18 +12,34 @@ const maxRecentRequests = 50
 // StoredResponse aliases the SQLite-backed Responses API record with account & session_hash ownership.
 type StoredResponse = store.ResponseRecord
 
-// RequestLogEntry captures a compact record of a gateway API call for dashboard visibility.
+// RequestLogEntry captures a detailed record of a gateway API call for dashboard visibility & SQLite analytics.
 type RequestLogEntry struct {
 	ID               string    `json:"id"`
 	Timestamp        time.Time `json:"timestamp"`
+	APIKeyID         string    `json:"apiKeyId,omitempty"`
+	APIKeyName       string    `json:"apiKeyName,omitempty"`
 	Endpoint         string    `json:"endpoint"` // "/v1/chat/completions" | "/v1/responses"
 	UpstreamAPI      string    `json:"upstreamApi"`
+	Bridged          bool      `json:"bridged,omitempty"`
 	Model            string    `json:"model"`
+	RequestedModel   string    `json:"requestedModel,omitempty"`
+	ReasoningEffort  string    `json:"reasoningEffort,omitempty"`
 	AccountID        string    `json:"accountId,omitempty"`
 	AccountLabel     string    `json:"accountLabel,omitempty"`
 	RoutingMode      string    `json:"routingMode,omitempty"` // "bound" | "new_bind" | "rebound" | "direct"
+	SessionHash      string    `json:"sessionHash,omitempty"`
+	RequestID        string    `json:"requestId,omitempty"`
+	ClientIP         string    `json:"clientIp,omitempty"`
+	UserAgent        string    `json:"userAgent,omitempty"`
 	Stream           bool      `json:"stream"`
+	HasTools         bool      `json:"hasTools,omitempty"`
+	HasVision        bool      `json:"hasVision,omitempty"`
+	PreflightMode    string    `json:"preflightMode,omitempty"` // "preflight" | "tool_skip" | "disabled"
+	SciMasterPrompt  bool      `json:"sciMasterPrompt,omitempty"`
+	UsageMultiplier  float64   `json:"usageMultiplier,omitempty"`
+	WeightedTokens   float64   `json:"weightedTokens,omitempty"`
 	Status           int       `json:"status"`
+	FirstTokenMs     int64     `json:"firstTokenMs,omitempty"`
 	DurationMs       int64     `json:"durationMs"`
 	PromptTokens     int64     `json:"promptTokens"`
 	CompletionTokens int64     `json:"completionTokens"`
@@ -60,11 +76,50 @@ type ResponseStore struct {
 
 // OpenResponseStore wraps the shared SQLite store for Responses API persistence and live telemetry.
 func OpenResponseStore(st *store.Store) *ResponseStore {
-	return &ResponseStore{
+	rs := &ResponseStore{
 		db:          st,
 		modelCounts: make(map[string]int64),
 		recent:      make([]RequestLogEntry, 0, maxRecentRequests),
 	}
+	if st != nil {
+		for _, rec := range st.RecentGatewayUsage(maxRecentRequests) {
+			rs.recent = append(rs.recent, RequestLogEntry{
+				ID:               rec.ID,
+				Timestamp:        rec.CreatedAt,
+				APIKeyID:         rec.APIKeyID,
+				APIKeyName:       rec.APIKeyName,
+				Endpoint:         rec.Endpoint,
+				UpstreamAPI:      rec.UpstreamAPI,
+				Bridged:          rec.Bridged,
+				Model:            rec.Model,
+				RequestedModel:   rec.RequestedModel,
+				ReasoningEffort:  rec.ReasoningEffort,
+				AccountID:        rec.AccountID,
+				AccountLabel:     rec.AccountLabel,
+				RoutingMode:      rec.RoutingMode,
+				SessionHash:      rec.SessionHash,
+				RequestID:        rec.RequestID,
+				ClientIP:         rec.ClientIP,
+				UserAgent:        rec.UserAgent,
+				Stream:           rec.Stream,
+				HasTools:         rec.HasTools,
+				HasVision:        rec.HasVision,
+				PreflightMode:    rec.PreflightMode,
+				SciMasterPrompt:  rec.SciMasterPrompt,
+				UsageMultiplier:  rec.UsageMultiplier,
+				WeightedTokens:   rec.WeightedTokens,
+				Status:           rec.Status,
+				FirstTokenMs:     rec.FirstTokenMs,
+				DurationMs:       rec.DurationMs,
+				PromptTokens:     rec.PromptTokens,
+				CompletionTokens: rec.CompletionTokens,
+				ReasoningTokens:  rec.ReasoningTokens,
+				CachedTokens:     rec.CachedTokens,
+				Error:            rec.Error,
+			})
+		}
+	}
+	return rs
 }
 
 // Save stores a completed response record in SQLite.
@@ -143,6 +198,43 @@ func (rs *ResponseStore) RecordRequest(entry RequestLogEntry) {
 	rs.recent = append([]RequestLogEntry{entry}, rs.recent...)
 	if len(rs.recent) > maxRecentRequests {
 		rs.recent = rs.recent[:maxRecentRequests]
+	}
+	if rs.db != nil {
+		_ = rs.db.RecordGatewayUsage(store.GatewayUsageRecord{
+			ID:               entry.ID,
+			CreatedAt:        entry.Timestamp,
+			APIKeyID:         entry.APIKeyID,
+			APIKeyName:       entry.APIKeyName,
+			AccountID:        entry.AccountID,
+			AccountLabel:     entry.AccountLabel,
+			Model:            entry.Model,
+			RequestedModel:   entry.RequestedModel,
+			ReasoningEffort:  entry.ReasoningEffort,
+			Endpoint:         entry.Endpoint,
+			UpstreamAPI:      entry.UpstreamAPI,
+			Bridged:          entry.Bridged,
+			RoutingMode:      entry.RoutingMode,
+			SessionHash:      entry.SessionHash,
+			RequestID:        entry.RequestID,
+			ClientIP:         entry.ClientIP,
+			UserAgent:        entry.UserAgent,
+			Stream:           entry.Stream,
+			HasTools:         entry.HasTools,
+			HasVision:        entry.HasVision,
+			PreflightMode:    entry.PreflightMode,
+			SciMasterPrompt:  entry.SciMasterPrompt,
+			UsageMultiplier:  entry.UsageMultiplier,
+			WeightedTokens:   entry.WeightedTokens,
+			Status:           entry.Status,
+			FirstTokenMs:     entry.FirstTokenMs,
+			DurationMs:       entry.DurationMs,
+			PromptTokens:     entry.PromptTokens,
+			CompletionTokens: entry.CompletionTokens,
+			ReasoningTokens:  entry.ReasoningTokens,
+			CachedTokens:     entry.CachedTokens,
+			TotalTokens:      entry.PromptTokens + entry.CompletionTokens,
+			Error:            entry.Error,
+		})
 	}
 }
 

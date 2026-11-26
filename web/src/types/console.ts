@@ -2,6 +2,7 @@ export type ConsoleTab =
   | "overview"
   | "assets"
   | "gateway"
+  | "analytics"
   | "logs"
   | "recon"
   | "settings"
@@ -228,6 +229,7 @@ export interface GatewayConfigView {
   corsOrigins: string
   preflightMode: boolean
   sciMasterPrompt: boolean
+  analyticsRetentionDays?: number
   storeId?: string
   apiKeys: GatewayApiKey[]
 }
@@ -253,6 +255,8 @@ export interface SciXModelItem {
 
 export interface GatewayRecentRequest {
   timestamp: string
+  apiKeyId?: string
+  apiKeyName?: string
   endpoint: string
   stream?: boolean
   model?: string
@@ -334,4 +338,140 @@ export interface ReconDiffData {
   added?: Array<{ url: string }>
   changed?: Array<{ url: string }>
   removed?: Array<{ url: string }>
+}
+
+export interface UsageSummary {
+  totalRequests: number
+  successRequests: number
+  failedRequests: number
+  successRate: number
+  promptTokens: number
+  completionTokens: number
+  reasoningTokens: number
+  cachedTokens: number
+  totalTokens: number
+  weightedTokens?: number
+  avgFirstTokenMs?: number
+  avgDurationMs: number
+  activeKeys: number
+  activeModels: number
+  activeAccounts: number
+}
+
+export interface TimeSeriesBucket {
+  bucket: string
+  label: string
+  requests: number
+  successRequests: number
+  failedRequests: number
+  promptTokens: number
+  completionTokens: number
+  reasoningTokens: number
+  cachedTokens: number
+  totalTokens: number
+  weightedTokens?: number
+}
+
+export interface DimensionUsage {
+  id: string
+  name: string
+  requests: number
+  successRequests: number
+  failedRequests: number
+  promptTokens: number
+  completionTokens: number
+  reasoningTokens: number
+  cachedTokens: number
+  totalTokens: number
+  weightedTokens?: number
+  avgDurationMs: number
+  sharePercent: number
+}
+
+export interface KeyModelUsage {
+  apiKeyId: string
+  apiKeyName: string
+  model: string
+  requests: number
+  promptTokens: number
+  completionTokens: number
+  reasoningTokens: number
+  cachedTokens: number
+  totalTokens: number
+  weightedTokens?: number
+}
+
+export interface FilterOption {
+  id: string
+  name: string
+}
+
+export interface GatewayAnalyticsData {
+  rangeDays: number
+  granularity: "hour" | "day"
+  timezone: string
+  from: string
+  to: string
+  summary: UsageSummary
+  timeSeries: TimeSeriesBucket[]
+  byKey: DimensionUsage[]
+  byModel: DimensionUsage[]
+  byAccount: DimensionUsage[]
+  byKeyModel: KeyModelUsage[]
+  availableKeys: FilterOption[]
+  availableModels: FilterOption[]
+  availableAccounts: FilterOption[]
+  totalStoredRecords: number
+  oldestRecordAt?: string
+}
+
+export interface GatewayAnalyticsResponse {
+  ok: boolean
+  analyticsRetentionDays: number
+  analytics: GatewayAnalyticsData
+}
+
+export interface GatewayUsageLogItem {
+  id: string
+  createdAt: string
+  apiKeyId: string
+  apiKeyName: string
+  accountId: string
+  accountLabel: string
+  model: string
+  requestedModel?: string
+  reasoningEffort?: string
+  endpoint: string
+  upstreamApi: string
+  bridged: boolean
+  routingMode: string
+  sessionHash?: string
+  requestId?: string
+  clientIp?: string
+  userAgent?: string
+  stream: boolean
+  hasTools: boolean
+  hasVision: boolean
+  preflightMode?: string
+  sciMasterPrompt: boolean
+  usageMultiplier: number
+  weightedTokens: number
+  status: number
+  firstTokenMs: number
+  durationMs: number
+  promptTokens: number
+  completionTokens: number
+  reasoningTokens: number
+  cachedTokens: number
+  totalTokens: number
+  error?: string
+}
+
+export interface UsageLogsPageResponse {
+  ok: boolean
+  items: GatewayUsageLogItem[]
+  total: number
+  page: number
+  pageSize: number
+  totalPages: number
 }

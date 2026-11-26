@@ -549,11 +549,12 @@ func (c *Client) registerReaderEntry(ctx context.Context, userResourceID string)
 	}
 
 	var lastErr error
-	for attempt := 0; attempt < 4; attempt++ {
+	const maxRegisterAttempts = 12
+	for attempt := 0; attempt < maxRegisterAttempts; attempt++ {
 		resp, err := c.http.DoJSON(ctx, http.MethodPost, u, payload, c.sbCloudHeaders(auth.Token, "agent/chat-with-paper"))
 		if err != nil {
 			lastErr = err
-		} else if resp.StatusCode == http.StatusConflict || resp.StatusCode >= 500 {
+		} else if resp.StatusCode == http.StatusConflict || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 			lastErr = fmt.Errorf("reader/entries HTTP %d: %s", resp.StatusCode, truncateText(string(resp.Body), 180))
 		} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return "", "", fmt.Errorf("reader/entries HTTP %d: %s", resp.StatusCode, truncateText(string(resp.Body), 180))
@@ -595,21 +596,63 @@ func (c *Client) registerReaderEntry(ctx context.Context, userResourceID string)
 			}
 		}
 
-		if attempt < 3 {
+		if attempt < maxRegisterAttempts-1 {
+			wait := 1500 * time.Millisecond
+			if attempt >= 4 {
+				wait = 2500 * time.Millisecond
+			}
+			if c.readerPollInterval > 0 {
+				wait = c.readerPollInterval
+			}
 			select {
 			case <-ctx.Done():
 				return "", "", ctx.Err()
-			case <-time.After(1500 * time.Millisecond):
+			case <-time.After(wait):
 			}
 		}
 	}
 	return "", "", lastErr
 }
 
-// waitForReaderDocumentReady reproduces the official reader-web prepareOnce state machine:
-// 1. Call POST /api/v1/scix/reader/entries/<id>/document to kick off parsing/upgrade.
-// 2. While kind != "ready": sleep briefly, re-POST if kind is "upgrade_required"/"not_started",
-//    otherwise poll GET .../document?status=1 until ready (or failed/timeout).
+func parseReaderDocumentStatus(raw []byte) (kind string, detail string) {
+	var parsed map[string]any
+	if json.Unmarshal(raw, &parsed) != nil {
+		return "", ""
+	}
+	obj := parsed
+	if data := asMap(parsed["data"]); data != nil {
+		obj = data
+	}
+	kind = strings.ToLower(strings.TrimSpace(asString(obj["kind"])))
+	if kind == "" {
+		kind = strings.ToLower(strings.TrimSpace(asString(obj["status"])))
+	}
+	if kind == "" {
+		if prep := asMap(obj["preparation"]); prep != nil {
+			kind = strings.ToLower(strings.TrimSpace(asString(prep["status"])))
+			detail = strings.TrimSpace(asString(prep["error"]))
+		}
+	}
+	if detail == "" {
+		for _, m := range []map[string]any{obj, parsed} {
+			for _, k := range []string{"error", "message", "msg", "reason"} {
+				if s := strings.TrimSpace(asString(m[k])); s != "" {
+					detail = s
+					break
+				}
+			}
+			if detail != "" {
+				break
+			}
+		}
+	}
+	return kind, detail
+}
+
+// waitForReaderDocumentReady polls Bohrium's Reader document state machine until the document
+// reports "ready" (proceeding immediately to the chat step) or a terminal failure state.
+// Because document state is actively queried from upstream, there is no arbitrary wall-clock timeout:
+// polling continues as long as upstream reports an in-progress status and ctx remains active.
 func (c *Client) waitForReaderDocumentReady(ctx context.Context, entryID, sourceRev string) error {
 	auth := c.store.GetAuth()
 	headers := c.sbCloudHeaders(auth.Token, "agent/chat-with-paper")
@@ -620,58 +663,78 @@ func (c *Client) waitForReaderDocumentReady(ctx context.Context, entryID, source
 		prepareBody["sourceRevision"] = sourceRev
 	}
 
-	parseKind := func(raw []byte) string {
-		var parsed map[string]any
-		if json.Unmarshal(raw, &parsed) != nil {
-			return ""
-		}
-		obj := parsed
-		if data := asMap(parsed["data"]); data != nil {
-			obj = data
-		}
-		if k := asString(obj["kind"]); k != "" {
-			return k
-		}
-		return asString(obj["status"])
-	}
-
-	// Step 1: Always invoke POST .../document first (triggers parsing / upgrade_required).
-	resp, err := c.http.DoJSON(ctx, http.MethodPost, docURL, prepareBody, headers)
+	const maxConsecutivePollErrors = 5
+	consecutiveErrs := 0
 	kind := ""
-	if err == nil {
-		kind = parseKind(resp.Body)
-	}
 
-	deadline := time.Now().Add(90 * time.Second)
-	for attempt := 0; time.Now().Before(deadline); attempt++ {
-		switch kind {
-		case "ready":
-			return nil
-		case "failed":
-			return fmt.Errorf("文献解析失败 (kind=failed)")
+	for attempt := 0; ; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
 
-		wait := 2500 * time.Millisecond
+		// First attempt (or upgrade_required / not_started / empty status) triggers POST .../document;
+		// once preparation is running, poll GET .../document?status=1 until ready or failed.
+		var (
+			method  string
+			reqURL  string
+			reqBody any
+		)
+		if attempt == 0 || kind == "" || kind == "upgrade_required" || kind == "not_started" {
+			method = http.MethodPost
+			reqURL = docURL
+			reqBody = prepareBody
+		} else {
+			method = http.MethodGet
+			reqURL = docURL + "?status=1"
+			reqBody = nil
+		}
+
+		resp, err := c.http.DoJSON(ctx, method, reqURL, reqBody, headers)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			consecutiveErrs++
+			if consecutiveErrs >= maxConsecutivePollErrors {
+				return fmt.Errorf("连续 %d 次轮询文献状态失败: %w", consecutiveErrs, err)
+			}
+		} else if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return fmt.Errorf("查询文献状态鉴权失败 (HTTP %d)", resp.StatusCode)
+		} else if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusUnprocessableEntity {
+			return fmt.Errorf("查询文献状态失败 (HTTP %d): %s", resp.StatusCode, truncateText(string(resp.Body), 180))
+		} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			consecutiveErrs++
+			if consecutiveErrs >= maxConsecutivePollErrors {
+				return fmt.Errorf("连续 %d 次轮询文献状态返回异常 HTTP %d: %s", consecutiveErrs, resp.StatusCode, truncateText(string(resp.Body), 180))
+			}
+		} else {
+			consecutiveErrs = 0
+			var detail string
+			kind, detail = parseReaderDocumentStatus(resp.Body)
+			switch kind {
+			case "ready":
+				return nil
+			case "failed", "error", "unsupported", "invalid", "canceled", "cancelled":
+				if detail != "" {
+					return fmt.Errorf("文献解析失败 (status=%s): %s", kind, truncateText(detail, 180))
+				}
+				return fmt.Errorf("文献解析失败 (status=%s)", kind)
+			}
+		}
+
+		wait := 2000 * time.Millisecond
 		if attempt >= 4 {
-			wait = 3500 * time.Millisecond
+			wait = 3000 * time.Millisecond
+		}
+		if c.readerPollInterval > 0 {
+			wait = c.readerPollInterval
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(wait):
 		}
-
-		if kind == "" || kind == "upgrade_required" || kind == "not_started" {
-			resp, err = c.http.DoJSON(ctx, http.MethodPost, docURL, prepareBody, headers)
-		} else {
-			resp, err = c.http.DoJSON(ctx, http.MethodGet, docURL+"?status=1", nil, headers)
-		}
-		if err != nil {
-			return err
-		}
-		kind = parseKind(resp.Body)
 	}
-	return fmt.Errorf("等待文献解析超时（最后状态: %s）", nonEmpty(kind, "unknown"))
 }
 
 type chatOutcome struct {
