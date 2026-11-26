@@ -118,7 +118,7 @@ docker compose up -d --build
 ## 6. Repository Maintenance Gotchas
 
 - **Keep root-anchored ignore patterns**: In both `.gitignore` and `.dockerignore`, `/data/`, `/recon/`, `/dist/`, and `/bin/` MUST retain their leading slash so `internal/prompts/data/` and `internal/recon/` stay tracked in Git and included in Docker build contexts.
-- **GitHub Actions macOS runners**: Keep `macos-15-intel` and `macos-15` in binary build/publish workflows (`macos-13` and `macos-14` are retired).
+- **GitHub Actions macOS runners**: Keep `macos-15-intel` and `macos-15` in `build-binaries.yml` for native smoke testing (`macos-13` and `macos-14` are retired), while `publish-binaries.yml` cross-compiles all 5 pure-Go `CGO_ENABLED=0` targets on `ubuntu-latest` to avoid hosted macOS arm64 runner capacity timeouts.
 - **Timezone data**: `cmd/bohrium-club-auto/main.go` imports `_ "time/tzdata"` so `Asia/Shanghai` works reliably across minimal containers and Windows without host tzdata.
 - **UI Safety**: React JSX automatically escapes rendered values; never use `dangerouslySetInnerHTML` with upstream strings in `web/src/`.
 - **Documentation Sync**: Whenever environment variables, API endpoints, workflows, or recon markers change, update `README.md`, `config/config.example.json`, and `docs/RECON-SNAPSHOT.md` in the same commit.

@@ -37,5 +37,5 @@ docker compose up -d --build
 
 - `.github/workflows/ci.yml`：Push/PR 自动构建前端并运行 `go vet`、`go test -race` 与静态编译；
 - `.github/workflows/build-binaries.yml`：手动触发，先构建一份 `web/dist` Artifact，再在 5 平台原生 Runner 上测试、编译并执行 HTTP 冒烟（校验 `/healthz`、SPA `/assets/` 与管理员 401/200）；
-- `.github/workflows/publish-binaries.yml`：手动触发，打包 5 平台归档与 `SHA256SUMS.txt` 并发布 Release；
+- `.github/workflows/publish-binaries.yml`：手动触发，在 `ubuntu-latest` 上通过 `CGO_ENABLED=0` 交叉编译 5 个平台静态单文件，打包 `.zip`/`.tar.gz` 与 `SHA256SUMS.txt` 并发布 Release；
 - `.github/workflows/build-docker-image.yml` / `publish-docker-image.yml`：容器构建冒烟与多架构 GHCR 推送。

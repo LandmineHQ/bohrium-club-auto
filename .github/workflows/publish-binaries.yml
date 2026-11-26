@@ -58,39 +58,34 @@ jobs:
   build:
     name: build-${{ matrix.name }}
     needs: web-build
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: windows-x64
-            os: windows-latest
             goos: windows
             goarch: amd64
             dir: windows-x64
             asset: bohrium-club-auto-windows-x64.zip
           - name: linux-x64
-            os: ubuntu-latest
             goos: linux
             goarch: amd64
             dir: linux-x64
             asset: bohrium-club-auto-linux-x64.tar.gz
           - name: linux-arm64
-            os: ubuntu-24.04-arm
             goos: linux
             goarch: arm64
             dir: linux-arm64
             asset: bohrium-club-auto-linux-arm64.tar.gz
           - name: darwin-x64
-            os: macos-15-intel
             goos: darwin
             goarch: amd64
             dir: darwin-x64
             asset: bohrium-club-auto-darwin-x64.tar.gz
           - name: darwin-arm64
-            os: macos-15
             goos: darwin
             goarch: arm64
             dir: darwin-arm64
@@ -119,11 +114,15 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           VERSION: ${{ inputs.version }}
         run: |
+          set -euo pipefail
           mkdir -p "dist/${{ matrix.dir }}"
           EXT=""
           if [ "${{ matrix.goos }}" = "windows" ]; then EXT=".exe"; fi
+          OUT="dist/${{ matrix.dir }}/bohrium-club-auto${EXT}"
           go build -trimpath -ldflags="-s -w -X main.Version=${VERSION}" \
-            -o "dist/${{ matrix.dir }}/bohrium-club-auto${EXT}" ./cmd/bohrium-club-auto
+            -o "${OUT}" ./cmd/bohrium-club-auto
+          file "${OUT}"
+          go version -m "${OUT}" | head -n 5
           cat > "dist/${{ matrix.dir }}/RUN-README.txt" <<'EOF'
           Bohrium Club Auto — Quick Start
           1. Run ./bohrium-club-auto (or bohrium-club-auto.exe on Windows).
@@ -132,17 +131,21 @@ jobs:
           EOF
 
       - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Compress-Archive -Path "dist/${{ matrix.dir }}/bohrium-club-auto.exe", "dist/${{ matrix.dir }}/RUN-README.txt" `
-            -DestinationPath "${{ matrix.asset }}"
-
-      - name: Package (Linux / macOS)
-        if: runner.os != 'Windows'
+        if: matrix.goos == 'windows'
         shell: bash
         run: |
+          set -euo pipefail
+          (cd "dist/${{ matrix.dir }}" && zip -9 "../../${{ matrix.asset }}" bohrium-club-auto.exe RUN-README.txt)
+          unzip -l "${{ matrix.asset }}"
+
+      - name: Package (Linux / macOS)
+        if: matrix.goos != 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x "dist/${{ matrix.dir }}/bohrium-club-auto"
           tar -C "dist/${{ matrix.dir }}" -czf "${{ matrix.asset }}" bohrium-club-auto RUN-README.txt
+          tar -tzf "${{ matrix.asset }}"
 
       - name: Upload package
         uses: actions/upload-artifact@v4
