@@ -52,6 +52,37 @@ type SciXModel struct {
 	Presentation     *SciXModelPresentation `json:"presentation,omitempty"`
 }
 
+// IsInternal reports whether upstream marks this model as an internal auxiliary model (hidden=true, e.g. vision/title/summary).
+func (m SciXModel) IsInternal() bool {
+	return m.Hidden
+}
+
+// IsClientHidden reports whether upstream marks a non-internal model as hidden from official client pickers (e.g. standard/advanced).
+func (m SciXModel) IsClientHidden() bool {
+	return !m.Hidden && m.Presentation != nil && !m.Presentation.Visible
+}
+
+// DefaultGatewayEnabled returns whether this model should be enabled on the OpenAI gateway by default.
+func (m SciXModel) DefaultGatewayEnabled() bool {
+	return !m.IsClientHidden()
+}
+
+// Clone returns a deep copy of SciXModel so slices and pointers are never shared across requests.
+func (m SciXModel) Clone() SciXModel {
+	cp := m
+	if m.Input != nil {
+		cp.Input = append([]string(nil), m.Input...)
+	}
+	if m.ReasoningEfforts != nil {
+		cp.ReasoningEfforts = append([]string(nil), m.ReasoningEfforts...)
+	}
+	if m.Presentation != nil {
+		p := *m.Presentation
+		cp.Presentation = &p
+	}
+	return cp
+}
+
 // EffectiveAPI returns the native Bohrium upstream protocol for this model ("chat_completions" or "responses").
 // Per brain.mjs (createScixProfile), omitted api defaults to "responses".
 func (m SciXModel) EffectiveAPI() string {
@@ -150,7 +181,9 @@ func (cat *SciXModelCatalog) Clone() *SciXModelCatalog {
 	cp := *cat
 	if cat.Data != nil {
 		cp.Data = make([]SciXModel, len(cat.Data))
-		copy(cp.Data, cat.Data)
+		for i, m := range cat.Data {
+			cp.Data[i] = m.Clone()
+		}
 	}
 	if cat.ImageDescribe != nil {
 		id := *cat.ImageDescribe

@@ -46,6 +46,11 @@ func (s *Server) handleGatewayStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	modelEnabled := gwCfg.ModelEnabled
+	if modelEnabled == nil {
+		modelEnabled = map[string]bool{}
+	}
+
 	pgPrompts, _ := prompts.PlaygroundPrompts()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":              true,
@@ -60,6 +65,7 @@ func (s *Server) handleGatewayStatus(w http.ResponseWriter, r *http.Request) {
 			"analyticsRetentionDays": gwCfg.AnalyticsRetentionDays,
 			"storeId":                gwCfg.StoreID,
 			"apiKeys":                gwCfg.APIKeys,
+			"modelEnabled":           modelEnabled,
 		},
 		"pool": map[string]any{
 			"pooled":                poolViews,
@@ -167,6 +173,40 @@ func (s *Server) handleGatewayRefreshModels(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "data": cat})
 }
 
+func (s *Server) handleGatewayUpdateModel(w http.ResponseWriter, r *http.Request) {
+	rawID := strings.TrimSpace(r.PathValue("id"))
+	rawID = strings.TrimPrefix(rawID, "scix/")
+	key := strings.ToLower(strings.TrimSpace(rawID))
+	if key == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "模型 ID 不能为空"})
+		return
+	}
+	var body struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Enabled == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "请提供有效的 enabled 布尔值"})
+		return
+	}
+	updated, err := s.cfg.Update(func(c *config.Config) error {
+		if c.Gateway.ModelEnabled == nil {
+			c.Gateway.ModelEnabled = make(map[string]bool)
+		}
+		c.Gateway.ModelEnabled[key] = *body.Enabled
+		return nil
+	})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":           true,
+		"modelId":      rawID,
+		"enabled":      *body.Enabled,
+		"modelEnabled": updated.Gateway.ModelEnabled,
+	})
+}
+
 func (s *Server) handleGatewayCreateKey(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name string `json:"name"`
@@ -261,13 +301,14 @@ func (s *Server) handleGatewayDeleteKey(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) handleGatewayUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Enabled                *bool   `json:"enabled"`
-		DefaultModel           *string `json:"defaultModel"`
-		AllowNoAuth            *bool   `json:"allowNoAuth"`
-		CORSOrigins            *string `json:"corsOrigins"`
-		PreflightMode          *bool   `json:"preflightMode"`
-		SciMasterPrompt        *bool   `json:"sciMasterPrompt"`
-		AnalyticsRetentionDays *int    `json:"analyticsRetentionDays"`
+		Enabled                *bool           `json:"enabled"`
+		DefaultModel           *string         `json:"defaultModel"`
+		AllowNoAuth            *bool           `json:"allowNoAuth"`
+		CORSOrigins            *string         `json:"corsOrigins"`
+		PreflightMode          *bool           `json:"preflightMode"`
+		SciMasterPrompt        *bool           `json:"sciMasterPrompt"`
+		AnalyticsRetentionDays *int            `json:"analyticsRetentionDays"`
+		ModelEnabled           map[string]bool `json:"modelEnabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "无效请求体"})
@@ -291,6 +332,16 @@ func (s *Server) handleGatewayUpdateSettings(w http.ResponseWriter, r *http.Requ
 		}
 		if body.SciMasterPrompt != nil {
 			c.Gateway.SciMasterPrompt = *body.SciMasterPrompt
+		}
+		if body.ModelEnabled != nil {
+			nextMap := make(map[string]bool, len(body.ModelEnabled))
+			for k, v := range body.ModelEnabled {
+				nk := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(k), "scix/"))
+				if nk != "" {
+					nextMap[nk] = v
+				}
+			}
+			c.Gateway.ModelEnabled = nextMap
 		}
 		if body.AnalyticsRetentionDays != nil {
 			d := *body.AnalyticsRetentionDays

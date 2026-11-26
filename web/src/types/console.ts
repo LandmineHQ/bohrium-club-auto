@@ -232,6 +232,7 @@ export interface GatewayConfigView {
   analyticsRetentionDays?: number
   storeId?: string
   apiKeys: GatewayApiKey[]
+  modelEnabled?: Record<string, boolean>
 }
 
 export interface SciXModelItem {
@@ -242,6 +243,7 @@ export interface SciXModelItem {
   context_window?: number
   max_output_tokens?: number
   input?: string[]
+  reasoning_effort?: string
   reasoning_efforts?: string[]
   presentation?: {
     name?: string

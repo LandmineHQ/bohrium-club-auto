@@ -8,6 +8,20 @@ import (
 	"net/http"
 )
 
+// OpenAIModel is the standard OpenAI GET /v1/models/{id} and /v1/models item object.
+type OpenAIModel struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	OwnedBy string `json:"owned_by"`
+}
+
+// OpenAIModelList is the standard OpenAI GET /v1/models response envelope.
+type OpenAIModelList struct {
+	Object string        `json:"object"`
+	Data   []OpenAIModel `json:"data"`
+}
+
 // ErrorEnvelope matches the standard OpenAI API error JSON structure.
 type ErrorEnvelope struct {
 	Error ErrorDetail `json:"error"`

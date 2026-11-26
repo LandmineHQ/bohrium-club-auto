@@ -186,7 +186,7 @@ func TestAPIKeyAuthAndModels(t *testing.T) {
 		t.Fatalf("expected 401 without key, got %d", resp.StatusCode)
 	}
 
-	// 2. Valid Bearer key -> 200 catalog with scix_catalog metadata
+	// 2. Valid Bearer key -> 200 standard OpenAI model list
 	req, _ := http.NewRequest(http.MethodGet, gwSrv.URL+"/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	resp, err = http.DefaultClient.Do(req)
@@ -197,15 +197,25 @@ func TestAPIKeyAuthAndModels(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
-	var cat bohrium.SciXModelCatalog
-	if err := json.NewDecoder(resp.Body).Decode(&cat); err != nil {
+	rawCat, _ := io.ReadAll(resp.Body)
+	var cat openai.OpenAIModelList
+	if err := json.Unmarshal(rawCat, &cat); err != nil {
 		t.Fatalf("decode catalog: %v", err)
 	}
-	if len(cat.Data) != 5 {
-		t.Fatalf("expected 5 models, got %d", len(cat.Data))
+	if cat.Object != "list" || len(cat.Data) != 5 {
+		t.Fatalf("expected object=list and 5 models, got object=%q len=%d", cat.Object, len(cat.Data))
 	}
-	if cat.SciXCatalog == nil || cat.SciXCatalog.ScopeGeneration == "" || cat.SciXCatalog.ContentVersion == "" {
-		t.Fatalf("expected scix_catalog scopeGeneration & contentVersion, got %+v", cat.SciXCatalog)
+	var rawMap map[string]any
+	if err := json.Unmarshal(rawCat, &rawMap); err != nil || len(rawMap) != 2 {
+		t.Fatalf("expected strictly {object, data} top-level keys on /v1/models, got %v", rawMap)
+	}
+	if items, ok := rawMap["data"].([]any); !ok || len(items) != 5 {
+		t.Fatalf("unexpected data array: %v", rawMap["data"])
+	} else {
+		first, _ := items[0].(map[string]any)
+		if len(first) != 4 {
+			t.Fatalf("expected strictly 4 OpenAI model fields {id, object, created, owned_by}, got %v", first)
+		}
 	}
 
 	// 3. Alias lookup via x-api-key header ("DeepSeek-V4-Pro" -> "dspro-high")
@@ -219,10 +229,10 @@ func TestAPIKeyAuthAndModels(t *testing.T) {
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 for alias, got %d", resp2.StatusCode)
 	}
-	var model bohrium.SciXModel
+	var model openai.OpenAIModel
 	_ = json.NewDecoder(resp2.Body).Decode(&model)
-	if model.ID != "dspro-high" {
-		t.Fatalf("expected dspro-high, got %q", model.ID)
+	if model.ID != "dspro-high" || model.Object != "model" || model.OwnedBy == "" {
+		t.Fatalf("expected dspro-high standard OpenAI model, got %+v", model)
 	}
 }
 
@@ -1365,5 +1375,174 @@ func TestGatewayDetailedUsageTelemetryAndTTFT(t *testing.T) {
 	}
 	if rec.FirstTokenMs < 20 || rec.DurationMs < rec.FirstTokenMs {
 		t.Fatalf("expected realistic TTFT >= 20ms and duration >= TTFT, got ttft=%d dur=%d", rec.FirstTokenMs, rec.DurationMs)
+	}
+}
+
+func TestModelVisibilityToggleAndStandardOpenAIModels(t *testing.T) {
+	upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{
+				"object": "list",
+				"data": [
+					{"id":"standard","name":"标准","api":"chat_completions","context_window":1000000,"max_output_tokens":384000,"input":["text"],"reasoning_effort":"high","reasoning_efforts":["low","medium","high"],"presentation":{"visible":false,"sortOrder":0}},
+					{"id":"advanced","name":"高级","api":"chat_completions","context_window":1050000,"max_output_tokens":128000,"input":["text","image"],"reasoning_effort":"high","reasoning_efforts":["low","medium","high"],"presentation":{"visible":false,"sortOrder":0}},
+					{"id":"vision","name":"读图","hidden":true,"context_window":1050000,"max_output_tokens":128000,"input":["text","image"],"reasoning_effort":"high","reasoning_efforts":["low","medium","high"],"presentation":{"visible":false,"sortOrder":0}},
+					{"id":"title","name":"标题","hidden":true,"context_window":128000,"max_output_tokens":256,"input":["text"],"presentation":{"visible":false,"sortOrder":0}},
+					{"id":"summary","name":"工具批次摘要","hidden":true,"context_window":128000,"max_output_tokens":512,"input":["text"],"presentation":{"visible":false,"sortOrder":0}},
+					{"id":"dspro-high","name":"DeepSeek-V4-Pro","api":"chat_completions","context_window":1000000,"max_output_tokens":384000,"input":["text"],"reasoning_effort":"high","reasoning_efforts":["low","high","max"],"presentation":{"visible":true,"name":"DeepSeek-V4-Pro","sortOrder":20,"usageMultiplier":1,"default":true}},
+					{"id":"dsflash-high","name":"DeepSeek-V4.1-Flash","api":"chat_completions","context_window":1000000,"max_output_tokens":384000,"input":["text"],"reasoning_effort":"high","reasoning_efforts":["low","high","max"],"presentation":{"visible":true,"name":"DeepSeek-V4.1-Flash","sortOrder":10,"usageMultiplier":0.3}},
+					{"id":"kimi-k3","name":"Kimi-K3","api":"chat_completions","context_window":1050000,"max_output_tokens":128000,"input":["text","image"],"reasoning_effort":"high","reasoning_efforts":["low","high","max"],"presentation":{"visible":true,"name":"Kimi-K3","sortOrder":30,"usageMultiplier":2}}
+				],
+				"image_describe": {"model":"vision","reasoning_effort":"low"},
+				"session_purposes": {"session-title":{"model":"title"},"tool-batch-summary":{"model":"summary"}}
+			}`)
+		case "/billing/preflight":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"allowed":true}`)
+		case "/chat/completions", "/responses":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mID, _ := body["model"].(string)
+			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+			if r.URL.Path == "/chat/completions" {
+				_, _ = io.WriteString(w, `data: {"id":"c_vis","object":"chat.completion.chunk","created":1700000000,"model":"`+mID+`","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`+"\n\n")
+				_, _ = io.WriteString(w, "data: [DONE]\n\n")
+			} else {
+				_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_vis\",\"object\":\"response\",\"model\":\""+mID+"\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n")
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(upSrv.Close)
+
+	tmpDir := t.TempDir()
+	t.Setenv("BOHRIUM_DATA_DIR", tmpDir)
+	t.Setenv("BOHRIUM_API_KEYS", "sk-brm-vis-test")
+	t.Setenv("BOHRIUM_ADMIN_PASSWORD", "testpass123")
+	cfgMgr, _ := config.Load()
+	st, _ := store.Open(tmpDir)
+	t.Cleanup(func() { _ = st.Close() })
+	acc, _, _ := st.UpsertAccountFromAuth(store.AuthState{
+		Token: "tok-vis-1", UserID: 8801, OrgID: 8802, Nickname: "VisTester", ExpiresAt: time.Now().Add(24 * time.Hour),
+	}, "Vis")
+	_ = st.UpdateAccountBalance(acc.ID, 5000, 0, 0)
+	_ = st.SetPoolMembership([]string{acc.ID})
+
+	httpCli, _ := chromehttp.New(chromehttp.Options{Timeout: 5 * time.Second})
+	mgr := bohrium.NewManager(httpCli, cfgMgr, st)
+	mgr.SetEndpoints(bohrium.Endpoints{SigmaLLMBase: upSrv.URL, WWWBase: upSrv.URL})
+
+	gw := openai.NewGateway(cfgMgr, mgr)
+	mux := http.NewServeMux()
+	gw.RegisterRoutes(mux)
+	gwSrv := httptest.NewServer(mux)
+	t.Cleanup(gwSrv.Close)
+
+	doReq := func(method, path, body string) (*http.Response, string) {
+		var rdr io.Reader
+		if body != "" {
+			rdr = strings.NewReader(body)
+		}
+		req, _ := http.NewRequest(method, gwSrv.URL+path, rdr)
+		req.Header.Set("Authorization", "Bearer sk-brm-vis-test")
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp, string(raw)
+	}
+
+	// 1. Default GET /v1/models excludes standard & advanced, keeps vision/title/summary, and returns strict standard OpenAI fields ONLY
+	rList, rawList := doReq(http.MethodGet, "/v1/models", "")
+	if rList.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/models status=%d body=%s", rList.StatusCode, rawList)
+	}
+	var cat openai.OpenAIModelList
+	if err := json.Unmarshal([]byte(rawList), &cat); err != nil {
+		t.Fatalf("unmarshal /v1/models: %v", err)
+	}
+	if cat.Object != "list" || len(cat.Data) != 6 {
+		t.Fatalf("expected object=list and 6 models by default (excluding standard/advanced), got object=%q len=%d", cat.Object, len(cat.Data))
+	}
+	var rawMap map[string]any
+	if err := json.Unmarshal([]byte(rawList), &rawMap); err != nil || len(rawMap) != 2 {
+		t.Fatalf("expected strictly {object, data} top-level keys on /v1/models, got %v", rawMap)
+	}
+	byID := map[string]openai.OpenAIModel{}
+	for _, m := range cat.Data {
+		byID[m.ID] = m
+	}
+	if _, hasStd := byID["standard"]; hasStd {
+		t.Fatalf("standard must be hidden from /v1/models by default")
+	}
+	if _, hasAdv := byID["advanced"]; hasAdv {
+		t.Fatalf("advanced must be hidden from /v1/models by default")
+	}
+	for _, keep := range []string{"vision", "title", "summary", "dspro-high", "dsflash-high", "kimi-k3"} {
+		if _, ok := byID[keep]; !ok {
+			t.Fatalf("expected model %q to remain enabled by default", keep)
+		}
+	}
+	for _, item := range rawMap["data"].([]any) {
+		obj := item.(map[string]any)
+		if len(obj) != 4 || obj["id"] == nil || obj["object"] != "model" || obj["created"] == nil || obj["owned_by"] == nil {
+			t.Fatalf("expected strictly 4 OpenAI model fields {id, object, created, owned_by}, got %v", obj)
+		}
+	}
+
+	// GET /v1/models/dspro-high also returns strictly standard OpenAI fields ONLY
+	rOne, rawOne := doReq(http.MethodGet, "/v1/models/dspro-high", "")
+	if rOne.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/models/dspro-high status=%d body=%s", rOne.StatusCode, rawOne)
+	}
+	var oneMap map[string]any
+	if err := json.Unmarshal([]byte(rawOne), &oneMap); err != nil || len(oneMap) != 4 || oneMap["id"] != "dspro-high" || oneMap["object"] != "model" {
+		t.Fatalf("expected strictly {id, object, created, owned_by} on GET /v1/models/dspro-high, got %v", oneMap)
+	}
+
+	// 2. Disabled standard & advanced cannot be queried or invoked (including aliases)
+	if r, raw := doReq(http.MethodGet, "/v1/models/standard", ""); r.StatusCode != http.StatusNotFound || !strings.Contains(raw, "model_disabled") {
+		t.Fatalf("expected 404 model_disabled for GET /v1/models/standard, got %d %s", r.StatusCode, raw)
+	}
+	for _, mName := range []string{"standard", "标准"} {
+		if r, raw := doReq(http.MethodPost, "/v1/chat/completions", `{"model":"`+mName+`","stream":false,"messages":[{"role":"user","content":"hi"}]}`); r.StatusCode != http.StatusForbidden || !strings.Contains(raw, "model_disabled") {
+			t.Fatalf("expected 403 model_disabled for chat %q, got %d %s", mName, r.StatusCode, raw)
+		}
+	}
+	if r, raw := doReq(http.MethodPost, "/v1/responses", `{"model":"advanced","stream":false,"input":"hi"}`); r.StatusCode != http.StatusForbidden || !strings.Contains(raw, "model_disabled") {
+		t.Fatalf("expected 403 model_disabled for responses advanced, got %d %s", r.StatusCode, raw)
+	}
+
+	// 3. Enable standard & disable vision via GatewayConfig overrides -> /v1/models & invocation update immediately
+	_, _ = cfgMgr.Update(func(c *config.Config) error {
+		c.Gateway.ModelEnabled = map[string]bool{
+			"standard": true,
+			"vision":   false,
+		}
+		return nil
+	})
+	_, rawList2 := doReq(http.MethodGet, "/v1/models", "")
+	var cat2 openai.OpenAIModelList
+	_ = json.Unmarshal([]byte(rawList2), &cat2)
+	ids2 := map[string]bool{}
+	for _, m := range cat2.Data {
+		ids2[m.ID] = true
+	}
+	if len(cat2.Data) != 6 || !ids2["standard"] || ids2["vision"] {
+		t.Fatalf("expected 6 models (standard added, vision removed), got ids=%v", ids2)
+	}
+	if r, raw := doReq(http.MethodPost, "/v1/chat/completions", `{"model":"standard","stream":false,"messages":[{"role":"user","content":"hi"}]}`); r.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for enabled standard, got %d %s", r.StatusCode, raw)
+	}
+	if r, raw := doReq(http.MethodPost, "/v1/responses", `{"model":"vision","stream":false,"input":"hi"}`); r.StatusCode != http.StatusForbidden || !strings.Contains(raw, "model_disabled") {
+		t.Fatalf("expected 403 model_disabled for disabled vision, got %d %s", r.StatusCode, raw)
 	}
 }

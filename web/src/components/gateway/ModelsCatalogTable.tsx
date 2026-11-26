@@ -21,8 +21,25 @@ interface ModelsCatalogTableProps {
   catalogError?: string
   loggedIn: boolean
   selectedAccountId: string
+  modelEnabled?: Record<string, boolean>
   onRefreshCatalog: () => Promise<void>
+  onToggleModel: (modelId: string, enabled: boolean) => Promise<void>
   onPickModel: (modelId: string) => void
+}
+
+export function isClientHiddenModel(m: SciXModelItem): boolean {
+  return !m.hidden && m.presentation?.visible === false
+}
+
+export function isGatewayModelEnabled(
+  m: SciXModelItem,
+  modelEnabled?: Record<string, boolean>
+): boolean {
+  const key = m.id.toLowerCase()
+  if (modelEnabled && Object.prototype.hasOwnProperty.call(modelEnabled, key)) {
+    return !!modelEnabled[key]
+  }
+  return !isClientHiddenModel(m)
 }
 
 export function ModelsCatalogTable({
@@ -30,11 +47,23 @@ export function ModelsCatalogTable({
   catalogError,
   loggedIn,
   selectedAccountId,
+  modelEnabled,
   onRefreshCatalog,
+  onToggleModel,
   onPickModel,
 }: ModelsCatalogTableProps) {
   const [refreshing, setRefreshing] = useState(false)
   const [preflightId, setPreflightId] = useState("")
+  const [togglingId, setTogglingId] = useState("")
+
+  async function handleToggle(modelId: string, enabled: boolean) {
+    setTogglingId(modelId)
+    try {
+      await onToggleModel(modelId, enabled)
+    } finally {
+      setTogglingId("")
+    }
+  }
 
   async function refreshModels() {
     setRefreshing(true)
@@ -82,8 +111,10 @@ export function ModelsCatalogTable({
             <Badge variant="mono">shrimp-brain-v2</Badge>
           </div>
           <CardDescription>
-            实时同步 Bohrium 客户端模型列表；网关自动为 <code>chat_completions</code> 与{" "}
-            <code>responses</code> 原生模型提供双向跨协议兼容。
+            实时同步 Bohrium 客户端模型列表；勾选的模型将通过标准 OpenAI <code>/v1/models</code>{" "}
+            暴露并允许调用（<code>standard</code>/<code>advanced</code> 与客户端一致默认{" "}
+            <code>hidden</code> 禁用，<code>vision</code>/<code>title</code>/<code>summary</code>{" "}
+            默认启用）。
           </CardDescription>
         </div>
         <Button variant="outline" size="sm" disabled={refreshing} onClick={refreshModels}>
@@ -101,6 +132,7 @@ export function ModelsCatalogTable({
       <Table>
         <TableHeader>
           <TableRow>
+            <TableHead className="w-16">启用</TableHead>
             <TableHead>模型 ID / 名称</TableHead>
             <TableHead>原生上游协议</TableHead>
             <TableHead>上下文 / 最大输出</TableHead>
@@ -112,7 +144,7 @@ export function ModelsCatalogTable({
         <TableBody>
           {models.length === 0 ? (
             <TableRow>
-              <TableCell colSpan={6} className="py-6 text-center text-muted-foreground">
+              <TableCell colSpan={7} className="py-6 text-center text-muted-foreground">
                 {loggedIn
                   ? "暂无模型数据，请点击「刷新模型目录」"
                   : "请先添加玻尔账号，即可拉取 SciX 模型目录"}
@@ -127,18 +159,33 @@ export function ModelsCatalogTable({
               const outK = m.max_output_tokens ? `${Math.round(m.max_output_tokens / 1000)}K` : "--"
               const mods = (m.input || ["text"]).join(", ")
               const effs = (m.reasoning_efforts || []).join("/")
+              const defEff = m.reasoning_effort || ""
               const mult = m.presentation?.usageMultiplier
                 ? `${m.presentation.usageMultiplier}x`
                 : "--"
+              const clientHidden = isClientHiddenModel(m)
+              const enabled = isGatewayModelEnabled(m, modelEnabled)
 
               return (
-                <TableRow key={m.id}>
+                <TableRow key={m.id} className={!enabled ? "opacity-60" : undefined}>
+                  <TableCell>
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 cursor-pointer accent-foreground"
+                      checked={enabled}
+                      disabled={togglingId === m.id}
+                      onChange={(e) => void handleToggle(m.id, e.target.checked)}
+                      aria-label={`启用模型 ${m.id}`}
+                    />
+                  </TableCell>
                   <TableCell>
                     <div className="flex flex-wrap items-center gap-1.5">
                       <code className="rounded bg-muted px-1.5 py-0.5 text-[11px]">{m.id}</code>
                       <strong className="font-semibold">{displayName}</strong>
                       {m.presentation?.default && <Badge variant="mono">default</Badge>}
                       {m.hidden && <Badge variant="mono">internal</Badge>}
+                      {clientHidden && <Badge variant="mono">hidden</Badge>}
+                      {!enabled && <Badge variant="muted">已禁用</Badge>}
                     </div>
                     {desc && <div className="mt-0.5 text-[11px] text-muted-foreground">{desc}</div>}
                   </TableCell>
@@ -151,7 +198,10 @@ export function ModelsCatalogTable({
                   <TableCell>
                     <div>{mods}</div>
                     {effs && (
-                      <div className="mt-0.5 text-[11px] text-muted-foreground">effort: {effs}</div>
+                      <div className="mt-0.5 text-[11px] text-muted-foreground">
+                        effort: {effs}
+                        {defEff ? ` (默认 ${defEff})` : ""}
+                      </div>
                     )}
                   </TableCell>
                   <TableCell className="tabular-nums">{mult}</TableCell>
@@ -165,7 +215,13 @@ export function ModelsCatalogTable({
                       >
                         预检
                       </Button>
-                      <Button variant="outline" size="xs" onClick={() => onPickModel(m.id)}>
+                      <Button
+                        variant="outline"
+                        size="xs"
+                        disabled={!enabled}
+                        title={!enabled ? "启用该模型后可调试" : undefined}
+                        onClick={() => onPickModel(m.id)}
+                      >
                         调试
                       </Button>
                     </div>

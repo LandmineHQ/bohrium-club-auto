@@ -247,6 +247,112 @@ func validateAPIKey(candidate string, keys []config.APIKey) (string, string, boo
 	return matchedID, matchedName, matched
 }
 
+type modelDisabledError struct {
+	modelID string
+	msg     string
+}
+
+func (e *modelDisabledError) Error() string {
+	return e.msg
+}
+
+// IsModelEnabled reports whether m is active on the OpenAI-compatible gateway.
+func (g *Gateway) IsModelEnabled(m bohrium.SciXModel) bool {
+	if g.cfg == nil {
+		return m.DefaultGatewayEnabled()
+	}
+	return g.cfg.Get().Gateway.IsModelEnabled(m.ID, m.DefaultGatewayEnabled())
+}
+
+func toOpenAIModel(m bohrium.SciXModel) OpenAIModel {
+	obj := strings.TrimSpace(m.Object)
+	if obj == "" {
+		obj = "model"
+	}
+	ownedBy := strings.TrimSpace(m.OwnedBy)
+	if ownedBy == "" {
+		ownedBy = "sigma"
+	}
+	return OpenAIModel{
+		ID:      m.ID,
+		Object:  obj,
+		Created: m.Created,
+		OwnedBy: ownedBy,
+	}
+}
+
+// BuildOpenAIModelList returns the standard OpenAI GET /v1/models payload containing only enabled models.
+func (g *Gateway) BuildOpenAIModelList(cat *bohrium.SciXModelCatalog) OpenAIModelList {
+	list := OpenAIModelList{
+		Object: "list",
+		Data:   []OpenAIModel{},
+	}
+	if cat == nil {
+		return list
+	}
+	for _, m := range cat.Data {
+		if !g.IsModelEnabled(m) {
+			continue
+		}
+		list.Data = append(list.Data, toOpenAIModel(m))
+	}
+	return list
+}
+
+func (g *Gateway) resolveEnabledModel(ctx context.Context, cli *bohrium.Client, requested string) (bohrium.SciXModel, *bohrium.SciXModelCatalog, error) {
+	req := strings.TrimSpace(requested)
+	cat, err := cli.GetSciXModelCatalog(ctx, false)
+	if err != nil {
+		return bohrium.SciXModel{}, nil, err
+	}
+
+	if req == "" {
+		var candidates []string
+		if g.cfg != nil {
+			if def := strings.TrimSpace(g.cfg.Get().Gateway.DefaultModel); def != "" {
+				candidates = append(candidates, def)
+			}
+		}
+		for _, m := range cat.Data {
+			if m.Presentation != nil && m.Presentation.Default {
+				candidates = append(candidates, m.ID)
+			}
+		}
+		for _, m := range cat.Data {
+			if !m.Hidden {
+				candidates = append(candidates, m.ID)
+			}
+		}
+		for _, m := range cat.Data {
+			candidates = append(candidates, m.ID)
+		}
+		for _, cand := range candidates {
+			if m, ok := cat.FindModel(cand); ok && g.IsModelEnabled(m) {
+				return m, cat, nil
+			}
+		}
+		return bohrium.SciXModel{}, cat, &modelDisabledError{msg: "no enabled models available in gateway settings"}
+	}
+
+	m, ok := cat.FindModel(req)
+	if !ok && time.Since(cat.FetchedAt) > 5*time.Second {
+		if fresh, rErr := cli.GetSciXModelCatalog(ctx, true); rErr == nil {
+			cat = fresh
+			m, ok = cat.FindModel(req)
+		}
+	}
+	if !ok {
+		return bohrium.SciXModel{}, cat, fmt.Errorf("model %q not found in Bohrium SciX catalog", requested)
+	}
+	if !g.IsModelEnabled(m) {
+		return bohrium.SciXModel{}, cat, &modelDisabledError{
+			modelID: m.ID,
+			msg:     fmt.Sprintf("model %q is disabled in gateway settings", m.ID),
+		}
+	}
+	return m, cat, nil
+}
+
 func (g *Gateway) handleListModels(w http.ResponseWriter, r *http.Request) {
 	force := strings.EqualFold(r.Header.Get("X-Refresh-Models"), "true") || r.URL.Query().Get("refresh") == "1"
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
@@ -262,7 +368,7 @@ func (g *Gateway) handleListModels(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusBadGateway, "upstream_error", "catalog_unavailable", err.Error())
 		return
 	}
-	WriteJSON(w, http.StatusOK, cat)
+	WriteJSON(w, http.StatusOK, g.BuildOpenAIModelList(cat))
 }
 
 func (g *Gateway) handleGetModel(w http.ResponseWriter, r *http.Request) {
@@ -275,12 +381,17 @@ func (g *Gateway) handleGetModel(w http.ResponseWriter, r *http.Request) {
 		writePoolRouteError(w, err)
 		return
 	}
-	m, _, err := cli.ResolveSciXModel(ctx, id)
+	m, _, err := g.resolveEnabledModel(ctx, cli, id)
 	if err != nil {
+		var disErr *modelDisabledError
+		if errors.As(err, &disErr) {
+			WriteError(w, http.StatusNotFound, "invalid_request_error", "model_disabled", disErr.Error())
+			return
+		}
 		WriteError(w, http.StatusNotFound, "invalid_request_error", "model_not_found", err.Error())
 		return
 	}
-	WriteJSON(w, http.StatusOK, m)
+	WriteJSON(w, http.StatusOK, toOpenAIModel(m))
 }
 
 // BalanceResponse represents the OpenAI-gateway /v1/balance aggregated pool response payload.
@@ -519,8 +630,14 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 
-		model, _, mErr := decision.Client.ResolveSciXModel(ctx, req.Model)
+		model, _, mErr := g.resolveEnabledModel(ctx, decision.Client, req.Model)
 		if mErr != nil {
+			var disErr *modelDisabledError
+			if errors.As(mErr, &disErr) {
+				WriteError(w, http.StatusForbidden, "invalid_request_error", "model_disabled", disErr.Error())
+				g.recordFailure(ctx, "/v1/chat/completions", "", req.Model, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, http.StatusForbidden, start, disErr.Error(), tel)
+				return
+			}
 			if isAuthErrorText(mErr.Error()) && explicitAcc == "" {
 				g.markAccountExpired(decision.Account.ID, mErr.Error())
 				excluded[decision.Account.ID] = true
@@ -860,8 +977,14 @@ func (g *Gateway) handleCreateResponse(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		model, _, mErr := decision.Client.ResolveSciXModel(ctx, req.Model)
+		model, _, mErr := g.resolveEnabledModel(ctx, decision.Client, req.Model)
 		if mErr != nil {
+			var disErr *modelDisabledError
+			if errors.As(mErr, &disErr) {
+				WriteError(w, http.StatusForbidden, "invalid_request_error", "model_disabled", disErr.Error())
+				g.recordFailure(ctx, "/v1/responses", "", req.Model, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, http.StatusForbidden, start, disErr.Error(), tel)
+				return
+			}
 			if isAuthErrorText(mErr.Error()) && explicitAcc == "" {
 				g.markAccountExpired(decision.Account.ID, mErr.Error())
 				excluded[decision.Account.ID] = true

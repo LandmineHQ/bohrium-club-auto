@@ -13,7 +13,7 @@
 
 网关向 Bohrium Sigma LLM 上游 (`https://www.bohrium.com/bohrapi/v1/sigma-search/api/v1/scix/llm`) 发起请求时，完整保留客户端原生交互与字段：
 
-- **动态模型目录**：调用 `GET /models?tag=shrimp-brain-v2` 实时获取当前账号可用模型（如 `dspro-high`、`dsflash-high`、`kimi-k3`、`kimi-k3.1-pro`、`standard`、`advanced`、`vision`、`title`、`summary`），并缓存 60 秒。
+- **动态模型目录与逐模型启用控制**：调用 `GET /models?tag=shrimp-brain-v2` 实时获取当前账号可用模型（如 `dspro-high`、`dsflash-high`、`kimi-k3`、`kimi-k3.1-pro`、`standard`、`advanced`、`vision`、`title`、`summary`），并缓存 60 秒。其中 `standard`/`advanced` 与官方客户端一致默认标记为 `hidden` 并禁用，`vision`/`title`/`summary` 等内部辅助模型保留在目录中并默认启用；可在 Web 控制台「Bohrium SciX 模型目录」通过复选框随时启用/禁用任意模型（禁用模型不会出现在 `/v1/models`，通过 `/v1/*` 调用将返回 `403 model_disabled`）。
 - **独立桌面传输层（无浏览器头泄漏）**：对 `/scix/llm/*` 使用独立于 Web 签到的原生 HTTP 传输层——不注入 Chrome `User-Agent` / `Sec-CH-UA*` / `Accept-Language`，也不泄漏 Go 默认 UA，仅携带 `scix.exe` 白名单请求头及 `x-scix-runtime: scix_local`。
 - **桌面执行上下文头与会话粘性**：自动生成或透传补全 unpadded base64url 编码的 `x-scix-execution` 请求头（包含 `version: 1`、`scenario: "local_agent"`、持久化 `storeId`、按会话保持稳定的 `rootSessionId`/`sessionId`/`sessionCreatedAt`、按用户轮次新建并在工具续跑时复用的 `rootRunId`/`runId` 与 `toolCallId`、`purpose`、`recoveryAttempt`、`question`），以及 W3C `traceparent`。
 - **两层额度预检与兜底（与客户端一致）**：默认开启新轮次 `POST /billing/preflight` 准入预检（仅带 `Authorization`、`traceparent` 与 `x-scix-runtime`，与后续 LLM 请求共享同一 `traceparent`；Agent 多步工具续跑 `role: "tool"` / `function_call_output` 自动跳过重复预检）；若预检拒绝或运行中上游返回光子不足（`insufficient_balance` / `BILLING_PHOTON_NOT_ENOUGH`），统一返回 HTTP `402` 与 `insufficient_quota` / `insufficient_balance` 错误信封。可通过控制台或 `BOHRIUM_GATEWAY_PREFLIGHT=false` 关闭前置预检。
@@ -43,7 +43,7 @@ Bohrium 上游对不同模型限定了原生端点：
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/v1/models` | 返回实时 Bohrium SciX 模型列表（含 `scix_catalog` 元数据，兼容客户端与 OpenAI SDK） |
+| `GET` | `/v1/models` | 按标准 OpenAI 格式（`id`、`object`、`created`、`owned_by`）返回当前已启用的模型列表 |
 | `GET` | `/v1/models/{id}` | 按模型 ID、`scix/<id>` 或显示名别名（如 `DeepSeek-V4-Pro`）查询模型详情 |
 | `GET` | `/v1/balance` | 实时聚合所有已入池账号的光子余额、组织余额、钱包余额（CNY）、配额、知识库存储及各入池账号余额与路由权重明细（`pool_accounts`、`balance_infos`） |
 | `POST` | `/v1/chat/completions` | 完整 Chat Completions（SSE/非流式、工具调用、`reasoning_effort`、多模态图像、`response_format`） |

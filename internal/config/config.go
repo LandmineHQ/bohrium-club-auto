@@ -30,15 +30,29 @@ const DefaultAnalyticsRetentionDays = 180
 
 // GatewayConfig configures the Bohrium desktop-compatible OpenAI /v1/* API gateway.
 type GatewayConfig struct {
-	Enabled                bool     `json:"enabled"`
-	APIKeys                []APIKey `json:"apiKeys"`
-	DefaultModel           string   `json:"defaultModel"`
-	AllowNoAuth            bool     `json:"allowNoAuth"`
-	CORSOrigins            string   `json:"corsOrigins"`
-	PreflightMode          bool     `json:"preflightMode"`
-	SciMasterPrompt        bool     `json:"sciMasterPrompt"`
-	AnalyticsRetentionDays int      `json:"analyticsRetentionDays"`
-	StoreID                string   `json:"storeId"`
+	Enabled                bool            `json:"enabled"`
+	APIKeys                []APIKey        `json:"apiKeys"`
+	DefaultModel           string          `json:"defaultModel"`
+	AllowNoAuth            bool            `json:"allowNoAuth"`
+	CORSOrigins            string          `json:"corsOrigins"`
+	PreflightMode          bool            `json:"preflightMode"`
+	SciMasterPrompt        bool            `json:"sciMasterPrompt"`
+	AnalyticsRetentionDays int             `json:"analyticsRetentionDays"`
+	StoreID                string          `json:"storeId"`
+	ModelEnabled           map[string]bool `json:"modelEnabled,omitempty"`
+}
+
+// IsModelEnabled reports whether modelID is enabled for OpenAI /v1/* gateway endpoints,
+// falling back to defaultEnabled when no explicit admin override is configured.
+func (g GatewayConfig) IsModelEnabled(modelID string, defaultEnabled bool) bool {
+	key := strings.ToLower(strings.TrimSpace(modelID))
+	if key == "" || len(g.ModelEnabled) == 0 {
+		return defaultEnabled
+	}
+	if v, ok := g.ModelEnabled[key]; ok {
+		return v
+	}
+	return defaultEnabled
 }
 
 // Config holds persisted and environment-overridden application settings.
@@ -330,16 +344,26 @@ func fillMissingDefaults(cfg *Config, dataDir string) {
 	}
 }
 
+func cloneConfig(src Config) Config {
+	cp := src
+	if src.Gateway.APIKeys != nil {
+		cp.Gateway.APIKeys = make([]APIKey, len(src.Gateway.APIKeys))
+		copy(cp.Gateway.APIKeys, src.Gateway.APIKeys)
+	}
+	if src.Gateway.ModelEnabled != nil {
+		cp.Gateway.ModelEnabled = make(map[string]bool, len(src.Gateway.ModelEnabled))
+		for k, v := range src.Gateway.ModelEnabled {
+			cp.Gateway.ModelEnabled[k] = v
+		}
+	}
+	return cp
+}
+
 // Get returns a snapshot copy of the current configuration.
 func (m *Manager) Get() Config {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	cp := m.cfg
-	if len(m.cfg.Gateway.APIKeys) > 0 {
-		cp.Gateway.APIKeys = make([]APIKey, len(m.cfg.Gateway.APIKeys))
-		copy(cp.Gateway.APIKeys, m.cfg.Gateway.APIKeys)
-	}
-	return cp
+	return cloneConfig(m.cfg)
 }
 
 // Path returns the config.json file path.
@@ -377,15 +401,15 @@ func NewUUIDv4() string {
 func (m *Manager) Update(fn func(*Config) error) (Config, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	next := m.cfg
+	next := cloneConfig(m.cfg)
 	if err := fn(&next); err != nil {
-		return m.cfg, err
+		return cloneConfig(m.cfg), err
 	}
 	m.cfg = next
 	if err := m.saveLocked(); err != nil {
-		return m.cfg, err
+		return cloneConfig(m.cfg), err
 	}
-	return m.cfg, nil
+	return cloneConfig(m.cfg), nil
 }
 
 func (m *Manager) saveLocked() error {

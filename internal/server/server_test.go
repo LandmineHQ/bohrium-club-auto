@@ -300,4 +300,18 @@ func TestMultiAccountPoolAndBindingsAdminAPI(t *testing.T) {
 	if recAn2.Code != http.StatusOK || !strings.Contains(recAn2.Body.String(), `"analyticsRetentionDays":90`) || !strings.Contains(recAn2.Body.String(), `"totalTokens":1500`) {
 		t.Fatalf("GET /api/gateway/analytics after 90d purge failed: %d %s", recAn2.Code, recAn2.Body.String())
 	}
+
+	// 7. Per-model visibility toggle endpoint PATCH /api/gateway/models/{id}
+	recModOn := doAdmin(http.MethodPatch, "/api/gateway/models/standard", map[string]any{"enabled": true})
+	if recModOn.Code != http.StatusOK || !strings.Contains(recModOn.Body.String(), `"enabled":true`) {
+		t.Fatalf("PATCH /api/gateway/models/standard failed: %d %s", recModOn.Code, recModOn.Body.String())
+	}
+	recModOff := doAdmin(http.MethodPatch, "/api/gateway/models/vision", map[string]any{"enabled": false})
+	if recModOff.Code != http.StatusOK || !strings.Contains(recModOff.Body.String(), `"enabled":false`) {
+		t.Fatalf("PATCH /api/gateway/models/vision failed: %d %s", recModOff.Code, recModOff.Body.String())
+	}
+	recGwSt := doAdmin(http.MethodGet, "/api/gateway/status", nil)
+	if recGwSt.Code != http.StatusOK || !strings.Contains(recGwSt.Body.String(), `"standard":true`) || !strings.Contains(recGwSt.Body.String(), `"vision":false`) {
+		t.Fatalf("GET /api/gateway/status missing modelEnabled overrides: %d %s", recGwSt.Code, recGwSt.Body.String())
+	}
 }

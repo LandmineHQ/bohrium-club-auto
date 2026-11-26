@@ -18,7 +18,7 @@ import {
 } from "@/components/ui/table"
 import { PoolBoard } from "./PoolBoard"
 import { SessionBindingsTable } from "./SessionBindingsTable"
-import { ModelsCatalogTable } from "./ModelsCatalogTable"
+import { ModelsCatalogTable, isClientHiddenModel, isGatewayModelEnabled } from "./ModelsCatalogTable"
 import { PlaygroundPanel } from "./PlaygroundPanel"
 import type { GatewayApiKey, GatewayStatusResponse } from "@/types/console"
 
@@ -71,29 +71,54 @@ export function GatewayTab({ data, onRefresh, onRefreshAll }: GatewayTabProps) {
 
   const sortedModels = useMemo(() => {
     const raw = data?.catalog?.data || []
+    const tier = (m: (typeof raw)[number]) =>
+      m.presentation?.visible ? 0 : m.hidden ? 1 : isClientHiddenModel(m) ? 2 : 0
     return [...raw].sort((a, b) => {
-      const av = a.presentation?.visible ? 0 : 1
-      const bv = b.presentation?.visible ? 0 : 1
-      if (av !== bv) return av - bv
+      const ta = tier(a)
+      const tb = tier(b)
+      if (ta !== tb) return ta - tb
       return (a.presentation?.sortOrder || 999) - (b.presentation?.sortOrder || 999)
     })
   }, [data?.catalog?.data])
 
   useEffect(() => {
     if (!sortedModels.length) return
-    if (!sortedModels.some((m) => m.id === pgModel)) {
+    const current = sortedModels.find((m) => m.id === pgModel)
+    if (!current || !isGatewayModelEnabled(current, cfg?.modelEnabled)) {
       const def =
-        sortedModels.find((m) => m.id === "dsflash-high") ||
-        sortedModels.find((m) => m.presentation?.default) ||
+        sortedModels.find(
+          (m) => m.id === "dsflash-high" && isGatewayModelEnabled(m, cfg?.modelEnabled)
+        ) ||
+        sortedModels.find(
+          (m) => m.presentation?.default && isGatewayModelEnabled(m, cfg?.modelEnabled)
+        ) ||
+        sortedModels.find((m) => isGatewayModelEnabled(m, cfg?.modelEnabled)) ||
         sortedModels[0]
       if (def) setPgModel(def.id)
     }
-  }, [sortedModels, pgModel])
+  }, [sortedModels, pgModel, cfg?.modelEnabled])
 
   const healthyPool = pooled.filter((x) => x.healthy).length
   const totalTok = (stats?.promptTokens || 0) + (stats?.completionTokens || 0)
-  const visibleModels = sortedModels.filter((m) => !m.hidden).length
+  const enabledModels = sortedModels.filter((m) =>
+    isGatewayModelEnabled(m, cfg?.modelEnabled)
+  ).length
   const apiKeys = cfg?.apiKeys || []
+
+  async function handleToggleModel(modelId: string, nextEnabled: boolean) {
+    try {
+      await apiRequest(`/api/gateway/models/${encodeURIComponent(modelId)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ enabled: nextEnabled }),
+      })
+      toast.success(
+        nextEnabled ? `已启用模型 ${modelId}（可通过 OpenAI 端点调用）` : `已隐藏并禁用模型 ${modelId}`
+      )
+      await onRefresh()
+    } catch (err) {
+      toast.error("更新模型状态失败: " + (err instanceof Error ? err.message : ""))
+    }
+  }
 
   function firstEnabledKey(): string {
     const found = apiKeys.find((k) => k.enabled && k.key)
@@ -218,7 +243,7 @@ export function GatewayTab({ data, onRefresh, onRefreshAll }: GatewayTabProps) {
             {formatNum(bindings.length)}
           </div>
           <div className="mt-1 text-[11px] text-muted-foreground tabular-nums">
-            SciX 模型 {sortedModels.length ? `${visibleModels}/${sortedModels.length}` : "--"} · 链{" "}
+            已启用模型 {sortedModels.length ? `${enabledModels}/${sortedModels.length}` : "--"} · 链{" "}
             {formatNum(stats?.storedResponses || 0)}
           </div>
         </Card>
@@ -491,7 +516,9 @@ export function GatewayTab({ data, onRefresh, onRefreshAll }: GatewayTabProps) {
         catalogError={data?.catalogError}
         loggedIn={!!data?.bohriumLoggedIn}
         selectedAccountId={pgAccountId}
+        modelEnabled={cfg?.modelEnabled}
         onRefreshCatalog={onRefresh}
+        onToggleModel={handleToggleModel}
         onPickModel={(mid) => {
           setPgModel(mid)
           toast.info(`已在调试区选中模型 ${mid}`)
@@ -502,6 +529,7 @@ export function GatewayTab({ data, onRefresh, onRefreshAll }: GatewayTabProps) {
         accounts={accounts}
         models={sortedModels}
         prompts={data?.playgroundPrompts || []}
+        modelEnabled={cfg?.modelEnabled}
         selectedAccountId={pgAccountId}
         onSelectAccountId={setPgAccountId}
         selectedModel={pgModel}

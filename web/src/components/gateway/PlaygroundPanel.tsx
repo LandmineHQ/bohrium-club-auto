@@ -7,11 +7,13 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { NativeSelect, Textarea } from "@/components/ui/input"
 import { Label } from "@/components/ui/primitives"
 import type { AccountSummaryView, SciXModelItem } from "@/types/console"
+import { isClientHiddenModel, isGatewayModelEnabled } from "./ModelsCatalogTable"
 
 interface PlaygroundPanelProps {
   accounts: AccountSummaryView[]
   models: SciXModelItem[]
   prompts: string[]
+  modelEnabled?: Record<string, boolean>
   selectedAccountId: string
   onSelectAccountId: (id: string) => void
   selectedModel: string
@@ -23,6 +25,7 @@ export function PlaygroundPanel({
   accounts,
   models,
   prompts,
+  modelEnabled,
   selectedAccountId,
   onSelectAccountId,
   selectedModel,
@@ -355,12 +358,17 @@ export function PlaygroundPanel({
                   <option value="dspro-high">dspro-high (DeepSeek-V4-Pro)</option>
                 </>
               ) : (
-                models.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.id} ({m.presentation?.name || m.name || m.id})
-                    {m.hidden ? " [hidden]" : ""}
-                  </option>
-                ))
+                models.map((m) => {
+                  const enabled = isGatewayModelEnabled(m, modelEnabled)
+                  const clientHidden = isClientHiddenModel(m)
+                  const tag = m.hidden ? " [internal]" : clientHidden ? " [hidden]" : ""
+                  return (
+                    <option key={m.id} value={m.id} disabled={!enabled}>
+                      {m.id} ({m.presentation?.name || m.name || m.id}){tag}
+                      {!enabled ? " [已禁用]" : ""}
+                    </option>
+                  )
+                })
               )}
             </NativeSelect>
           </div>

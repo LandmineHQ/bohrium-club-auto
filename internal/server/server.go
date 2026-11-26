@@ -125,6 +125,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /api/gateway/bindings/{hash}", s.requireAdmin(s.handleGatewayDeleteBinding))
 	s.mux.HandleFunc("DELETE /api/gateway/bindings", s.requireAdmin(s.handleGatewayClearBindings))
 	s.mux.HandleFunc("POST /api/gateway/models/refresh", s.requireAdmin(s.handleGatewayRefreshModels))
+	s.mux.HandleFunc("PATCH /api/gateway/models/{id...}", s.requireAdmin(s.handleGatewayUpdateModel))
 	s.mux.HandleFunc("POST /api/gateway/keys", s.requireAdmin(s.handleGatewayCreateKey))
 	s.mux.HandleFunc("PATCH /api/gateway/keys/{id}", s.requireAdmin(s.handleGatewayUpdateKey))
 	s.mux.HandleFunc("DELETE /api/gateway/keys/{id}", s.requireAdmin(s.handleGatewayDeleteKey))
