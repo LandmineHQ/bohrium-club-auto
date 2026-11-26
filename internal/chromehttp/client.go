@@ -241,11 +241,23 @@ func (c *Client) DoJSON(ctx context.Context, method, rawURL string, payload any,
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	return c.execAndRead(req, 16*1024*1024)
+	return c.execAndRead(c.httpClient, req, 16*1024*1024)
 }
 
-// DoRaw sends a raw byte body (e.g., binary PDF upload) and reads the response.
+// DoRaw sends a raw byte body and reads the response using the standard RPC timeout client.
 func (c *Client) DoRaw(ctx context.Context, method, rawURL string, body []byte, headers map[string]string) (*Response, error) {
+	return c.doRawWithClient(ctx, c.httpClient, method, rawURL, body, headers)
+}
+
+// DoTransfer sends/receives large binary payloads (e.g. multi-MB PDF upload/download) without
+// the short RPC Client.Timeout cap. Active transfers are not killed mid-flight; instead,
+// streamClient enforces TLSHandshakeTimeout (15s), ResponseHeaderTimeout (3m after body upload),
+// and caller ctx cancellation.
+func (c *Client) DoTransfer(ctx context.Context, method, rawURL string, body []byte, headers map[string]string) (*Response, error) {
+	return c.doRawWithClient(ctx, c.streamClient, method, rawURL, body, headers)
+}
+
+func (c *Client) doRawWithClient(ctx context.Context, client *http.Client, method, rawURL string, body []byte, headers map[string]string) (*Response, error) {
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
@@ -257,11 +269,11 @@ func (c *Client) DoRaw(ctx context.Context, method, rawURL string, body []byte, 
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	return c.execAndRead(req, 64*1024*1024)
+	return c.execAndRead(client, req, 64*1024*1024)
 }
 
-func (c *Client) execAndRead(req *http.Request, maxBytes int64) (*Response, error) {
-	resp, err := c.httpClient.Do(req)
+func (c *Client) execAndRead(client *http.Client, req *http.Request, maxBytes int64) (*Response, error) {
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}

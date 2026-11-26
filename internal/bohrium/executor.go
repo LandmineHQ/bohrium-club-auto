@@ -428,7 +428,10 @@ func (c *Client) uploadReaderPDF(ctx context.Context, fileName string, data []by
 		}
 	}
 
-	// 2) Precheck / multipart init.
+	// 2) Precheck / multipart init + binary upload with idempotent retry.
+	// Re-running file/multipart on retry both refreshes short-lived upload tokens and
+	// leverages Bohrium's MD5 deduplication (fileExist / alreadyInFolder) if a previous
+	// attempt landed on Tiefblue just before a transient network/header drop.
 	sum := md5.Sum(data)
 	md5Hex := hex.EncodeToString(sum[:])
 	size := len(data)
@@ -439,41 +442,65 @@ func (c *Client) uploadReaderPDF(ctx context.Context, fileName string, data []by
 	q.Set("fileName", fileName)
 	q.Set("md5", md5Hex)
 	q.Set("size", strconv.Itoa(size))
+	multipartURL := c.endpoints.WWWBase + "/bohrapi/v1/literature-sage/api/v1/file/multipart?" + q.Encode()
 
-	initData, err := c.fetchBohriumData(ctx, http.MethodGet,
-		c.endpoints.WWWBase+"/bohrapi/v1/literature-sage/api/v1/file/multipart?"+q.Encode(),
-		nil, headers)
-	if err != nil {
-		return "", fmt.Errorf("file/multipart 预检失败: %w", err)
-	}
+	const maxUploadAttempts = 3
+	var (
+		storagePath string
+		lastErr     error
+	)
 
-	// Branch A: File already exists in folder -> reuse sourceUserResourceId directly.
-	if asBool(initData["alreadyInFolder"]) {
-		if existingID := firstStringField(initData, "userResourceId", "resourceId"); existingID != "" {
-			var srcID any = existingID
-			if n, err := strconv.ParseInt(existingID, 10, 64); err == nil {
-				srcID = n
-			}
-			submitData, err := c.fetchBohriumData(ctx, http.MethodPost,
-				c.endpoints.WWWBase+"/bohrapi/v1/literature-sage/api/v1/file/submit",
-				map[string]any{
-					"scene":                "reader",
-					"parentId":             folderID,
-					"sourceUserResourceId": srcID,
-				}, headers)
-			if err == nil {
-				if id := firstStringField(submitData, "userResourceId", "resourceId"); id != "" {
-					return id, nil
-				}
-			}
-			return existingID, nil
+	for attempt := 0; attempt < maxUploadAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
 		}
-	}
 
-	// Branch B: Upload raw binary to storage host if !fileExist (exact uploadLibraryFileApi contract).
-	fileExist := asBool(initData["fileExist"])
-	storagePath := asString(initData["path"])
-	if !fileExist {
+		initData, err := c.fetchBohriumData(ctx, http.MethodGet, multipartURL, nil, headers)
+		if err != nil {
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			lastErr = fmt.Errorf("file/multipart 预检失败: %w", err)
+			if isNonRetryableUploadErr(err) {
+				return "", lastErr
+			}
+			if !waitUploadRetry(ctx, attempt, maxUploadAttempts, c.readerPollInterval) {
+				return "", ctx.Err()
+			}
+			continue
+		}
+
+		// Branch A: File already exists in folder -> reuse sourceUserResourceId directly.
+		if asBool(initData["alreadyInFolder"]) {
+			if existingID := firstStringField(initData, "userResourceId", "resourceId"); existingID != "" {
+				var srcID any = existingID
+				if n, err := strconv.ParseInt(existingID, 10, 64); err == nil {
+					srcID = n
+				}
+				submitData, err := c.fetchBohriumData(ctx, http.MethodPost,
+					c.endpoints.WWWBase+"/bohrapi/v1/literature-sage/api/v1/file/submit",
+					map[string]any{
+						"scene":                "reader",
+						"parentId":             folderID,
+						"sourceUserResourceId": srcID,
+					}, headers)
+				if err == nil {
+					if id := firstStringField(submitData, "userResourceId", "resourceId"); id != "" {
+						return id, nil
+					}
+				}
+				return existingID, nil
+			}
+		}
+
+		// Branch B: Upload raw binary to storage host if !fileExist (exact uploadLibraryFileApi contract).
+		fileExist := asBool(initData["fileExist"])
+		storagePath = asString(initData["path"])
+		if fileExist {
+			lastErr = nil
+			break
+		}
+
 		host := strings.TrimRight(asString(initData["host"]), "/")
 		uploadToken := asString(initData["token"])
 		if host == "" || uploadToken == "" || storagePath == "" {
@@ -487,7 +514,7 @@ func (c *Client) uploadReaderPDF(ctx context.Context, fileName string, data []by
 			},
 		})
 		storageParam := base64.StdEncoding.EncodeToString(paramJSON)
-		upResp, err := c.http.DoRaw(ctx, http.MethodPost, host+"/api/upload/binary", data, map[string]string{
+		upResp, err := c.http.DoTransfer(ctx, http.MethodPost, host+"/api/upload/binary", data, map[string]string{
 			"Content-Type":    "application/json",
 			"X-Storage-Param": storageParam,
 			"Authorization":   "Bearer " + uploadToken,
@@ -495,11 +522,30 @@ func (c *Client) uploadReaderPDF(ctx context.Context, fileName string, data []by
 			"Referer":         c.endpoints.WWWBase + "/agent/chat-with-paper",
 		})
 		if err != nil {
-			return "", fmt.Errorf("上传二进制 PDF 失败: %w", err)
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			lastErr = fmt.Errorf("上传二进制 PDF 失败 (第 %d/%d 次): %w", attempt+1, maxUploadAttempts, err)
+			if !waitUploadRetry(ctx, attempt, maxUploadAttempts, c.readerPollInterval) {
+				return "", ctx.Err()
+			}
+			continue
 		}
-		if upResp.StatusCode < 200 || upResp.StatusCode >= 300 {
-			return "", fmt.Errorf("上传二进制 PDF HTTP %d: %s", upResp.StatusCode, truncateText(string(upResp.Body), 180))
+		if upResp.StatusCode >= 200 && upResp.StatusCode < 300 {
+			lastErr = nil
+			break
 		}
+
+		lastErr = fmt.Errorf("上传二进制 PDF HTTP %d (第 %d/%d 次): %s", upResp.StatusCode, attempt+1, maxUploadAttempts, truncateText(string(upResp.Body), 180))
+		if upResp.StatusCode != http.StatusRequestTimeout && upResp.StatusCode != http.StatusTooManyRequests && upResp.StatusCode < 500 {
+			return "", lastErr
+		}
+		if !waitUploadRetry(ctx, attempt, maxUploadAttempts, c.readerPollInterval) {
+			return "", ctx.Err()
+		}
+	}
+	if lastErr != nil {
+		return "", lastErr
 	}
 
 	// Step 3: Commit uploaded file via file/submit.
@@ -522,6 +568,37 @@ func (c *Client) uploadReaderPDF(ctx context.Context, fileName string, data []by
 		return "", fmt.Errorf("file/submit 未返回 userResourceId")
 	}
 	return userResourceID, nil
+}
+
+func isNonRetryableUploadErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "HTTP 400") ||
+		strings.Contains(msg, "HTTP 401") ||
+		strings.Contains(msg, "HTTP 403") ||
+		strings.Contains(msg, "HTTP 404") ||
+		strings.Contains(msg, "登录失效")
+}
+
+func waitUploadRetry(ctx context.Context, attempt, maxAttempts int, overrideInterval time.Duration) bool {
+	if attempt >= maxAttempts-1 {
+		return true
+	}
+	wait := 2 * time.Second
+	if attempt >= 1 {
+		wait = 5 * time.Second
+	}
+	if overrideInterval > 0 {
+		wait = overrideInterval
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(wait):
+		return true
+	}
 }
 
 func (c *Client) registerReaderEntry(ctx context.Context, userResourceID string) (string, string, error) {

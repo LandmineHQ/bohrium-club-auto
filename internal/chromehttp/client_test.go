@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestChromeHeadersInjected(t *testing.T) {
@@ -52,5 +53,38 @@ func TestCustomChromeUADerivesSecCH(t *testing.T) {
 	}
 	if !strings.Contains(cli.secCHUA, `v="142"`) {
 		t.Fatalf("expected Sec-CH-UA major version 142, got %q", cli.secCHUA)
+	}
+}
+
+func TestDoTransferBypassesShortRPCTimeout(t *testing.T) {
+	var gotUA string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUA = r.Header.Get("User-Agent")
+		time.Sleep(120 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("uploaded-ok"))
+	}))
+	defer srv.Close()
+
+	cli, err := New(Options{Timeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Standard DoRaw enforces short RPC Timeout (50ms) -> should fail with timeout
+	if _, err := cli.DoRaw(context.Background(), http.MethodPost, srv.URL, []byte("payload"), nil); err == nil {
+		t.Fatalf("expected DoRaw to time out with 50ms RPC timeout")
+	}
+
+	// DoTransfer does not enforce short RPC Timeout -> should succeed and keep Chrome UA
+	resp, err := cli.DoTransfer(context.Background(), http.MethodPost, srv.URL, []byte("payload"), nil)
+	if err != nil {
+		t.Fatalf("DoTransfer failed unexpectedly: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK || string(resp.Body) != "uploaded-ok" {
+		t.Fatalf("unexpected DoTransfer response: status=%d body=%q", resp.StatusCode, string(resp.Body))
+	}
+	if !strings.Contains(gotUA, "Chrome/") {
+		t.Fatalf("expected Chrome UA on DoTransfer, got %q", gotUA)
 	}
 }

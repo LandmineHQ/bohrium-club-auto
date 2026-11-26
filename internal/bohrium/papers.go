@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"bohrium-club-auto/internal/prompts"
 )
@@ -80,10 +81,12 @@ func (c *Client) AcquireRandomPaperPDF(ctx context.Context) (*SelectedPDF, error
 			urls = append(urls, paper.MirrorPDFURL)
 		}
 		for _, dlURL := range urls {
-			resp, dlErr := c.http.DoRaw(ctx, http.MethodGet, dlURL, nil, map[string]string{
+			dlCtx, dlCancel := context.WithTimeout(ctx, 5*time.Minute)
+			resp, dlErr := c.http.DoTransfer(dlCtx, http.MethodGet, dlURL, nil, map[string]string{
 				"Accept":  "application/pdf,*/*;q=0.8",
 				"Referer": "https://arxiv.org/abs/" + paper.ID,
 			})
+			dlCancel()
 			if dlErr != nil {
 				lastErr = dlErr
 				continue

@@ -641,3 +641,156 @@ func TestWaitForReaderDocumentReadyStatusDrivenPolling(t *testing.T) {
 		t.Fatalf("expected caller context cancellation, got %v", err)
 	}
 }
+
+func TestUploadReaderPDFRetryAndMD5Dedup(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("BOHRIUM_DATA_DIR", tmp)
+	cfgMgr, _ := config.Load()
+	st, _ := store.Open(tmp)
+	t.Cleanup(func() { _ = st.Close() })
+	_ = st.SetAuth(store.AuthState{Token: makeTestJWT(1, 2, time.Now().Add(time.Hour))})
+
+	// Case 1: First upload hits transient 502; retry re-queries file/multipart (refreshing token) and succeeds.
+	var (
+		mu             sync.Mutex
+		multipartCalls int
+		uploadCalls    int
+		uploadTokens   []string
+		srvURL         string
+	)
+	ts1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.URL.Path {
+		case "/bohrapi/v1/literature-sage/api/v1/folder/create":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"folderId":10}}`))
+		case "/bohrapi/v1/literature-sage/api/v1/file/multipart":
+			multipartCalls++
+			tok := "tok-attempt-" + string(rune('0'+multipartCalls))
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 0,
+				"data": map[string]any{
+					"fileExist": false,
+					"host":      srvURL,
+					"token":     tok,
+					"path":      "reader/test.pdf",
+				},
+			})
+		case "/api/upload/binary":
+			uploadCalls++
+			uploadTokens = append(uploadTokens, r.Header.Get("Authorization"))
+			if uploadCalls == 1 {
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = w.Write([]byte("tiefblue transient 502"))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "/bohrapi/v1/literature-sage/api/v1/file/submit":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"userResourceId":"res-retry-ok"}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts1.Close()
+	srvURL = ts1.URL
+
+	httpCli, _ := chromehttp.New(chromehttp.Options{Timeout: 5 * time.Second})
+	cli := NewClient(httpCli, cfgMgr, st)
+	cli.SetEndpoints(Endpoints{WWWBase: ts1.URL})
+	cli.readerPollInterval = 5 * time.Millisecond
+
+	resID, err := cli.uploadReaderPDF(context.Background(), "paper.pdf", []byte("%PDF-1.4 sample payload"))
+	if err != nil {
+		t.Fatalf("expected uploadReaderPDF to recover on retry, got %v", err)
+	}
+	if resID != "res-retry-ok" || multipartCalls != 2 || uploadCalls != 2 {
+		t.Fatalf("expected 2 prechecks + 2 uploads -> res-retry-ok, got id=%q mp=%d up=%d", resID, multipartCalls, uploadCalls)
+	}
+	if len(uploadTokens) != 2 || uploadTokens[0] != "Bearer tok-attempt-1" || uploadTokens[1] != "Bearer tok-attempt-2" {
+		t.Fatalf("expected refreshed upload token on retry, got %+v", uploadTokens)
+	}
+
+	// Case 2: First upload returns 503 after data already landed; retry precheck sees fileExist=true and skips re-upload.
+	var (
+		mp2   int
+		up2   int
+		url2  string
+	)
+	ts2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.URL.Path {
+		case "/bohrapi/v1/literature-sage/api/v1/folder/create":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"folderId":10}}`))
+		case "/bohrapi/v1/literature-sage/api/v1/file/multipart":
+			mp2++
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 0,
+				"data": map[string]any{
+					"fileExist": mp2 >= 2,
+					"host":      url2,
+					"token":     "tok-dedup",
+					"path":      "reader/dedup.pdf",
+				},
+			})
+		case "/api/upload/binary":
+			up2++
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("tiefblue gateway timeout"))
+		case "/bohrapi/v1/literature-sage/api/v1/file/submit":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"userResourceId":"res-dedup-ok"}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts2.Close()
+	url2 = ts2.URL
+	cli.SetEndpoints(Endpoints{WWWBase: ts2.URL})
+
+	resID2, err := cli.uploadReaderPDF(context.Background(), "dedup.pdf", []byte("%PDF-1.4 dedup payload"))
+	if err != nil {
+		t.Fatalf("expected MD5 dedup recovery on retry, got %v", err)
+	}
+	if resID2 != "res-dedup-ok" || mp2 != 2 || up2 != 1 {
+		t.Fatalf("expected 2 prechecks + 1 upload (skipped via fileExist=true), got id=%q mp=%d up=%d", resID2, mp2, up2)
+	}
+
+	// Case 3: Non-retryable 403 fails fast on first attempt.
+	var up3 int
+	var url3 string
+	ts3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.URL.Path {
+		case "/bohrapi/v1/literature-sage/api/v1/folder/create":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"folderId":10}}`))
+		case "/bohrapi/v1/literature-sage/api/v1/file/multipart":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 0,
+				"data": map[string]any{
+					"fileExist": false,
+					"host":      url3,
+					"token":     "tok-403",
+					"path":      "reader/forbidden.pdf",
+				},
+			})
+		case "/api/upload/binary":
+			up3++
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte("forbidden"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts3.Close()
+	url3 = ts3.URL
+	cli.SetEndpoints(Endpoints{WWWBase: ts3.URL})
+
+	if _, err := cli.uploadReaderPDF(context.Background(), "forbidden.pdf", []byte("%PDF-1.4 forbidden")); err == nil {
+		t.Fatalf("expected 403 upload to fail")
+	}
+	if up3 != 1 {
+		t.Fatalf("expected 403 to fail fast with 1 attempt, got %d", up3)
+	}
+}
