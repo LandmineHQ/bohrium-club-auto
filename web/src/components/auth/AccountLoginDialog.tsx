@@ -31,6 +31,8 @@ interface AccountLoginDialogProps {
   onSuccess: (accountId?: string) => Promise<void>
 }
 
+const OFFICIAL_LOGIN_URL = "https://platform.bohrium.com/login?business=Bohrium&lang=zh-cn"
+
 const OAUTH_PROVIDERS = [
   { id: "google", label: "Google 登录" },
   { id: "apple", label: "Apple 登录" },
@@ -64,6 +66,7 @@ export function AccountLoginDialog({
   // OTP state
   const [otpKind, setOtpKind] = useState<"phone" | "email">("phone")
   const [otpCountryCode, setOtpCountryCode] = useState("86")
+  const [otpOversea, setOtpOversea] = useState(false)
   const [otpTarget, setOtpTarget] = useState("")
   const [otpCode, setOtpCode] = useState("")
   const [otpSending, setOtpSending] = useState(false)
@@ -133,6 +136,16 @@ export function AccountLoginDialog({
     }
     return () => stopPolling()
   }, [open])
+
+  function openOfficialLoginWindow() {
+    window.open(
+      OFFICIAL_LOGIN_URL,
+      "bohrium_official_login",
+      "noopener,noreferrer,width=520,height=720"
+    )
+    setActiveTab("token")
+    toast.info("已打开玻尔官方登录窗口，登录完成后请复制浏览器 Cookie 中的 brmToken 粘贴到下方")
+  }
 
   async function finishLogin(res: AccountLoginResult, methodLabel: string) {
     const msg = res.isNew
@@ -249,13 +262,18 @@ export function AccountLoginDialog({
           kind: otpKind,
           target: otpTarget.trim(),
           countryCode: otpCountryCode.trim() || "86",
+          isOversea: otpOversea,
           ticket: proof?.ticket || "",
           randStr: proof?.randStr || "",
           captchaAppId: proof?.captchaAppId || 0,
         }),
       })
       setOtpCooldown(60)
-      toast.success(res.message || "验证码已发送")
+      toast.success(
+        otpKind === "email"
+          ? "验证码已请求发送，请查收收件箱及垃圾邮件箱（未收到可切换海外通道重试）"
+          : res.message || "验证码已发送"
+      )
     } catch (err) {
       if (err instanceof TencentCaptchaCancelledError) {
         toast.info(err.message)
@@ -280,6 +298,7 @@ export function AccountLoginDialog({
           kind: otpKind,
           target: otpTarget.trim(),
           countryCode: otpCountryCode.trim() || "86",
+          isOversea: otpOversea,
           code: otpCode.trim(),
           label: label.trim(),
         }),
@@ -472,24 +491,37 @@ export function AccountLoginDialog({
             <p className="text-xs text-muted-foreground">
               支持手机号短信验证码或邮箱验证码登录；点击「获取验证码」后将弹出官方腾讯云人机图形验证，请手动完成滑块/点选验证。
             </p>
-            <div className="flex items-center gap-4 text-xs">
-              <label className="flex items-center gap-1.5 cursor-pointer">
+            <div className="flex flex-wrap items-center justify-between gap-3 text-xs">
+              <div className="flex items-center gap-4">
+                <label className="flex items-center gap-1.5 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="otp-kind"
+                    checked={otpKind === "phone"}
+                    onChange={() => setOtpKind("phone")}
+                  />
+                  手机号验证码
+                </label>
+                <label className="flex items-center gap-1.5 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="otp-kind"
+                    checked={otpKind === "email"}
+                    onChange={() => setOtpKind("email")}
+                  />
+                  邮箱验证码
+                </label>
+              </div>
+              <label
+                className="flex items-center gap-1.5 cursor-pointer text-muted-foreground"
+                title="对应官网境内/境外发信通道（部分海外邮箱域名需切换海外通道）"
+              >
                 <input
-                  type="radio"
-                  name="otp-kind"
-                  checked={otpKind === "phone"}
-                  onChange={() => setOtpKind("phone")}
+                  type="checkbox"
+                  checked={otpOversea}
+                  onChange={(e) => setOtpOversea(e.target.checked)}
                 />
-                手机号验证码
-              </label>
-              <label className="flex items-center gap-1.5 cursor-pointer">
-                <input
-                  type="radio"
-                  name="otp-kind"
-                  checked={otpKind === "email"}
-                  onChange={() => setOtpKind("email")}
-                />
-                邮箱验证码
+                海外通道 (en-us)
               </label>
             </div>
             {otpKind === "phone" && (
@@ -536,7 +568,17 @@ export function AccountLoginDialog({
                 placeholder="输入收到的 6 位验证码"
               />
             </div>
-            <div className="flex justify-end">
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={openOfficialLoginWindow}
+                title="若后端发码触发上游阿里云 WAF，可直接在新窗口登录官网后导入 brmToken"
+              >
+                <ExternalLink className="h-3.5 w-3.5" />
+                打开官方登录窗口
+              </Button>
               <Button onClick={submitOTP} disabled={otpSubmitting}>
                 验证码登录
               </Button>
@@ -566,7 +608,17 @@ export function AccountLoginDialog({
                 placeholder="玻尔账号密码"
               />
             </div>
-            <div className="flex justify-end">
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={openOfficialLoginWindow}
+                title="若后端登录触发上游阿里云 WAF，可直接在新窗口登录官网后导入 brmToken"
+              >
+                <ExternalLink className="h-3.5 w-3.5" />
+                打开官方登录窗口
+              </Button>
               <Button onClick={submitPassword} disabled={pwBusy}>
                 {pwBusy ? "验证登录中..." : "密码登录"}
               </Button>
@@ -574,11 +626,20 @@ export function AccountLoginDialog({
           </TabsContent>
 
           <TabsContent value="token" className="space-y-3">
-            <p className="text-xs text-muted-foreground">
-              从已登录 <code>club.bohrium.com</code> 的浏览器 Cookie 中复制 <code>brmToken</code>（支持粘贴整段 Cookie）。
-            </p>
+            <div className="rounded-md border bg-muted/40 p-3 text-xs space-y-2">
+              <div className="text-muted-foreground leading-relaxed">
+                推荐用于邮箱/密码账号：点击下方按钮在官方独立窗口完成登录（自然通过阿里云 WAF 与腾讯验证），随后在浏览器开发者工具（<kbd className="rounded border bg-background px-1">F12</kbd> → Application → Cookies）复制{" "}
+                <code>brmToken</code> 粘贴到下方即可，导入后后台会自动续期。
+              </div>
+              <div>
+                <Button type="button" variant="outline" size="xs" onClick={openOfficialLoginWindow}>
+                  <ExternalLink className="h-3 w-3" />
+                  打开玻尔官方登录窗口 (platform.bohrium.com)
+                </Button>
+              </div>
+            </div>
             <div className="space-y-1.5">
-              <Label htmlFor="import-token-input">brmToken JWT</Label>
+              <Label htmlFor="import-token-input">brmToken JWT（支持直接粘贴整段 Cookie）</Label>
               <Textarea
                 id="import-token-input"
                 rows={4}

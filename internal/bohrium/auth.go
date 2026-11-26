@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -356,14 +357,39 @@ func (c *Client) VerifyOAuthCallback(ctx context.Context, provider, callbackInpu
 	return c.CompleteLogin(ctx, tok, "oauth_"+name)
 }
 
+func (c *Client) platformHeaders(isOversea bool) map[string]string {
+	lang := "zh-cn"
+	if isOversea {
+		lang = "en-us"
+	}
+	return map[string]string{
+		"Origin":           c.endpoints.PlatformBase,
+		"Referer":          c.endpoints.PlatformBase + "/login",
+		"Content-Language": lang,
+	}
+}
+
+func maskLoginTarget(target string) string {
+	t := strings.TrimSpace(target)
+	if idx := strings.IndexByte(t, '@'); idx > 0 {
+		local := t[:idx]
+		dom := t[idx:]
+		if len(local) <= 2 {
+			return local[:1] + "***" + dom
+		}
+		return local[:2] + "***" + dom
+	}
+	if len(t) > 6 {
+		return t[:3] + "****" + t[len(t)-3:]
+	}
+	return "***"
+}
+
 // PrepareCaptcha fetches Tencent Cloud Captcha widget parameters from platform.bohrium.com
 // so the user can complete interactive human verification in the Web Console.
 // For scene="password", it first queries /api/captcha/check_user and sets Skip=true when exempt.
 func (c *Client) PrepareCaptcha(ctx context.Context, scene, account string) (*CaptchaPrepareResult, error) {
-	headers := map[string]string{
-		"Origin":  c.endpoints.PlatformBase,
-		"Referer": c.endpoints.PlatformBase + "/login",
-	}
+	headers := c.platformHeaders(false)
 	appIDStr := fmt.Sprintf("%d", DefaultTencentCaptchaAppID)
 
 	if strings.EqualFold(strings.TrimSpace(scene), "password") && strings.TrimSpace(account) != "" {
@@ -392,14 +418,14 @@ func (c *Client) PrepareCaptcha(ctx context.Context, scene, account string) (*Ca
 	}
 	var parsed map[string]any
 	if err := json.Unmarshal(resp.Body, &parsed); err != nil {
+		if isAliyunWAFResponse(resp.Body) {
+			return nil, wafBlockedErr("初始化图形验证码")
+		}
 		return nil, fmt.Errorf("解析 encrypt_appid 响应失败: %w", err)
 	}
 	if codeNum := int(asInt64(parsed["code"])); codeNum != 0 {
-		msg := asString(parsed["msg"])
-		if msg == "" {
-			msg = asString(asMap(parsed["error"])["msg"])
-		}
-		return nil, fmt.Errorf("初始化图形验证码失败 (code=%d): %s", codeNum, nonEmpty(msg, truncateText(string(resp.Body), 160)))
+		msg := extractPlatformErrMsg(parsed, resp.Body)
+		return nil, fmt.Errorf("初始化图形验证码失败 (code=%d): %s", codeNum, msg)
 	}
 	signAppID := asString(asMap(parsed["data"])["signAppIdStr"])
 	if signAppID == "" {
@@ -410,6 +436,36 @@ func (c *Client) PrepareCaptcha(ctx context.Context, scene, account string) (*Ca
 		CaptchaAppID: appIDStr,
 		AidEncrypted: signAppID,
 	}, nil
+}
+
+func isAliyunWAFResponse(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	low := strings.ToLower(string(body))
+	return strings.Contains(low, "aliyun_waf") ||
+		strings.Contains(low, `id="renderdata"`) ||
+		strings.Contains(low, "acw_sc__v2") ||
+		strings.Contains(low, "interfaceacting.js")
+}
+
+func wafBlockedErr(action string) error {
+	return fmt.Errorf("%s被上游阿里云 WAF 拦截，后端直连无法通过官网浏览器环境校验；请点击「打开官方登录窗口」在浏览器完成登录后，复制 Cookie 中的 brmToken 粘贴到「导入 Token」页签，或改用微信扫码 / 第三方 OAuth 登录", action)
+}
+
+func extractPlatformErrMsg(parsed map[string]any, raw []byte) string {
+	for _, cand := range []string{
+		asString(parsed["message"]),
+		asString(parsed["msg"]),
+		asString(asMap(parsed["error"])["msg"]),
+		asString(asMap(parsed["error"])["message"]),
+		asString(parsed["error"]),
+	} {
+		if strings.TrimSpace(cand) != "" {
+			return strings.TrimSpace(cand)
+		}
+	}
+	return truncateText(string(raw), 160)
 }
 
 func applyCaptchaProof(payload map[string]any, proof *CaptchaProof) bool {
@@ -433,16 +489,13 @@ func applyCaptchaProof(payload map[string]any, proof *CaptchaProof) bool {
 
 // SendVerifyCode sends a phone SMS or email OTP verification code via platform.bohrium.com.
 // When the user completes Tencent Cloud Captcha in the UI, proof carries (ticket, randStr, captchaAppId).
-func (c *Client) SendVerifyCode(ctx context.Context, kind, target, countryCode string, captcha *CaptchaProof) error {
+func (c *Client) SendVerifyCode(ctx context.Context, kind, target, countryCode string, isOversea bool, captcha *CaptchaProof) error {
 	kind = strings.ToLower(strings.TrimSpace(kind))
 	target = strings.TrimSpace(target)
 	if target == "" {
 		return fmt.Errorf("请输入手机号或邮箱")
 	}
-	headers := map[string]string{
-		"Origin":  c.endpoints.PlatformBase,
-		"Referer": c.endpoints.PlatformBase + "/login",
-	}
+	headers := c.platformHeaders(isOversea)
 
 	var (
 		endpoint string
@@ -454,8 +507,9 @@ func (c *Client) SendVerifyCode(ctx context.Context, kind, target, countryCode s
 		endpoint = "/api/account/code/send_by_phone_v3"
 		payload = map[string]any{
 			"phone":          phone,
-			"channel":        "web",
+			"channel":        "pc",
 			"sceneType":      2,
+			"tokenKey":       "",
 			"Version":        "v2",
 			"captchaSceneId": "1cg9xwt4",
 			"businessLine":   "bohrium",
@@ -464,10 +518,11 @@ func (c *Client) SendVerifyCode(ctx context.Context, kind, target, countryCode s
 		endpoint = "/api/account/code/send_by_email_v3"
 		payload = map[string]any{
 			"email":        target,
-			"channel":      "web",
+			"channel":      "pc",
 			"sceneType":    2,
+			"tokenKey":     "",
 			"businessLine": "bohrium",
-			"isOversea":    false,
+			"isOversea":    isOversea,
 		}
 	default:
 		return fmt.Errorf("不支持的验证码类型: %s（支持 phone / email）", kind)
@@ -476,35 +531,61 @@ func (c *Client) SendVerifyCode(ctx context.Context, kind, target, countryCode s
 
 	resp, err := c.http.DoJSON(ctx, http.MethodPost, c.endpoints.PlatformBase+endpoint, payload, headers)
 	if err != nil {
+		log.Printf("[auth] send_code kind=%s target=%s oversea=%v err=%v", kind, maskLoginTarget(target), isOversea, err)
 		return fmt.Errorf("发送验证码请求失败: %w", err)
 	}
+	bodyPreview := truncateText(string(resp.Body), 240)
 	var parsed map[string]any
-	_ = json.Unmarshal(resp.Body, &parsed)
-	if codeNum := int(asInt64(parsed["code"])); codeNum != 0 || resp.StatusCode >= 400 {
-		msg := asString(parsed["msg"])
-		if msg == "" {
-			msg = asString(asMap(parsed["error"])["msg"])
+	if uErr := json.Unmarshal(resp.Body, &parsed); uErr != nil {
+		log.Printf("[auth] send_code kind=%s target=%s oversea=%v http=%d non-json body=%s", kind, maskLoginTarget(target), isOversea, resp.StatusCode, bodyPreview)
+		if isAliyunWAFResponse(resp.Body) {
+			c.appendAuthLog("send_code", false, fmt.Sprintf("发送%s验证码被上游阿里云 WAF 拦截 (%s, HTTP %d)", kind, maskLoginTarget(target), resp.StatusCode))
+			return wafBlockedErr("发送验证码")
 		}
+		c.appendAuthLog("send_code", false, fmt.Sprintf("发送%s验证码异常 (%s, HTTP %d): 非 JSON 响应 %s", kind, maskLoginTarget(target), resp.StatusCode, truncateText(string(resp.Body), 120)))
+		return fmt.Errorf("发送验证码响应异常 (HTTP %d): %s", resp.StatusCode, truncateText(string(resp.Body), 140))
+	}
+	rawCode, hasCode := parsed["code"]
+	codeNum := int(asInt64(rawCode))
+	log.Printf("[auth] send_code kind=%s target=%s oversea=%v hasProof=%v http=%d hasCode=%v code=%d body=%s",
+		kind, maskLoginTarget(target), isOversea, hasProof, resp.StatusCode, hasCode, codeNum, bodyPreview)
+
+	if !hasCode || codeNum != 0 || resp.StatusCode != http.StatusOK {
+		msg := extractPlatformErrMsg(parsed, resp.Body)
+		c.appendAuthLog("send_code", false, fmt.Sprintf("发送%s验证码失败 (%s, HTTP %d, code=%d): %s", kind, maskLoginTarget(target), resp.StatusCode, codeNum, msg))
 		if !hasProof && (strings.Contains(strings.ToLower(msg+string(resp.Body)), "captcha") || strings.Contains(msg, "验证")) {
 			return fmt.Errorf("发送验证码需要先完成人机图形验证，请在界面中点击「获取验证码」并完成腾讯验证弹窗")
 		}
-		return fmt.Errorf("发送验证码失败 (code=%d): %s", codeNum, nonEmpty(msg, truncateText(string(resp.Body), 140)))
+		if codeNum == 180041 {
+			return fmt.Errorf("发送验证码频次过高 (code=180041)，请稍后再试")
+		}
+		return fmt.Errorf("发送验证码失败 (HTTP %d, code=%d): %s", resp.StatusCode, codeNum, msg)
 	}
+	c.appendAuthLog("send_code", true, fmt.Sprintf("已请求发送%s验证码 (%s, oversea=%v, HTTP %d, resp=%s)", kind, maskLoginTarget(target), isOversea, resp.StatusCode, truncateText(string(resp.Body), 140)))
 	return nil
 }
 
+func (c *Client) appendAuthLog(action string, success bool, msg string) {
+	if c.store == nil {
+		return
+	}
+	_ = c.store.AppendLog(store.RunLog{
+		Trigger: "manual",
+		Action:  action,
+		Success: success,
+		Message: msg,
+	})
+}
+
 // LoginWithCode logs in using a phone SMS code or email verification code.
-func (c *Client) LoginWithCode(ctx context.Context, kind, target, countryCode, code string) (*store.AuthState, error) {
+func (c *Client) LoginWithCode(ctx context.Context, kind, target, countryCode, code string, isOversea bool) (*store.AuthState, error) {
 	kind = strings.ToLower(strings.TrimSpace(kind))
 	target = strings.TrimSpace(target)
 	code = strings.TrimSpace(code)
 	if target == "" || code == "" {
 		return nil, fmt.Errorf("账号与验证码均不能为空")
 	}
-	headers := map[string]string{
-		"Origin":  c.endpoints.PlatformBase,
-		"Referer": c.endpoints.PlatformBase + "/login",
-	}
+	headers := c.platformHeaders(isOversea)
 
 	var (
 		endpoint string
@@ -518,12 +599,12 @@ func (c *Client) LoginWithCode(ctx context.Context, kind, target, countryCode, c
 		payload = map[string]any{
 			"phone":        normalizePhone(target, countryCode),
 			"phoneCode":    code,
-			"channel":      "web",
+			"channel":      "pc",
 			"sceneType":    2,
 			"autoRegist":   true,
 			"device":       c.deviceInfoB64(),
 			"refer":        map[string]any{},
-			"isOversea":    false,
+			"isOversea":    isOversea,
 			"businessLine": "bohrium",
 		}
 	case "email":
@@ -532,12 +613,12 @@ func (c *Client) LoginWithCode(ctx context.Context, kind, target, countryCode, c
 		payload = map[string]any{
 			"email":        target,
 			"code":         code,
-			"channel":      "web",
+			"channel":      "pc",
 			"sceneType":    2,
 			"autoRegist":   true,
 			"device":       c.deviceInfoB64(),
 			"refer":        map[string]any{},
-			"isOversea":    false,
+			"isOversea":    isOversea,
 			"businessLine": "bohrium",
 		}
 	default:
@@ -550,14 +631,17 @@ func (c *Client) LoginWithCode(ctx context.Context, kind, target, countryCode, c
 	}
 	var parsed map[string]any
 	if err := json.Unmarshal(resp.Body, &parsed); err != nil {
-		return nil, fmt.Errorf("解析验证码登录响应失败: %w", err)
-	}
-	if codeNum := int(asInt64(parsed["code"])); codeNum != 0 {
-		msg := asString(parsed["msg"])
-		if msg == "" {
-			msg = asString(asMap(parsed["error"])["msg"])
+		if isAliyunWAFResponse(resp.Body) {
+			c.appendAuthLog("login_code", false, fmt.Sprintf("验证码登录被上游阿里云 WAF 拦截 (%s, HTTP %d)", maskLoginTarget(target), resp.StatusCode))
+			return nil, wafBlockedErr("验证码登录")
 		}
-		return nil, fmt.Errorf("验证码登录失败 (code=%d): %s", codeNum, nonEmpty(msg, truncateText(string(resp.Body), 140)))
+		return nil, fmt.Errorf("解析验证码登录响应失败 (HTTP %d): %s", resp.StatusCode, truncateText(string(resp.Body), 140))
+	}
+	rawCode, hasCode := parsed["code"]
+	codeNum := int(asInt64(rawCode))
+	if !hasCode || codeNum != 0 || resp.StatusCode != http.StatusOK {
+		msg := extractPlatformErrMsg(parsed, resp.Body)
+		return nil, fmt.Errorf("验证码登录失败 (code=%d): %s", codeNum, msg)
 	}
 	tok := extractTokenFromResponse(resp.Headers, asMap(parsed["data"]))
 	if tok == "" {
@@ -587,10 +671,7 @@ func (c *Client) LoginWithPassword(ctx context.Context, account, password string
 	if account == "" || password == "" {
 		return nil, fmt.Errorf("account and password are required")
 	}
-	headers := map[string]string{
-		"Origin":  c.endpoints.PlatformBase,
-		"Referer": c.endpoints.PlatformBase + "/login",
-	}
+	headers := c.platformHeaders(false)
 	hasProof := captcha != nil && strings.TrimSpace(captcha.Ticket) != "" && strings.TrimSpace(captcha.RandStr) != ""
 	if !hasProof {
 		checkResp, err := c.http.DoJSON(ctx, http.MethodPost, c.endpoints.PlatformBase+"/api/captcha/check_user", map[string]any{
@@ -613,7 +694,7 @@ func (c *Client) LoginWithPassword(ctx context.Context, account, password string
 	payload := map[string]any{
 		"account":      account,
 		"password":     encPW,
-		"channel":      "web",
+		"channel":      "pc",
 		"sceneType":    2,
 		"device":       c.deviceInfoB64(),
 		"ext":          platformAESExt,
@@ -628,6 +709,10 @@ func (c *Client) LoginWithPassword(ctx context.Context, account, password string
 	}
 	var loginBody map[string]any
 	if err := json.Unmarshal(loginResp.Body, &loginBody); err != nil {
+		if isAliyunWAFResponse(loginResp.Body) {
+			c.appendAuthLog("login_password", false, fmt.Sprintf("密码登录被上游阿里云 WAF 拦截 (%s, HTTP %d)", maskLoginTarget(account), loginResp.StatusCode))
+			return nil, wafBlockedErr("密码登录")
+		}
 		return nil, fmt.Errorf("parse login response: %w", err)
 	}
 	if int(asInt64(loginBody["code"])) != 0 {

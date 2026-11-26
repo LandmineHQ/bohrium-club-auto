@@ -807,6 +807,7 @@ func TestPrepareCaptchaAndLoginWithProof(t *testing.T) {
 		mu              sync.Mutex
 		skipUser        bool
 		lastSendPayload map[string]any
+		lastSendLang    string
 		lastPwPayload   map[string]any
 	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -831,6 +832,7 @@ func TestPrepareCaptchaAndLoginWithProof(t *testing.T) {
 			var b map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&b)
 			lastSendPayload = b
+			lastSendLang = r.Header.Get("Content-Language")
 			_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
 		case "/api/account/v3/login":
 			var b map[string]any
@@ -872,17 +874,31 @@ func TestPrepareCaptchaAndLoginWithProof(t *testing.T) {
 		t.Fatalf("expected skip=true for exempt account, got %+v err=%v", prepSkip, err)
 	}
 
-	// 3. SendVerifyCode forwards user-completed Tencent Captcha proof
+	// 3. SendVerifyCode forwards user-completed Tencent Captcha proof, Content-Language, channel="pc"
 	proof := &CaptchaProof{Ticket: "t03-user-ticket", RandStr: "@ab12", CaptchaAppID: DefaultTencentCaptchaAppID}
-	if err := cli.SendVerifyCode(context.Background(), "phone", "13800138000", "86", proof); err != nil {
-		t.Fatalf("SendVerifyCode(phone): %v", err)
+	if err := cli.SendVerifyCode(context.Background(), "email", "user@example.org", "", true, proof); err != nil {
+		t.Fatalf("SendVerifyCode(email): %v", err)
 	}
 	mu.Lock()
 	gotSend := lastSendPayload
+	gotLang := lastSendLang
 	mu.Unlock()
-	if asString(gotSend["ticket"]) != "t03-user-ticket" || asString(gotSend["randStr"]) != "@ab12" || asInt64(gotSend["captchaAppId"]) != DefaultTencentCaptchaAppID {
-		t.Fatalf("SendVerifyCode did not forward captcha proof: %+v", gotSend)
+	if asString(gotSend["ticket"]) != "t03-user-ticket" || asString(gotSend["randStr"]) != "@ab12" || asInt64(gotSend["captchaAppId"]) != DefaultTencentCaptchaAppID || asString(gotSend["channel"]) != "pc" || !asBool(gotSend["isOversea"]) || gotLang != "en-us" {
+		t.Fatalf("SendVerifyCode did not forward expected fields: payload=%+v lang=%q", gotSend, gotLang)
 	}
+
+	// 4. SendVerifyCode MUST detect Aliyun WAF HTML 200 responses and return a clean user-facing error (no raw HTML leak)
+	tsBad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`<textarea id="renderData" style="display:none">{}</textarea><textarea id="aliyun_waf_fa9faf9f45" style="display:none">{}</textarea>`))
+	}))
+	defer tsBad.Close()
+	cli.SetEndpoints(Endpoints{ClubBase: srv.URL, PlatformBase: tsBad.URL, WWWBase: srv.URL})
+	wafErr := cli.SendVerifyCode(context.Background(), "email", "user@example.org", "", false, proof)
+	if wafErr == nil || !strings.Contains(wafErr.Error(), "阿里云 WAF") || strings.Contains(wafErr.Error(), "<textarea") {
+		t.Fatalf("expected clean Aliyun WAF error without raw HTML, got %v", wafErr)
+	}
+	cli.SetEndpoints(Endpoints{ClubBase: srv.URL, PlatformBase: srv.URL, WWWBase: srv.URL})
 
 	// 4. LoginWithPassword with proof bypasses check_user rejection and forwards proof to /v3/login
 	mu.Lock()

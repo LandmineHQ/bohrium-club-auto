@@ -23,15 +23,19 @@
 
 ## 方式三：手机 / 邮箱验证码登录
 
-在 **「验证码」** 标签页选择手机号或邮箱，点击 **「获取验证码」** 后，后端会调用 `/api/bohrium/captcha/prepare` 获取初始化参数，并在当前浏览器中弹出官方腾讯云人机图形验证（`TJCaptcha.js`）；您手动完成滑块/点选验证后，前端自动将验证票据（`ticket`、`randStr`、`captchaAppId`）随发送请求提交至 `send_by_phone_v3` / `send_by_email_v3`，输入收到的验证码即可登录。
+在 **「验证码」** 标签页选择手机号或邮箱（支持勾选 **海外通道 `en-us`**），点击 **「获取验证码」** 后，后端会调用 `/api/bohrium/captcha/prepare` 获取初始化参数，并在当前浏览器中弹出官方腾讯云人机图形验证（`TJCaptcha.js`）；您手动完成滑块/点选验证后，前端自动将验证票据（`ticket`、`randStr`、`captchaAppId`）随发送请求提交至 `send_by_phone_v3` / `send_by_email_v3`，输入收到的验证码即可登录。
 
 ## 方式四：账号密码登录（支持学术码）
 
 支持手机号、邮箱或学术码（Account ID）+ 密码登录，复现了 `platform.bohrium.com` 的 AES-128-CBC（PKCS7 + 双重 Base64）加密逻辑；提交前先通过 `/api/captcha/check_user` 判断是否免验，如需人机验证则自动在页面弹出官方腾讯云图形验证组件供您手动完成验证，再携带验证票据提交 `/api/account/v3/login`。
 
+::: warning 上游阿里云 WAF 说明
+`platform.bohrium.com` 对部分后端直连发码/密码登录请求可能返回阿里云 WAF 浏览器环境质询（本程序不会绕过 WAF）。若遇到拦截提示，请直接点击弹窗内的 **「打开官方登录窗口」** 在浏览器完成官网登录，再将 Cookie 中的 `brmToken` 粘贴到 **「导入 Token」** 页签（导入一次后后台自动续期），或使用 **微信扫码 / 第三方 OAuth**。
+:::
+
 ## 方式五：导入 `brmToken`
 
-如果浏览器已登录 `club.bohrium.com` 或 `www.bohrium.com`，可在 DevTools → Application → Cookies 中复制 `brmToken`（支持直接粘贴整段 Cookie 字符串），在 **「导入 Token」** 标签页提交即可。
+点击 **「打开玻尔官方登录窗口」** 在独立窗口完成登录，或从已登录 `club.bohrium.com` / `www.bohrium.com` 的浏览器 DevTools → Application → Cookies 中复制 `brmToken`（支持直接粘贴整段 Cookie 字符串），在 **「导入 Token」** 标签页提交即可。
 
 ## 自动续期机制
 

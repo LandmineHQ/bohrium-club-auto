@@ -29,6 +29,46 @@ export default defineConfig({
     outDir: "dist",
     emptyOutDir: true,
     sourcemap: false,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          const norm = id.replace(/\\/g, "/")
+          if (!norm.includes("/node_modules/")) return
+          if (
+            norm.includes("/node_modules/d3-") ||
+            norm.includes("/node_modules/victory-vendor/") ||
+            norm.includes("/node_modules/internmap/")
+          ) {
+            return "d3-vendor"
+          }
+          if (norm.includes("/node_modules/recharts/")) {
+            return "charts"
+          }
+          if (
+            norm.includes("/node_modules/@radix-ui/") ||
+            norm.includes("/node_modules/lucide-react/") ||
+            norm.includes("/node_modules/sonner/")
+          ) {
+            return "ui-vendor"
+          }
+          if (
+            norm.includes("/node_modules/react/") ||
+            norm.includes("/node_modules/react-dom/") ||
+            norm.includes("/node_modules/scheduler/") ||
+            norm.includes("/node_modules/use-sync-external-store/") ||
+            norm.includes("/node_modules/@reduxjs/") ||
+            norm.includes("/node_modules/redux/") ||
+            norm.includes("/node_modules/react-redux/") ||
+            norm.includes("/node_modules/reselect/") ||
+            norm.includes("/node_modules/immer/") ||
+            norm.includes("/node_modules/es-toolkit/") ||
+            norm.includes("/node_modules/clsx/")
+          ) {
+            return "react-core"
+          }
+        },
+      },
+    },
   },
   server: {
     port: 5174,

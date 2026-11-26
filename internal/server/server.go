@@ -467,6 +467,7 @@ func (s *Server) handleSendCode(w http.ResponseWriter, r *http.Request) {
 		Kind         string `json:"kind"`
 		Target       string `json:"target"`
 		CountryCode  string `json:"countryCode"`
+		IsOversea    bool   `json:"isOversea"`
 		Ticket       string `json:"ticket"`
 		RandStr      string `json:"randStr"`
 		CaptchaAppID int64  `json:"captchaAppId"`
@@ -485,7 +486,7 @@ func (s *Server) handleSendCode(w http.ResponseWriter, r *http.Request) {
 			CaptchaAppID: body.CaptchaAppID,
 		}
 	}
-	if err := s.mgr.Ephemeral().SendVerifyCode(ctx, body.Kind, body.Target, body.CountryCode, proof); err != nil {
+	if err := s.mgr.Ephemeral().SendVerifyCode(ctx, body.Kind, body.Target, body.CountryCode, body.IsOversea, proof); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
@@ -497,6 +498,7 @@ func (s *Server) handleCodeLogin(w http.ResponseWriter, r *http.Request) {
 		Kind        string `json:"kind"`
 		Target      string `json:"target"`
 		CountryCode string `json:"countryCode"`
+		IsOversea   bool   `json:"isOversea"`
 		Code        string `json:"code"`
 		Label       string `json:"label"`
 	}
@@ -507,7 +509,7 @@ func (s *Server) handleCodeLogin(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
 	cli, scope := s.mgr.ForLogin(body.Label)
-	if _, err := cli.LoginWithCode(ctx, body.Kind, body.Target, body.CountryCode, body.Code); err != nil {
+	if _, err := cli.LoginWithCode(ctx, body.Kind, body.Target, body.CountryCode, body.Code, body.IsOversea); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
