@@ -400,12 +400,30 @@ CREATE INDEX IF NOT EXISTS idx_usage_created ON gateway_usage_logs(created_at DE
 CREATE INDEX IF NOT EXISTS idx_usage_key_created ON gateway_usage_logs(api_key_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_usage_model_created ON gateway_usage_logs(model, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_usage_account_created ON gateway_usage_logs(account_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS gateway_key_usage_totals (
+    api_key_id    TEXT PRIMARY KEY,
+    request_count INTEGER NOT NULL DEFAULT 0,
+    total_tokens  INTEGER NOT NULL DEFAULT 0,
+    last_used_at  INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS gateway_key_daily_baselines (
+    api_key_id    TEXT NOT NULL,
+    day_start     INTEGER NOT NULL,
+    request_count INTEGER NOT NULL DEFAULT 0,
+    total_tokens  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (api_key_id, day_start)
+);
 `
 	if _, err := s.db.Exec(ddl); err != nil {
 		return fmt.Errorf("init sqlite schema: %w", err)
 	}
 	if err := s.ensureUsageColumns(); err != nil {
 		return fmt.Errorf("migrate gateway_usage_logs columns: %w", err)
+	}
+	if err := s.backfillGatewayKeyUsageTotals(); err != nil {
+		return fmt.Errorf("backfill gateway key usage totals: %w", err)
 	}
 	return nil
 }

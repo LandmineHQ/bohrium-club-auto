@@ -25,7 +25,6 @@ const (
 	publicMsgEmptyPool            = "No active accounts are configured in the routing pool."
 	publicMsgNoHealthyPool        = "No healthy accounts are currently available in the routing pool."
 	publicMsgAccountUnavailable   = "No authenticated upstream account is currently available."
-	publicMsgLiveBalanceWarning   = "live balance refresh temporarily unavailable (showing cached balance)"
 )
 
 type sanitizedUpstreamError struct {

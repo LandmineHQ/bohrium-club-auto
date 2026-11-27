@@ -64,7 +64,7 @@ func (s *Server) handleGatewayStatus(w http.ResponseWriter, r *http.Request) {
 			"sciMasterPrompt":        gwCfg.SciMasterPrompt,
 			"analyticsRetentionDays": gwCfg.AnalyticsRetentionDays,
 			"storeId":                gwCfg.StoreID,
-			"apiKeys":                gwCfg.APIKeys,
+			"apiKeys":                s.gatewayAPIKeyViews(gwCfg.APIKeys),
 			"modelEnabled":           modelEnabled,
 		},
 		"pool": map[string]any{
@@ -205,98 +205,6 @@ func (s *Server) handleGatewayUpdateModel(w http.ResponseWriter, r *http.Request
 		"enabled":      *body.Enabled,
 		"modelEnabled": updated.Gateway.ModelEnabled,
 	})
-}
-
-func (s *Server) handleGatewayCreateKey(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Name string `json:"name"`
-	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	name := strings.TrimSpace(body.Name)
-	if name == "" {
-		name = "API Key " + time.Now().Format("01-02 15:04")
-	}
-	newKey := config.APIKey{
-		ID:        openai.RandomID("key_"),
-		Name:      name,
-		Key:       config.GenerateAPIKey(),
-		CreatedAt: time.Now().UTC().Format(time.RFC3339),
-		Enabled:   true,
-	}
-	updated, err := s.cfg.Update(func(c *config.Config) error {
-		c.Gateway.APIKeys = append(c.Gateway.APIKeys, newKey)
-		return nil
-	})
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"key":     newKey,
-		"apiKeys": updated.Gateway.APIKeys,
-	})
-}
-
-func (s *Server) handleGatewayUpdateKey(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimSpace(r.PathValue("id"))
-	var body struct {
-		Name    *string `json:"name"`
-		Enabled *bool   `json:"enabled"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "无效请求体"})
-		return
-	}
-	found := false
-	updated, err := s.cfg.Update(func(c *config.Config) error {
-		for i := range c.Gateway.APIKeys {
-			if c.Gateway.APIKeys[i].ID == id {
-				found = true
-				if body.Name != nil && strings.TrimSpace(*body.Name) != "" {
-					c.Gateway.APIKeys[i].Name = strings.TrimSpace(*body.Name)
-				}
-				if body.Enabled != nil {
-					c.Gateway.APIKeys[i].Enabled = *body.Enabled
-				}
-				break
-			}
-		}
-		if !found {
-			return &badInputError{"API Key 不存在"}
-		}
-		return nil
-	})
-	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "apiKeys": updated.Gateway.APIKeys})
-}
-
-func (s *Server) handleGatewayDeleteKey(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimSpace(r.PathValue("id"))
-	updated, err := s.cfg.Update(func(c *config.Config) error {
-		next := make([]config.APIKey, 0, len(c.Gateway.APIKeys))
-		removed := false
-		for _, k := range c.Gateway.APIKeys {
-			if k.ID == id {
-				removed = true
-				continue
-			}
-			next = append(next, k)
-		}
-		if !removed {
-			return &badInputError{"API Key 不存在"}
-		}
-		c.Gateway.APIKeys = next
-		return nil
-	})
-	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "apiKeys": updated.Gateway.APIKeys})
 }
 
 func (s *Server) handleGatewayUpdateSettings(w http.ResponseWriter, r *http.Request) {
@@ -511,7 +419,7 @@ func (s *Server) handleGatewayPurgeAnalytics(w http.ResponseWriter, r *http.Requ
 		err    error
 	)
 	if body.ClearAll {
-		purged, err = s.store.ClearGatewayUsage()
+		purged, err = s.store.ClearGatewayUsageInTimezone(time.Now().UTC(), s.cfg.Get().Schedule.Timezone)
 	} else {
 		retDays := s.cfg.Get().Gateway.AnalyticsRetentionDays
 		if retDays <= 0 {

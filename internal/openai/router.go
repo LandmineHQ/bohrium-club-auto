@@ -45,7 +45,7 @@ type RouteDecision struct {
 	Mode             string // "direct" | "bound" | "new_bind" | "rebound"
 }
 
-// PoolAccountView summarizes a pooled account's live routing weight and binding telemetry for the UI / /v1/balance.
+// PoolAccountView summarizes a pooled account's live routing weight and binding telemetry for the admin UI.
 type PoolAccountView struct {
 	AccountID        string    `json:"accountId"`
 	UserID           int64     `json:"userId"`

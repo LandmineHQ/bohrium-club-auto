@@ -3,14 +3,13 @@ package openai
 import (
 	"bytes"
 	"context"
-	"crypto/subtle"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -71,24 +70,26 @@ func apiKeyIdentityFromCtx(ctx context.Context) (string, string) {
 	return id, name
 }
 
-// Gateway exposes full OpenAI-compatible /v1/models, /v1/balance, /v1/chat/completions, and /v1/responses endpoints
+// Gateway exposes full OpenAI-compatible /v1/models, /v1/user/balance, /v1/chat/completions, and /v1/responses endpoints
 // backed by a multi-account weighted-balance routing pool over Bohrium desktop client's native Sigma LLM protocol.
 type Gateway struct {
-	cfg                         *config.Manager
-	mgr                         *bohrium.Manager
-	router                      *PoolRouter
-	respDir                     *ResponseStore
-	keepaliveNanos              atomic.Int64
+	cfg                          *config.Manager
+	mgr                          *bohrium.Manager
+	router                       *PoolRouter
+	respDir                      *ResponseStore
+	keyLimiter                   *keyRateLimiter
+	keepaliveNanos               atomic.Int64
 	preHeaderKeepaliveDelayNanos atomic.Int64
 }
 
 // NewGateway constructs a multi-account OpenAI-compatible Bohrium gateway.
 func NewGateway(cfg *config.Manager, mgr *bohrium.Manager) *Gateway {
 	gw := &Gateway{
-		cfg:     cfg,
-		mgr:     mgr,
-		router:  NewPoolRouter(mgr),
-		respDir: OpenResponseStore(mgr.Store()),
+		cfg:        cfg,
+		mgr:        mgr,
+		router:     NewPoolRouter(mgr),
+		respDir:    OpenResponseStore(mgr.Store()),
+		keyLimiter: newKeyRateLimiter(),
 	}
 	gw.keepaliveNanos.Store(int64(defaultKeepaliveInterval))
 	gw.preHeaderKeepaliveDelayNanos.Store(int64(defaultPreHeaderKeepaliveDelay))
@@ -130,7 +131,10 @@ func (g *Gateway) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("OPTIONS /v1/", g.handleCORS)
 	mux.HandleFunc("GET /v1/models", g.withMiddleware(g.handleListModels))
 	mux.HandleFunc("GET /v1/models/{id...}", g.withMiddleware(g.handleGetModel))
-	mux.HandleFunc("GET /v1/balance", g.withMiddleware(g.handleGetBalance))
+	mux.HandleFunc("GET /v1/user/balance", g.withMiddleware(g.handleGetUserBalance))
+	// Legacy alias retains client compatibility but now returns the same
+	// authenticated key-level quota, never an aggregate pool balance.
+	mux.HandleFunc("GET /v1/balance", g.withMiddleware(g.handleGetUserBalance))
 	mux.HandleFunc("POST /v1/chat/completions", g.withMiddleware(g.handleChatCompletions))
 	mux.HandleFunc("POST /v1/responses", g.withMiddleware(g.handleCreateResponse))
 	mux.HandleFunc("GET /v1/responses/{id}/input_items", g.withMiddleware(g.handleGetResponseInputItems))
@@ -213,28 +217,53 @@ func (g *Gateway) withMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "gateway_disabled", "OpenAI gateway is disabled in configuration")
 			return
 		}
+
 		keyID, keyName := "", ""
 		if existingID, ok := r.Context().Value(ctxKeyAPIKeyID).(string); ok && strings.TrimSpace(existingID) != "" {
 			keyID, keyName = apiKeyIdentityFromCtx(r.Context())
 		}
+		var (
+			callerKey    config.APIKey
+			hasKeyPolicy bool
+		)
 		if keyID == "" {
-			key := extractAPIKey(r)
-			if !gwCfg.AllowNoAuth {
-				matchedID, matchedName, ok := validateAPIKey(key, gwCfg.APIKeys)
-				if !ok {
-					WriteError(w, http.StatusUnauthorized, "authentication_error", "invalid_api_key", "Invalid or missing API key; provide Authorization: Bearer <sk-brm-...>")
-					return
+			candidate := extractAPIKey(r)
+			matched, authErr := authenticateAPIKey(candidate, gwCfg.APIKeys, time.Now().UTC())
+			if authErr != nil {
+				WriteError(w, http.StatusUnauthorized, "authentication_error", authErr.code, authErr.message)
+				return
+			}
+			if matched.ID != "" {
+				callerKey = matched
+				hasKeyPolicy = true
+				keyID, keyName = matched.ID, strings.TrimSpace(matched.Name)
+				if keyName == "" {
+					keyName = matched.ID
 				}
-				keyID, keyName = matchedID, matchedName
+			} else if !gwCfg.AllowNoAuth {
+				WriteError(w, http.StatusUnauthorized, "authentication_error", "invalid_api_key", "Invalid or missing API key; provide Authorization: Bearer <sk-brm-...>")
+				return
 			} else {
-				if matchedID, matchedName, ok := validateAPIKey(key, gwCfg.APIKeys); ok {
-					keyID, keyName = matchedID, matchedName
-				} else {
-					keyID, keyName = "public", "无鉴权访问 (Public)"
-				}
+				keyID, keyName = "public", "无鉴权访问 (Public)"
 			}
 		}
+
 		ctx := WithCallerKeyIdentity(r.Context(), keyID, keyName)
+		if hasKeyPolicy {
+			ctx = withCallerKeyPolicy(ctx, callerKey)
+			if !g.enforceKeyQuota(w, r, callerKey) {
+				return
+			}
+			decision := g.keyLimiter.acquire(callerKey.ID, callerKey.RateLimit, callerKey.ConcurrencyLimit, time.Now())
+			if !decision.allowed {
+				if decision.retryAfter > 0 {
+					w.Header().Set("Retry-After", strconv.Itoa(decision.retryAfter))
+				}
+				WriteError(w, http.StatusTooManyRequests, "rate_limit_error", decision.code, decision.message)
+				return
+			}
+			defer decision.release()
+		}
 		next(w, r.WithContext(ctx))
 	}
 }
@@ -253,30 +282,6 @@ func extractAPIKey(r *http.Request) string {
 		return k
 	}
 	return ""
-}
-
-func validateAPIKey(candidate string, keys []config.APIKey) (string, string, bool) {
-	if candidate == "" {
-		return "", "", false
-	}
-	cBytes := []byte(candidate)
-	matchedID := ""
-	matchedName := ""
-	matched := false
-	for _, k := range keys {
-		if !k.Enabled || k.Key == "" {
-			continue
-		}
-		if subtle.ConstantTimeCompare(cBytes, []byte(k.Key)) == 1 {
-			matched = true
-			matchedID = k.ID
-			matchedName = strings.TrimSpace(k.Name)
-			if matchedName == "" {
-				matchedName = k.ID
-			}
-		}
-	}
-	return matchedID, matchedName, matched
 }
 
 type modelDisabledError struct {
@@ -312,6 +317,12 @@ func (g *Gateway) handleResolveModelError(
 	if ctx.Err() != nil {
 		g.recordFailure(ctx, endpoint, "", requestedModel, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, stream, statusClientClosedRequest, start, ctx.Err().Error(), tel)
 		return false, statusClientClosedRequest, "", "", "", ctx.Err().Error()
+	}
+	var notAllowedErr *modelNotAllowedError
+	if errors.As(mErr, &notAllowedErr) {
+		WriteError(w, http.StatusForbidden, "invalid_request_error", "model_not_allowed", notAllowedErr.Error())
+		g.recordFailure(ctx, endpoint, "", requestedModel, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, stream, http.StatusForbidden, start, notAllowedErr.Error(), tel)
+		return false, http.StatusForbidden, "invalid_request_error", "model_not_allowed", notAllowedErr.Error(), notAllowedErr.Error()
 	}
 	var disErr *modelDisabledError
 	if errors.As(mErr, &disErr) {
@@ -425,20 +436,20 @@ func toOpenAIModel(m bohrium.SciXModel) OpenAIModel {
 	}
 
 	out := OpenAIModel{
-		ID:                     m.ID,
-		Object:                 obj,
-		Created:                m.Created,
-		OwnedBy:                ownedBy,
-		Name:                   displayName,
-		DisplayName:            displayName,
-		Description:            description,
-		ContextWindow:          ctxWin,
-		ContextLength:          ctxWin,
-		MaxModelLen:            ctxWin,
-		MaxInputTokens:         ctxWin,
-		MaxOutputTokens:        maxOut,
-		MaxTokens:              maxOut,
-		Input:                  append([]string(nil), inputMods...),
+		ID:              m.ID,
+		Object:          obj,
+		Created:         m.Created,
+		OwnedBy:         ownedBy,
+		Name:            displayName,
+		DisplayName:     displayName,
+		Description:     description,
+		ContextWindow:   ctxWin,
+		ContextLength:   ctxWin,
+		MaxModelLen:     ctxWin,
+		MaxInputTokens:  ctxWin,
+		MaxOutputTokens: maxOut,
+		MaxTokens:       maxOut,
+		Input:           append([]string(nil), inputMods...),
 		Architecture: &OpenAIModelArchitecture{
 			Modality:         strings.Join(inputMods, "+") + "->text",
 			InputModalities:  append([]string(nil), inputMods...),
@@ -479,8 +490,15 @@ func toOpenAIModel(m bohrium.SciXModel) OpenAIModel {
 	return out
 }
 
-// BuildOpenAIModelList returns the GET /v1/models payload containing only enabled models.
+// BuildOpenAIModelList returns the unrestricted administrative model list.
+// External handlers use BuildOpenAIModelListForKey to apply the caller's scope.
 func (g *Gateway) BuildOpenAIModelList(cat *bohrium.SciXModelCatalog) OpenAIModelList {
+	return g.BuildOpenAIModelListForKey(context.Background(), cat)
+}
+
+// BuildOpenAIModelListForKey returns only models enabled globally and allowed
+// by the authenticated key's optional allowlist.
+func (g *Gateway) BuildOpenAIModelListForKey(ctx context.Context, cat *bohrium.SciXModelCatalog) OpenAIModelList {
 	list := OpenAIModelList{
 		Object: "list",
 		Data:   []OpenAIModel{},
@@ -489,7 +507,7 @@ func (g *Gateway) BuildOpenAIModelList(cat *bohrium.SciXModelCatalog) OpenAIMode
 		return list
 	}
 	for _, m := range cat.Data {
-		if !g.IsModelEnabled(m) {
+		if !g.IsModelEnabled(m) || !keyAllowsModel(ctx, m.ID) {
 			continue
 		}
 		list.Data = append(list.Data, toOpenAIModel(m))
@@ -506,6 +524,9 @@ func (g *Gateway) resolveEnabledModel(ctx context.Context, cli *bohrium.Client, 
 
 	if req == "" {
 		var candidates []string
+		if keyDefault := keyDefaultModel(ctx); keyDefault != "" {
+			candidates = append(candidates, keyDefault)
+		}
 		if g.cfg != nil {
 			if def := strings.TrimSpace(g.cfg.Get().Gateway.DefaultModel); def != "" {
 				candidates = append(candidates, def)
@@ -525,7 +546,7 @@ func (g *Gateway) resolveEnabledModel(ctx context.Context, cli *bohrium.Client, 
 			candidates = append(candidates, m.ID)
 		}
 		for _, cand := range candidates {
-			if m, ok := cat.FindModel(cand); ok && g.IsModelEnabled(m) {
+			if m, ok := cat.FindModel(cand); ok && g.IsModelEnabled(m) && keyAllowsModel(ctx, m.ID) {
 				return m, cat, nil
 			}
 		}
@@ -551,6 +572,9 @@ func (g *Gateway) resolveEnabledModel(ctx context.Context, cli *bohrium.Client, 
 			msg:     fmt.Sprintf("model %q is disabled in gateway settings", m.ID),
 		}
 	}
+	if !keyAllowsModel(ctx, m.ID) {
+		return bohrium.SciXModel{}, cat, rejectModelNotAllowed(m.ID)
+	}
 	return m, cat, nil
 }
 
@@ -569,7 +593,7 @@ func (g *Gateway) handleListModels(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusBadGateway, "upstream_error", "catalog_unavailable", publicMsgCatalogUnavailable)
 		return
 	}
-	WriteJSON(w, http.StatusOK, g.BuildOpenAIModelList(cat))
+	WriteJSON(w, http.StatusOK, g.BuildOpenAIModelListForKey(r.Context(), cat))
 }
 
 func (g *Gateway) handleGetModel(w http.ResponseWriter, r *http.Request) {
@@ -584,6 +608,11 @@ func (g *Gateway) handleGetModel(w http.ResponseWriter, r *http.Request) {
 	}
 	m, _, err := g.resolveEnabledModel(ctx, cli, id)
 	if err != nil {
+		var notAllowedErr *modelNotAllowedError
+		if errors.As(err, &notAllowedErr) {
+			WriteError(w, http.StatusNotFound, "invalid_request_error", "model_not_allowed", notAllowedErr.Error())
+			return
+		}
 		var disErr *modelDisabledError
 		if errors.As(err, &disErr) {
 			WriteError(w, http.StatusNotFound, "invalid_request_error", "model_disabled", disErr.Error())
@@ -600,172 +629,12 @@ func (g *Gateway) handleGetModel(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, http.StatusOK, toOpenAIModel(m))
 }
 
-// BalanceResponse represents the OpenAI-gateway /v1/balance aggregated pool response payload.
-type BalanceResponse struct {
-	Object            string                `json:"object"`
-	IsAvailable       bool                  `json:"is_available"`
-	Currency          string                `json:"currency"`
-	Balance           float64               `json:"balance"`
-	PhotonBalance     float64               `json:"photon_balance"`
-	OrgBalance        float64               `json:"org_balance"`
-	OrgBalanceLimit   float64               `json:"org_balance_limit"`
-	WalletBalanceCNY  float64               `json:"wallet_balance_cny"`
-	Expiring7DPhotons float64               `json:"expiring_7d_photons"`
-	PoolAccountCount  int                   `json:"pool_account_count"`
-	HealthyPoolCount  int                   `json:"healthy_pool_count"`
-	PoolAccounts      []PoolAccountView     `json:"pool_accounts"`
-	Membership        BalanceMembership     `json:"membership"`
-	Quotas            BalanceQuotas         `json:"quotas"`
-	Storage           BalanceStorage        `json:"storage"`
-	ExpiringLots      []bohrium.ExpiringLot `json:"expiring_lots"`
-	BalanceInfos      []BalanceCurrencyInfo `json:"balance_infos"`
-	FetchedAt         string                `json:"fetched_at"`
-	Warnings          []string              `json:"warnings,omitempty"`
-}
-
-// BalanceMembership summarizes Bohrium membership tier & periodic benefits.
-type BalanceMembership struct {
-	Level           any     `json:"level"`
-	ExpireAt        string  `json:"expire_at,omitempty"`
-	Photons         float64 `json:"photons"`
-	NextBenefitDate string  `json:"next_benefit_date,omitempty"`
-}
-
-// BalanceQuotas summarizes remaining feature quotas.
-type BalanceQuotas struct {
-	PaperSearch   bohrium.QuotaCounter `json:"paper_search"`
-	KnowledgeChat bohrium.QuotaCounter `json:"knowledge_chat"`
-	DeepResearch  bohrium.QuotaCounter `json:"deep_research"`
-}
-
-// BalanceStorage mirrors knowledge-base storage utilization.
-type BalanceStorage struct {
-	RemainingBytes int64   `json:"remaining_bytes"`
-	UsedBytes      int64   `json:"used_bytes"`
-	TotalBytes     int64   `json:"total_bytes"`
-	UsedPercent    float64 `json:"used_percent"`
-	RemainingHuman string  `json:"remaining_human"`
-	UsedHuman      string  `json:"used_human"`
-	TotalHuman     string  `json:"total_human"`
-}
-
 // BalanceCurrencyInfo matches the balance_infos convention used by OpenAI-compatible gateways.
 type BalanceCurrencyInfo struct {
 	Currency        string `json:"currency"`
 	TotalBalance    string `json:"total_balance"`
 	GrantedBalance  string `json:"granted_balance"`
 	ToppedUpBalance string `json:"topped_up_balance"`
-}
-
-func (g *Gateway) handleGetBalance(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-
-	poolAccounts, err := g.mgr.Store().ListPoolAccounts()
-	if err != nil {
-		WriteError(w, http.StatusInternalServerError, "server_error", "store_error", publicMsgStoreError)
-		return
-	}
-	if len(poolAccounts) == 0 {
-		WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "empty_pool", publicMsgEmptyPool)
-		return
-	}
-
-	var (
-		totalPhotons    float64
-		totalOrg        float64
-		totalOrgLimit   float64
-		totalWalletCNY  float64
-		totalExpiring7D float64
-		allLots         []bohrium.ExpiringLot
-		warnings        []string
-		firstAssets     *bohrium.PointsAndCapacity
-	)
-
-	// Refresh live balances for every account in the OpenAI routing pool.
-	for _, acc := range poolAccounts {
-		assets, aErr := g.mgr.RefreshAccountBalance(ctx, acc.ID)
-		if aErr != nil {
-			warnings = append(warnings, fmt.Sprintf("%s: %s", acc.DisplayName(), publicMsgLiveBalanceWarning))
-			totalPhotons += acc.PhotonBalance
-			totalOrg += acc.OrgBalance
-			totalWalletCNY += acc.WalletBalanceCNY
-			continue
-		}
-		if firstAssets == nil {
-			firstAssets = assets
-		}
-		totalPhotons += assets.PhotonBalance
-		totalOrg += assets.OrgBalance
-		totalOrgLimit += assets.OrgBalanceLimit
-		totalWalletCNY += assets.WalletBalance
-		totalExpiring7D += assets.Expiring7DayPhotons
-		allLots = append(allLots, assets.ExpiringLots...)
-	}
-
-	views, _, _ := g.router.PoolSummary()
-	healthyCnt := 0
-	for _, v := range views {
-		if v.Healthy {
-			healthyCnt++
-		}
-	}
-
-	combinedPhotons := totalPhotons + totalOrg
-	resp := BalanceResponse{
-		Object:            "balance",
-		IsAvailable:       healthyCnt > 0 && (combinedPhotons > 0 || totalWalletCNY > 0),
-		Currency:          "photon",
-		Balance:           totalPhotons,
-		PhotonBalance:     totalPhotons,
-		OrgBalance:        totalOrg,
-		OrgBalanceLimit:   totalOrgLimit,
-		WalletBalanceCNY:  totalWalletCNY,
-		Expiring7DPhotons: totalExpiring7D,
-		PoolAccountCount:  len(views),
-		HealthyPoolCount:  healthyCnt,
-		PoolAccounts:      views,
-		ExpiringLots:      allLots,
-		BalanceInfos: []BalanceCurrencyInfo{
-			{
-				Currency:        "PHOTON",
-				TotalBalance:    fmt.Sprintf("%.2f", combinedPhotons),
-				GrantedBalance:  fmt.Sprintf("%.2f", totalPhotons),
-				ToppedUpBalance: fmt.Sprintf("%.2f", totalOrg),
-			},
-			{
-				Currency:        "CNY",
-				TotalBalance:    fmt.Sprintf("%.2f", totalWalletCNY),
-				GrantedBalance:  "0.00",
-				ToppedUpBalance: fmt.Sprintf("%.2f", totalWalletCNY),
-			},
-		},
-		FetchedAt: time.Now().UTC().Format(time.RFC3339),
-		Warnings:  warnings,
-	}
-	if firstAssets != nil {
-		resp.Membership = BalanceMembership{
-			Level:           firstAssets.MembershipLevel,
-			ExpireAt:        firstAssets.MembershipExpire,
-			Photons:         firstAssets.MembershipPhotons,
-			NextBenefitDate: firstAssets.NextBenefitDate,
-		}
-		resp.Quotas = BalanceQuotas{
-			PaperSearch:   firstAssets.PaperQuota,
-			KnowledgeChat: firstAssets.KnowledgeChat,
-			DeepResearch:  firstAssets.DeepResearch,
-		}
-		resp.Storage = BalanceStorage{
-			RemainingBytes: firstAssets.Storage.RemainingBytes,
-			UsedBytes:      firstAssets.Storage.UsedBytes,
-			TotalBytes:     firstAssets.Storage.TotalBytes,
-			UsedPercent:    firstAssets.Storage.UsedPercent,
-			RemainingHuman: firstAssets.Storage.RemainingHuman,
-			UsedHuman:      firstAssets.Storage.UsedHuman,
-			TotalHuman:     firstAssets.Storage.TotalHuman,
-		}
-	}
-	WriteJSON(w, http.StatusOK, resp)
 }
 
 func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -794,7 +663,7 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 	baseTel := reqTelemetry{
 		RequestedModel:  strings.TrimSpace(req.Model),
-		ReasoningEffort: strings.TrimSpace(req.ReasoningEffort),
+		ReasoningEffort: strings.TrimSpace(req.EffectiveReasoningEffort()),
 		SessionHash:     sessionHash,
 		ClientIP:        extractClientIP(r),
 		UserAgent:       strings.TrimSpace(r.Header.Get("User-Agent")),
@@ -856,12 +725,17 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		tel.Bridged = upstreamAPI != "chat_completions"
 		tel.SciMasterPrompt = shouldInjectSciMasterPrompt(model.ID, g.sciMasterPromptEnabled())
 		tel.UsageMultiplier = modelUsageMultiplier(model)
-		tel.ReasoningEffort = resolveRecordedReasoningEffort(req.ReasoningEffort, model, nil)
+		tel.ReasoningEffort = resolveRecordedReasoningEffort(req.EffectiveReasoningEffort(), model, nil)
 		if strings.TrimSpace(req.Model) == model.ID {
 			tel.RequestedModel = ""
 		}
 
-		traceparent := strings.TrimSpace(r.Header.Get("traceparent"))
+		traceparent := ""
+		if attempt == 0 {
+			if cand := strings.TrimSpace(r.Header.Get("traceparent")); bohrium.IsValidTraceparent(cand) {
+				traceparent = cand
+			}
+		}
 		if traceparent == "" {
 			traceparent = bohrium.NewTraceparent()
 		}
@@ -871,6 +745,15 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 				if ctx.Err() != nil {
 					g.recordFailure(ctx, "/v1/chat/completions", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, statusClientClosedRequest, start, ctx.Err().Error(), tel)
 					return
+				}
+				if status == http.StatusUnauthorized {
+					if explicitAcc == "" {
+						g.markAccountExpired(decision.Account.ID, rawReason)
+						excluded[decision.Account.ID] = true
+						lastStatus, lastErrType, lastErrCode, lastErrMsg, lastRawErrMsg = http.StatusServiceUnavailable, "authentication_error", "account_expired", publicMsgAccountExpired, rawReason
+						continue
+					}
+					status = http.StatusServiceUnavailable
 				}
 				if status == http.StatusPaymentRequired && explicitAcc == "" {
 					g.markAccountInsufficient(decision.Account.ID, rawReason)
@@ -907,7 +790,7 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 			g.recordFailure(ctx, "/v1/chat/completions", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, http.StatusBadRequest, start, normErr.Error(), tel)
 			return
 		}
-		tel.ReasoningEffort = resolveRecordedReasoningEffort(req.ReasoningEffort, model, payloadMap)
+		tel.ReasoningEffort = resolveRecordedReasoningEffort(req.EffectiveReasoningEffort(), model, payloadMap)
 		payloadBytes, err := json.Marshal(payloadMap)
 		if err != nil {
 			WriteError(w, http.StatusInternalServerError, "server_error", "marshal_error", publicMsgMarshalError)
@@ -1012,7 +895,7 @@ func (g *Gateway) finishChatFromChatUpstream(ctx context.Context, w http.Respons
 	keyID, keyName := apiKeyIdentityFromCtx(ctx)
 	ttft := newTTFTTracker(upResp.Body, isSSEContentType(upResp) || req.Stream)
 	if req.Stream {
-		usage, sErr := pipeChatSSE(ctx, w, ttft, g.keepaliveInterval(), headersCommitted)
+		usage, sErr := pipeChatSSE(ctx, w, ttft, g.keepaliveInterval(), headersCommitted, req.StreamOptions == nil || req.StreamOptions.IncludeUsage)
 		status := http.StatusOK
 		errStr := ""
 		if sErr != nil {
@@ -1191,10 +1074,10 @@ func (g *Gateway) handleCreateResponse(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var (
-		allItems         []map[string]any
-		prevRootID       string
-		prevAccountID    string
-		prevSessionHash  string
+		allItems        []map[string]any
+		prevRootID      string
+		prevAccountID   string
+		prevSessionHash string
 	)
 	effectiveInstr := req.Instructions
 	if strings.TrimSpace(req.PreviousResponseID) != "" {
@@ -1301,7 +1184,12 @@ func (g *Gateway) handleCreateResponse(w http.ResponseWriter, r *http.Request) {
 			tel.RequestedModel = ""
 		}
 
-		traceparent := strings.TrimSpace(r.Header.Get("traceparent"))
+		traceparent := ""
+		if attempt == 0 {
+			if cand := strings.TrimSpace(r.Header.Get("traceparent")); bohrium.IsValidTraceparent(cand) {
+				traceparent = cand
+			}
+		}
 		if traceparent == "" {
 			traceparent = bohrium.NewTraceparent()
 		}
@@ -1311,6 +1199,15 @@ func (g *Gateway) handleCreateResponse(w http.ResponseWriter, r *http.Request) {
 				if ctx.Err() != nil {
 					g.recordFailure(ctx, "/v1/responses", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, statusClientClosedRequest, start, ctx.Err().Error(), tel)
 					return
+				}
+				if status == http.StatusUnauthorized {
+					if explicitAcc == "" {
+						g.markAccountExpired(decision.Account.ID, rawReason)
+						excluded[decision.Account.ID] = true
+						lastStatus, lastErrType, lastErrCode, lastErrMsg, lastRawErrMsg = http.StatusServiceUnavailable, "authentication_error", "account_expired", publicMsgAccountExpired, rawReason
+						continue
+					}
+					status = http.StatusServiceUnavailable
 				}
 				if status == http.StatusPaymentRequired && explicitAcc == "" {
 					g.markAccountInsufficient(decision.Account.ID, rawReason)
@@ -1742,6 +1639,9 @@ func (g *Gateway) runPreflightIfEnabled(ctx context.Context, cli *bohrium.Client
 	}
 	allowed, reason, err := cli.SciXBillingPreflight(ctx, modelID, traceparent)
 	if err != nil {
+		if errors.Is(err, bohrium.ErrSciXUnauthorized) || isAuthErrorText(err.Error()) {
+			return http.StatusUnauthorized, "authentication_error", "account_expired", publicMsgAccountExpired, "Billing preflight unauthorized: " + err.Error(), false
+		}
 		return http.StatusBadGateway, "upstream_error", "billing_unavailable", publicMsgBillingUnavailable, "Billing admission unavailable: " + err.Error(), false
 	}
 	if !allowed {
@@ -2117,35 +2017,27 @@ func (g *Gateway) sciMasterPromptEnabled() bool {
 	return g.cfg.Get().Gateway.SciMasterPrompt
 }
 
-func extractExplicitSessionKey(r *http.Request, promptCacheKey, userField string) string {
+func extractExplicitSessionKey(r *http.Request, promptCacheKey string) string {
 	if sid := strings.TrimSpace(r.Header.Get("x-session-id")); sid != "" {
 		return "hdr:" + sid
 	}
-	if rawExec := strings.TrimSpace(r.Header.Get(bohrium.SciXExecutionHeader)); rawExec != "" {
-		if dec, err := base64.RawURLEncoding.DecodeString(rawExec); err == nil {
-			var p bohrium.SciXExecutionPayload
-			if json.Unmarshal(dec, &p) == nil {
-				if p.RootSessionID != "" {
-					return "scix:" + p.RootSessionID
-				}
-				if p.SessionID != "" {
-					return "scix:" + p.SessionID
-				}
-			}
+	if p, ok := bohrium.ParseSciXExecutionHeader(r.Header.Get(bohrium.SciXExecutionHeader)); ok {
+		if p.RootSessionID != "" {
+			return "scix:" + p.RootSessionID
+		}
+		if p.SessionID != "" {
+			return "scix:" + p.SessionID
 		}
 	}
 	if k := strings.TrimSpace(promptCacheKey); k != "" {
 		return "pck:" + k
-	}
-	if u := strings.TrimSpace(userField); u != "" {
-		return "user:" + u
 	}
 	return ""
 }
 
 func computeChatSessionHash(r *http.Request, req *ChatCompletionRequest) string {
 	apiScope := apiKeyScopeFromCtx(r.Context())
-	explicit := extractExplicitSessionKey(r, req.PromptCacheKey, req.User)
+	explicit := extractExplicitSessionKey(r, req.PromptCacheKey)
 	var firstSys, firstUser string
 	for _, m := range req.Messages {
 		role := strings.ToLower(strings.TrimSpace(m.Role))
@@ -2157,7 +2049,7 @@ func computeChatSessionHash(r *http.Request, req *ChatCompletionRequest) string 
 			break
 		}
 	}
-	return ComputeSessionHash(apiScope, explicit, firstSys, firstUser, "")
+	return ComputeSessionHash(apiScope, explicit, firstSys, firstUser, req.User)
 }
 
 func computeResponsesSessionHash(r *http.Request, req *ResponsesRequest, allItems []map[string]any, prevRootID, prevSessionHash string) string {
@@ -2165,7 +2057,7 @@ func computeResponsesSessionHash(r *http.Request, req *ResponsesRequest, allItem
 		return strings.TrimSpace(prevSessionHash)
 	}
 	apiScope := apiKeyScopeFromCtx(r.Context())
-	explicit := extractExplicitSessionKey(r, req.PromptCacheKey, req.User)
+	explicit := extractExplicitSessionKey(r, req.PromptCacheKey)
 	if explicit == "" && strings.TrimSpace(prevRootID) != "" {
 		explicit = "resp-chain:" + strings.TrimSpace(prevRootID)
 	}
@@ -2183,7 +2075,7 @@ func computeResponsesSessionHash(r *http.Request, req *ResponsesRequest, allItem
 			}
 		}
 	}
-	return ComputeSessionHash(apiScope, explicit, firstSys, firstUser, "")
+	return ComputeSessionHash(apiScope, explicit, firstSys, firstUser, req.User)
 }
 
 func lastChatToolCallID(req *ChatCompletionRequest) string {

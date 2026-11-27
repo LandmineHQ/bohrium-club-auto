@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from "react"
 import { toast } from "sonner"
-import { Copy, Eye, EyeOff, Plus, RefreshCw } from "lucide-react"
+import { Copy, RefreshCw } from "lucide-react"
 import { apiRequest } from "@/lib/api"
-import { copyClipboard, formatNum, formatTime, gatewayBaseURL, maskApiKey } from "@/lib/utils"
+import { copyClipboard, formatNum, formatTime, gatewayBaseURL } from "@/lib/utils"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -20,7 +20,7 @@ import { PoolBoard } from "./PoolBoard"
 import { SessionBindingsTable } from "./SessionBindingsTable"
 import { ModelsCatalogTable, isClientHiddenModel, isGatewayModelEnabled } from "./ModelsCatalogTable"
 import { PlaygroundPanel } from "./PlaygroundPanel"
-import type { GatewayApiKey, GatewayStatusResponse } from "@/types/console"
+import type { GatewayStatusResponse } from "@/types/console"
 
 interface GatewayTabProps {
   data: GatewayStatusResponse | null
@@ -53,8 +53,6 @@ export function GatewayTab({ data, onRefresh, onRefreshAll }: GatewayTabProps) {
   const [retentionDays, setRetentionDays] = useState(180)
   const [savingSettings, setSavingSettings] = useState(false)
 
-  const [newKeyName, setNewKeyName] = useState("")
-  const [revealedIds, setRevealedIds] = useState<Set<string>>(() => new Set())
   const [pgAccountId, setPgAccountId] = useState("")
   const [pgModel, setPgModel] = useState("dsflash-high")
 
@@ -121,7 +119,7 @@ export function GatewayTab({ data, onRefresh, onRefreshAll }: GatewayTabProps) {
   }
 
   function firstEnabledKey(): string {
-    const found = apiKeys.find((k) => k.enabled && k.key)
+    const found = apiKeys.find((k) => k.enabled && k.key && (!k.status || k.status === "active"))
     return found?.key || "sk-brm-YOUR_KEY"
   }
 
@@ -152,49 +150,6 @@ export function GatewayTab({ data, onRefresh, onRefreshAll }: GatewayTabProps) {
       toast.error("保存失败: " + (err instanceof Error ? err.message : ""))
     } finally {
       setSavingSettings(false)
-    }
-  }
-
-  async function createApiKey() {
-    try {
-      const res = await apiRequest<{ key?: GatewayApiKey }>("/api/gateway/keys", {
-        method: "POST",
-        body: JSON.stringify({ name: newKeyName.trim() }),
-      })
-      setNewKeyName("")
-      if (res.key?.id) {
-        setRevealedIds((prev) => new Set(prev).add(res.key!.id))
-      }
-      toast.success("已新建 API Key")
-      await onRefresh()
-    } catch (err) {
-      toast.error("创建失败: " + (err instanceof Error ? err.message : ""))
-    }
-  }
-
-  async function toggleApiKey(k: GatewayApiKey) {
-    try {
-      await apiRequest(`/api/gateway/keys/${encodeURIComponent(k.id)}`, {
-        method: "PATCH",
-        body: JSON.stringify({ enabled: !k.enabled }),
-      })
-      toast.success(k.enabled ? "API Key 已停用" : "API Key 已启用")
-      await onRefresh()
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "操作失败")
-    }
-  }
-
-  async function deleteApiKey(k: GatewayApiKey) {
-    if (!window.confirm("确定删除此 API Key 吗？使用该 Key 的客户端将立即失去访问权限。")) {
-      return
-    }
-    try {
-      await apiRequest(`/api/gateway/keys/${encodeURIComponent(k.id)}`, { method: "DELETE" })
-      toast.warning("API Key 已删除")
-      await onRefresh()
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "删除失败")
     }
   }
 
@@ -258,8 +213,8 @@ export function GatewayTab({ data, onRefresh, onRefreshAll }: GatewayTabProps) {
 
       <SessionBindingsTable bindings={bindings} onRefresh={onRefresh} />
 
-      {/* Gateway settings + API Keys */}
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+      {/* Gateway settings */}
+      <div className="grid grid-cols-1">
         <Card>
           <CardHeader className="py-3.5">
             <div>
@@ -285,7 +240,7 @@ export function GatewayTab({ data, onRefresh, onRefreshAll }: GatewayTabProps) {
             <div className="flex flex-wrap gap-1.5">
               {[
                 "GET /v1/models",
-                "GET /v1/balance",
+                "GET /v1/user/balance",
                 "POST /v1/chat/completions",
                 "POST /v1/responses",
                 "GET/DELETE /v1/responses/{id}",
@@ -401,7 +356,7 @@ export function GatewayTab({ data, onRefresh, onRefreshAll }: GatewayTabProps) {
                 size="sm"
                 onClick={() =>
                   doCopy(
-                    `curl ${baseUrl}/balance \\\n  -H "Authorization: Bearer ${firstEnabledKey()}"`,
+                    `curl ${baseUrl}/user/balance \\\n  -H "Authorization: Bearer ${firstEnabledKey()}"`,
                     "Balance cURL"
                   )
                 }
@@ -412,103 +367,6 @@ export function GatewayTab({ data, onRefresh, onRefreshAll }: GatewayTabProps) {
           </CardContent>
         </Card>
 
-        <Card>
-          <CardHeader className="py-3.5">
-            <div>
-              <CardTitle>API Key 管理</CardTitle>
-              <CardDescription>
-                独立于控制台管理员密码，供 OpenAI SDK / Codex / Cursor / Cherry Studio 鉴权调用。
-              </CardDescription>
-            </div>
-          </CardHeader>
-          <CardContent className="pb-3">
-            <div className="flex gap-2">
-              <Input
-                value={newKeyName}
-                onChange={(e) => setNewKeyName(e.target.value)}
-                placeholder="新 Key 备注名（如 Codex / Cursor）"
-              />
-              <Button size="sm" onClick={createApiKey}>
-                <Plus className="h-3.5 w-3.5" />
-                新建 Key
-              </Button>
-            </div>
-          </CardContent>
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>备注</TableHead>
-                <TableHead>API Key</TableHead>
-                <TableHead>状态</TableHead>
-                <TableHead className="text-right">操作</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {apiKeys.length === 0 ? (
-                <TableRow>
-                  <TableCell colSpan={4} className="py-6 text-center text-muted-foreground">
-                    暂无 API Key，请点击上方「新建 Key」
-                  </TableCell>
-                </TableRow>
-              ) : (
-                apiKeys.map((k) => {
-                  const revealed = revealedIds.has(k.id)
-                  return (
-                    <TableRow key={k.id}>
-                      <TableCell className="font-medium">{k.name || k.id}</TableCell>
-                      <TableCell className="font-mono text-[11px]">
-                        {revealed ? k.key : maskApiKey(k.key)}
-                      </TableCell>
-                      <TableCell>
-                        {k.enabled ? (
-                          <Badge variant="ok">启用</Badge>
-                        ) : (
-                          <Badge variant="muted">停用</Badge>
-                        )}
-                      </TableCell>
-                      <TableCell className="text-right">
-                        <div className="flex justify-end gap-1">
-                          <Button
-                            variant="ghost"
-                            size="xs"
-                            onClick={() =>
-                              setRevealedIds((prev) => {
-                                const next = new Set(prev)
-                                if (next.has(k.id)) next.delete(k.id)
-                                else next.add(k.id)
-                                return next
-                              })
-                            }
-                          >
-                            {revealed ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
-                          </Button>
-                          <Button
-                            variant="outline"
-                            size="xs"
-                            onClick={() => doCopy(k.key, "API Key")}
-                          >
-                            复制
-                          </Button>
-                          <Button variant="ghost" size="xs" onClick={() => toggleApiKey(k)}>
-                            {k.enabled ? "停用" : "启用"}
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="xs"
-                            className="text-destructive hover:text-destructive"
-                            onClick={() => deleteApiKey(k)}
-                          >
-                            删除
-                          </Button>
-                        </div>
-                      </TableCell>
-                    </TableRow>
-                  )
-                })
-              )}
-            </TableBody>
-          </Table>
-        </Card>
       </div>
 
       <ModelsCatalogTable

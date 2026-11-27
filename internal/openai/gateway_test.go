@@ -42,6 +42,10 @@ type capturedUpstream struct {
 }
 
 func setupTestGatewayEnv(t *testing.T, autoPool bool, upstreamHandler http.HandlerFunc) (*openai.Gateway, *httptest.Server, *store.Store, *bohrium.Manager, string, *capturedUpstream) {
+	return setupTestGatewayEnvWithPolicy(t, autoPool, nil, upstreamHandler)
+}
+
+func setupTestGatewayEnvWithPolicy(t *testing.T, autoPool bool, mutate func(*config.Config), upstreamHandler http.HandlerFunc) (*openai.Gateway, *httptest.Server, *store.Store, *bohrium.Manager, string, *capturedUpstream) {
 	t.Helper()
 
 	capUp := &capturedUpstream{}
@@ -132,6 +136,15 @@ func setupTestGatewayEnv(t *testing.T, autoPool bool, upstreamHandler http.Handl
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
+
+	if mutate != nil {
+		if _, err := cfgMgr.Update(func(cfg *config.Config) error {
+			mutate(cfg)
+			return nil
+		}); err != nil {
+			t.Fatalf("apply test key policy: %v", err)
+		}
+	}
 
 	if autoPool {
 		acc, _, err := st.UpsertAccountFromAuth(store.AuthState{
@@ -607,64 +620,60 @@ func TestReverseBridgeChatToResponsesNativeModel(t *testing.T) {
 	}
 }
 
-func TestBalanceEndpoint(t *testing.T) {
-	_, gwSrv, apiKey, _ := setupTestGateway(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Path {
-		case "/bohrapi/v1/account/user/integral":
-			_, _ = io.WriteString(w, `{"code":0,"data":{"balance":2450.5,"orgBalance":500,"orgBalanceLimit":2000}}`)
-		case "/brm/v1/wallet/info":
-			_, _ = io.WriteString(w, `{"code":0,"data":{"balance":18.5}}`)
-		case "/platform-gateway/v1/benefits/quota/info":
-			_, _ = io.WriteString(w, `{"code":0,"data":{"extraExpire7DayAmount":300,"quotas":{"sn.paper":{"remaining":50,"total":100},"knowledge_base.chat":{"remaining":30,"total":50},"sn.deep_research":{"remaining":5,"total":10}}}}`)
-		case "/platform-gateway/v1/benefits/quota/expire_page":
-			_, _ = io.WriteString(w, `{"code":0,"data":{"items":[{"id":1,"remaining":300,"createdTime":"2026-11-20","expireTime":"2026-11-27","sourceType":"daily"}]}}`)
-		case "/bohrapi/v1/account/user/integral_page":
-			_, _ = io.WriteString(w, `{"code":0,"data":{"items":[]}}`)
-		case "/platform-gateway/v1/membership/info":
-			_, _ = io.WriteString(w, `{"code":0,"data":{"level":2,"expireTime":"2027-01-01","photons":1000}}`)
-		case "/bohrapi/v1/literature-sage/api/v1/file/capacity":
-			_, _ = io.WriteString(w, `{"code":0,"data":{"remainingCapacity":103809024,"usedCapacity":1048576,"totalCapacity":104857600}}`)
-		default:
-			w.WriteHeader(http.StatusNotFound)
+func TestUserBalanceUsesAuthenticatedKeyQuota(t *testing.T) {
+	_, gwSrv, st, _, apiKey, _ := setupTestGatewayEnvWithPolicy(t, true, func(cfg *config.Config) {
+		for i := range cfg.Gateway.APIKeys {
+			cfg.Gateway.APIKeys[i].TokenQuota = 10000
+			cfg.Gateway.APIKeys[i].DailyTokenQuota = 1000
 		}
-	})
+	}, nil)
 
-	// Unauthorized without API key
-	unauthResp, err := http.Get(gwSrv.URL + "/v1/balance")
+	unauthResp, err := http.Get(gwSrv.URL + "/v1/user/balance")
 	if err != nil {
-		t.Fatalf("GET /v1/balance unauth: %v", err)
+		t.Fatalf("GET /v1/user/balance unauth: %v", err)
 	}
 	unauthResp.Body.Close()
 	if unauthResp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", unauthResp.StatusCode)
+		t.Fatalf("expected 401 without key, got %d", unauthResp.StatusCode)
 	}
 
-	// Authorized balance query
-	req, _ := http.NewRequest(http.MethodGet, gwSrv.URL+"/v1/balance", nil)
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("GET /v1/balance: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(raw))
+	now := time.Now().UTC()
+	for _, rec := range []store.GatewayUsageRecord{
+		{ID: "quota_old", CreatedAt: now.AddDate(0, 0, -1), APIKeyID: "env-1", TotalTokens: 2200, Status: 200},
+		{ID: "quota_today", CreatedAt: now, APIKeyID: "env-1", TotalTokens: 300, Status: 200},
+		{ID: "quota_other_key", CreatedAt: now, APIKeyID: "another-key", TotalTokens: 9000, Status: 200},
+	} {
+		if err := st.RecordGatewayUsage(rec); err != nil {
+			t.Fatalf("RecordGatewayUsage(%s): %v", rec.ID, err)
+		}
 	}
 
-	var bal openai.BalanceResponse
-	if err := json.NewDecoder(resp.Body).Decode(&bal); err != nil {
-		t.Fatalf("decode balance: %v", err)
-	}
-	if bal.Object != "balance" || !bal.IsAvailable || bal.PhotonBalance != 2450.5 || bal.OrgBalance != 500 || bal.WalletBalanceCNY != 18.5 {
-		t.Fatalf("unexpected balance payload: %+v", bal)
-	}
-	if bal.Expiring7DPhotons != 300 || len(bal.BalanceInfos) != 2 || bal.BalanceInfos[0].Currency != "PHOTON" {
-		t.Fatalf("unexpected balance_infos/expiring: %+v", bal)
-	}
-	if bal.Storage.UsedBytes != 1048576 || bal.Storage.TotalBytes != 104857600 {
-		t.Fatalf("unexpected storage: %+v", bal.Storage)
+	for _, path := range []string{"/v1/user/balance", "/v1/balance"} {
+		req, _ := http.NewRequest(http.MethodGet, gwSrv.URL+path, nil)
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		var bal openai.UserBalanceResponse
+		decodeErr := json.NewDecoder(resp.Body).Decode(&bal)
+		resp.Body.Close()
+		if decodeErr != nil {
+			t.Fatalf("decode %s: %v", path, decodeErr)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 from %s, got %d", path, resp.StatusCode)
+		}
+		if bal.Balance != 700 || bal.Unit != "TOKEN" || bal.Unlimited || !bal.IsAvailable || bal.APIKeyID != "env-1" {
+			t.Fatalf("unexpected key balance from %s: %+v", path, bal)
+		}
+		if bal.Quota.Limit != 10000 || bal.Quota.Used != 2500 || bal.Quota.Remaining != 7500 ||
+			bal.Quota.DailyLimit != 1000 || bal.Quota.DailyUsed != 300 || bal.Quota.DailyRemaining != 700 {
+			t.Fatalf("unexpected quota detail from %s: %+v", path, bal.Quota)
+		}
+		if len(bal.BalanceInfos) != 1 || bal.BalanceInfos[0].Currency != "TOKEN" || bal.BalanceInfos[0].TotalBalance != "700" {
+			t.Fatalf("unexpected balance_infos from %s: %+v", path, bal.BalanceInfos)
+		}
 	}
 }
 
@@ -956,8 +965,11 @@ func TestDesktopClientFingerprintAndSciMasterPromptToggle(t *testing.T) {
 	}
 	visInput, _ := capUp.body["input"].([]any)
 	visSys := visInput[0].(map[string]any)
-	if visSys["role"] != "developer" || !strings.HasPrefix(visSys["content"].(string), "You are SciMaster,") || !strings.Contains(visSys["content"].(string), "Describe charts accurately.") {
-		t.Fatalf("unexpected vision input[0]: %+v", visSys)
+	if visSys["role"] != "developer" || visSys["content"] != "Describe charts accurately." {
+		t.Fatalf("unexpected vision input[0] (vision must skip SciMaster): %+v", visSys)
+	}
+	if capUp.execPayload.Purpose != "read_image" {
+		t.Fatalf("expected purpose=read_image for vision model, got %q", capUp.execPayload.Purpose)
 	}
 	capUp.mu.Unlock()
 
@@ -1030,14 +1042,14 @@ func TestDefaultAccountNotInPoolRequiresManualOptIn(t *testing.T) {
 	}
 	_ = st.UpdateAccountBalance(acc.ID, 5000, 0, 0)
 
-	// /v1/models, /v1/balance, and /v1/chat/completions MUST all reject with 503 empty_pool
+	// /v1/models and /v1/chat/completions MUST reject with 503 empty_pool.
+	// Key-level balance remains readable because it does not route upstream.
 	for _, tc := range []struct {
 		method string
 		path   string
 		body   string
 	}{
 		{http.MethodGet, "/v1/models", ""},
-		{http.MethodGet, "/v1/balance", ""},
 		{http.MethodPost, "/v1/chat/completions", `{"model":"dsflash-high","messages":[{"role":"user","content":"hi"}]}`},
 	} {
 		req, _ := http.NewRequest(tc.method, gwSrv.URL+tc.path, strings.NewReader(tc.body))
@@ -1055,6 +1067,17 @@ func TestDefaultAccountNotInPoolRequiresManualOptIn(t *testing.T) {
 		if resp.StatusCode != http.StatusServiceUnavailable || env.Error.Code != "empty_pool" {
 			t.Fatalf("%s %s: expected 503 empty_pool before manual opt-in, got status=%d env=%+v", tc.method, tc.path, resp.StatusCode, env)
 		}
+	}
+
+	balanceReq, _ := http.NewRequest(http.MethodGet, gwSrv.URL+"/v1/user/balance", nil)
+	balanceReq.Header.Set("Authorization", "Bearer "+apiKey)
+	balanceResp, err := http.DefaultClient.Do(balanceReq)
+	if err != nil {
+		t.Fatalf("GET key balance without pool: %v", err)
+	}
+	balanceResp.Body.Close()
+	if balanceResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected key balance to remain readable without pool, got %d", balanceResp.StatusCode)
 	}
 
 	// Manually drag account into routing pool -> /v1/chat/completions now succeeds!
@@ -1316,62 +1339,30 @@ func TestPreFirstByteAutomaticFailoverAndRebind(t *testing.T) {
 	}
 }
 
-func TestMultiAccountAggregatedBalance(t *testing.T) {
-	_, gwSrv, st, _, apiKey, _ := setupTestGatewayEnv(t, false, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		auth := r.Header.Get("Authorization")
-		switch r.URL.Path {
-		case "/bohrapi/v1/account/user/integral":
-			switch auth {
-			case "Bearer tok-bal-1":
-				_, _ = io.WriteString(w, `{"code":0,"data":{"balance":2000,"orgBalance":0,"orgBalanceLimit":0}}`)
-			case "Bearer tok-bal-2":
-				_, _ = io.WriteString(w, `{"code":0,"data":{"balance":7000,"orgBalance":1000,"orgBalanceLimit":2000}}`)
-			default:
-				_, _ = io.WriteString(w, `{"code":0,"data":{"balance":50000,"orgBalance":0,"orgBalanceLimit":0}}`)
-			}
-		case "/brm/v1/wallet/info":
-			_, _ = io.WriteString(w, `{"code":0,"data":{"balance":5}}`)
-		case "/platform-gateway/v1/benefits/quota/info":
-			_, _ = io.WriteString(w, `{"code":0,"data":{"extraExpire7DayAmount":100}}`)
-		case "/platform-gateway/v1/benefits/quota/expire_page", "/bohrapi/v1/account/user/integral_page":
-			_, _ = io.WriteString(w, `{"code":0,"data":{"items":[]}}`)
-		case "/platform-gateway/v1/membership/info":
-			_, _ = io.WriteString(w, `{"code":0,"data":{"level":1,"photons":500}}`)
-		case "/bohrapi/v1/literature-sage/api/v1/file/capacity":
-			_, _ = io.WriteString(w, `{"code":0,"data":{"remainingCapacity":1000,"usedCapacity":100,"totalCapacity":1100}}`)
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	})
+func TestUserBalanceUnlimitedKey(t *testing.T) {
+	_, gwSrv, st, _, apiKey, _ := setupTestGatewayEnv(t, false, nil)
+	acc, _, _ := st.UpsertAccountFromAuth(store.AuthState{
+		Token: "tok-bal-pool", UserID: 700001, Nickname: "Pool1", ExpiresAt: time.Now().Add(48 * time.Hour),
+	}, "P1")
+	_ = st.UpdateAccountBalance(acc.ID, 9000, 1000, 0)
+	_ = st.SetPoolMembership([]string{acc.ID})
 
-	a1, _, _ := st.UpsertAccountFromAuth(store.AuthState{Token: "tok-bal-1", UserID: 700001, Nickname: "Pool1", ExpiresAt: time.Now().Add(48 * time.Hour)}, "P1")
-	a2, _, _ := st.UpsertAccountFromAuth(store.AuthState{Token: "tok-bal-2", UserID: 700002, Nickname: "Pool2", ExpiresAt: time.Now().Add(48 * time.Hour)}, "P2")
-	_, _, _ = st.UpsertAccountFromAuth(store.AuthState{Token: "tok-bal-3", UserID: 700003, Nickname: "OutOfPool", ExpiresAt: time.Now().Add(48 * time.Hour)}, "Out")
-	_ = st.SetPoolMembership([]string{a1.ID, a2.ID})
-
-	req, _ := http.NewRequest(http.MethodGet, gwSrv.URL+"/v1/balance", nil)
+	req, _ := http.NewRequest(http.MethodGet, gwSrv.URL+"/v1/user/balance", nil)
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("GET /v1/balance: %v", err)
+		t.Fatalf("GET /v1/user/balance: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(raw))
-	}
-
-	var bal openai.BalanceResponse
+	var bal openai.UserBalanceResponse
 	if err := json.NewDecoder(resp.Body).Decode(&bal); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	// Pool1 (2000+0) + Pool2 (7000+1000) = 9000 photon + 1000 org = 10000 effective (OutOfPool 50000 excluded!)
-	if bal.PhotonBalance != 9000 || bal.OrgBalance != 1000 || bal.PoolAccountCount != 2 || bal.HealthyPoolCount != 2 {
-		t.Fatalf("unexpected aggregated pool balance: %+v", bal)
+	if resp.StatusCode != http.StatusOK || bal.Balance != -1 || !bal.Unlimited || !bal.IsAvailable {
+		t.Fatalf("expected unlimited key balance independent of pool, got status=%d bal=%+v", resp.StatusCode, bal)
 	}
-	if len(bal.PoolAccounts) != 2 || bal.PoolAccounts[0].WeightPercent != 20.0 || bal.PoolAccounts[1].WeightPercent != 80.0 {
-		t.Fatalf("expected 20%% / 80%% pool weights, got %+v", bal.PoolAccounts)
+	if bal.Quota.Remaining != -1 || bal.Quota.DailyRemaining != -1 || len(bal.BalanceInfos) != 1 || bal.BalanceInfos[0].TotalBalance != "-1" {
+		t.Fatalf("unexpected unlimited quota semantics: %+v", bal)
 	}
 }
 
@@ -2068,11 +2059,11 @@ func TestCatalogFetchFailureReturns502Not400(t *testing.T) {
 
 func TestUpstreamErrorsNeverLeakToDownstream(t *testing.T) {
 	var (
-		llmStatus       atomic.Int32
-		llmBodyMu       sync.Mutex
-		llmBody         string
-		preflightDrop   atomic.Bool
-		inlineSSEError  atomic.Bool
+		llmStatus      atomic.Int32
+		llmBodyMu      sync.Mutex
+		llmBody        string
+		preflightDrop  atomic.Bool
+		inlineSSEError atomic.Bool
 	)
 	llmStatus.Store(http.StatusInternalServerError)
 

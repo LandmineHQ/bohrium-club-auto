@@ -286,10 +286,10 @@ func newSSEScanner(r io.Reader) *bufio.Scanner {
 // PipeChatSSE streams Bohrium's native /chat/completions SSE directly to an OpenAI client,
 // filtering `: heartbeat` keepalive comments, guaranteeing a trailing `data: [DONE]`, and capturing usage.
 func PipeChatSSE(w http.ResponseWriter, body io.Reader) (UsageMetrics, error) {
-	return pipeChatSSE(context.Background(), w, body, defaultKeepaliveInterval, false)
+	return pipeChatSSE(context.Background(), w, body, defaultKeepaliveInterval, false, true)
 }
 
-func pipeChatSSE(ctx context.Context, w http.ResponseWriter, body io.Reader, keepaliveInterval time.Duration, headersCommitted bool) (UsageMetrics, error) {
+func pipeChatSSE(ctx context.Context, w http.ResponseWriter, body io.Reader, keepaliveInterval time.Duration, headersCommitted bool, emitUsage bool) (UsageMetrics, error) {
 	if !headersCommitted {
 		setSSEHeaders(w)
 		flushWriter(w)
@@ -325,6 +325,10 @@ func pipeChatSSE(ctx context.Context, w http.ResponseWriter, body io.Reader, kee
 		var chunk ChatCompletionChunk
 		if json.Unmarshal([]byte(data), &chunk) == nil && chunk.Usage != nil {
 			usage = usageFromChat(chunk.Usage)
+			if !emitUsage && len(chunk.Choices) == 0 {
+				// Caller opted out of usage chunks; the gateway still meters tokens from upstream.
+				continue
+			}
 		}
 		_ = sw.writeString("data: " + data + "\n\n")
 	}

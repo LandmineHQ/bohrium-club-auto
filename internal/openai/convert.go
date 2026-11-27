@@ -22,8 +22,9 @@ func shouldInjectSciMasterPrompt(modelID string, enabled bool) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(modelID)) {
-	case "title", "summary":
-		// Auxiliary session-purpose models use dedicated short prompts in Bohrium desktop client.
+	case "title", "summary", "vision":
+		// Auxiliary session-purpose / image-describe models use dedicated short prompts in Bohrium desktop client
+		// (vision runs with purpose "read_image" and its own system prompt).
 		return false
 	default:
 		return true
@@ -191,13 +192,8 @@ func NormalizeChatRequestForSciX(req *ChatCompletionRequest, model bohrium.SciXM
 		"stream":   upstreamStream,
 	}
 	if upstreamStream {
-		includeUsage := true
-		if req.Stream && req.StreamOptions != nil {
-			includeUsage = req.StreamOptions.IncludeUsage
-		}
-		if includeUsage {
-			payload["stream_options"] = map[string]any{"include_usage": true}
-		}
+		// brain.mjs always requests usage on streaming chat completions; the gateway needs it for quota accounting.
+		payload["stream_options"] = map[string]any{"include_usage": true}
 	}
 
 	// Bohrium desktop client specifies max_tokens (never both max_tokens & max_completion_tokens).
@@ -238,9 +234,6 @@ func NormalizeChatRequestForSciX(req *ChatCompletionRequest, model bohrium.SciXM
 	if req.User != "" {
 		payload["user"] = req.User
 	}
-	if req.PromptCacheKey != "" {
-		payload["prompt_cache_key"] = req.PromptCacheKey
-	}
 
 	// Tools (plus legacy functions upgrade)
 	tools := normalizeChatTools(req.Tools, req.Functions)
@@ -254,7 +247,7 @@ func NormalizeChatRequestForSciX(req *ChatCompletionRequest, model bohrium.SciXM
 		payload["parallel_tool_calls"] = *req.ParallelToolCalls
 	}
 
-	if effort := model.ClampReasoningEffort(req.ReasoningEffort); effort != "" {
+	if effort := model.ClampReasoningEffort(req.EffectiveReasoningEffort()); effort != "" {
 		payload["reasoning_effort"] = effort
 	}
 
@@ -674,9 +667,6 @@ func ResponsesToChatRequest(req *ResponsesRequest, model bohrium.SciXModel, allI
 	if req.User != "" {
 		payload["user"] = req.User
 	}
-	if req.PromptCacheKey != "" {
-		payload["prompt_cache_key"] = req.PromptCacheKey
-	}
 
 	// Convert Responses tools -> Chat Completions tools
 	if len(req.Tools) > 0 {
@@ -846,7 +836,7 @@ func ChatToResponsesRequest(req *ChatCompletionRequest, model bohrium.SciXModel,
 	} else if cacheKey := clampCacheKey(opts.SessionID); cacheKey != "" {
 		payload["prompt_cache_key"] = cacheKey
 	}
-	if effort := model.ClampReasoningEffort(req.ReasoningEffort); effort != "" {
+	if effort := model.ClampReasoningEffort(req.EffectiveReasoningEffort()); effort != "" {
 		payload["reasoning"] = map[string]any{"effort": effort}
 	}
 	if tools := chatToolsToResponsesTools(req.Tools, req.Functions); len(tools) > 0 {

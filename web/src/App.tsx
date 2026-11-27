@@ -8,6 +8,7 @@ import { AccountLoginDialog } from "@/components/auth/AccountLoginDialog"
 import { OverviewTab } from "@/components/overview/OverviewTab"
 import { AssetsTab } from "@/components/assets/AssetsTab"
 import { GatewayTab } from "@/components/gateway/GatewayTab"
+import { KeyManagementTab } from "@/components/gateway/KeyManagementTab"
 import { AnalyticsTab } from "@/components/analytics/AnalyticsTab"
 import { LogsTab } from "@/components/logs/LogsTab"
 import { ReconTab } from "@/components/recon/ReconTab"
@@ -170,7 +171,7 @@ export function App() {
             activeTab={activeTab}
             onSelectTab={(tab) => {
               setActiveTab(tab)
-              if (tab === "gateway") void loadGateway()
+              if (tab === "gateway" || tab === "apiKeys") void loadGateway()
             }}
             summary={overview?.accountSummary}
             accountCount={overview?.accounts?.length || 0}
@@ -218,6 +219,10 @@ export function App() {
                     await Promise.all([loadOverview(), loadGateway()])
                   }}
                 />
+              )}
+
+              {activeTab === "apiKeys" && (
+                <KeyManagementTab data={gateway} onRefresh={loadGateway} />
               )}
 
               {activeTab === "analytics" && (

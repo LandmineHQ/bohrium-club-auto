@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 )
 
 // OpenAIModelLimit carries models.dev / OpenCode style token limits.
@@ -136,6 +137,8 @@ type ChatCompletionRequest struct {
 	Functions           []json.RawMessage   `json:"functions,omitempty"`
 	FunctionCall        json.RawMessage     `json:"function_call,omitempty"`
 	ReasoningEffort     string              `json:"reasoning_effort,omitempty"`
+	Reasoning           *ReasoningConfig    `json:"reasoning,omitempty"`
+	IncludeReasoning    *bool               `json:"include_reasoning,omitempty"`
 	ResponseFormat      json.RawMessage     `json:"response_format,omitempty"`
 	MaxTokens           *int                `json:"max_tokens,omitempty"`
 	MaxCompletionTokens *int                `json:"max_completion_tokens,omitempty"`
@@ -159,6 +162,20 @@ type ChatCompletionRequest struct {
 // StreamOptions controls streaming behavior such as usage emission.
 type StreamOptions struct {
 	IncludeUsage bool `json:"include_usage,omitempty"`
+}
+
+// EffectiveReasoningEffort returns the reasoning effort from either reasoning_effort or the reasoning object.
+func (r *ChatCompletionRequest) EffectiveReasoningEffort() string {
+	if r == nil {
+		return ""
+	}
+	if eff := strings.TrimSpace(r.ReasoningEffort); eff != "" {
+		return eff
+	}
+	if r.Reasoning != nil && r.Reasoning.Effort != nil {
+		return strings.TrimSpace(*r.Reasoning.Effort)
+	}
+	return ""
 }
 
 // ChatMessage represents a single message in OpenAI Chat Completions.

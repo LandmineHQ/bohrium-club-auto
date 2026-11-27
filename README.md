@@ -72,7 +72,8 @@ Windows 直接运行 `bohrium-club-auto.exe`。默认监听 `http://127.0.0.1:87
   - 新账号默认不入池，需在控制台手动拖入后才承接 `/v1/*` 流量；
   - 新会话按有效余额比例（个人光子 + 组织余额）加权抽签分配账号，并在 SQLite 中缓存绑定关系，最长保留 7 天后自动清理；
   - 首包前遇到 401/402 自动冷却并切换池内其他可用账号重试；
-  - 支持 `/v1/models`、`/v1/balance`、`/v1/chat/completions`、`/v1/responses` 及 `chat_completions` / `responses` 双向兼容桥接。
+  - 独立「API Key 管理」页支持每 Key 默认模型、模型白名单、滑动 60 秒速率、在途并发、RFC3339 有效期、累计与每日 Token 额度，以及密钥轮换；
+  - 支持 `/v1/models`、`/v1/user/balance`（CC Switch 通用余额模板，返回当前 Key 的有效剩余 Token）、`/v1/chat/completions`、`/v1/responses` 及 `chat_completions` / `responses` 双向兼容桥接。旧 `/v1/balance` 保留为同语义兼容别名。
 - **资产与前端检测**：聚合展示光子余额、即将过期批次、流水、配额与知识库存储容量；提供 `recon pull` / `recon diff` 检测上游前端资源变化。
 
 ---
@@ -168,7 +169,7 @@ docs-site/               VitePress 文档工程
 | `GET` / `PUT` | `/api/gateway/{status,settings,pool}` | 网关状态、配置（含数据保留天数）与路由池成员调整 |
 | `GET` / `POST` | `/api/gateway/analytics`、`analytics/logs`、`analytics/purge` | 按时间/Key/模型/账号聚合 Token 看板、详细调用记录分页检索（含推理强度/端点/桥接/计费策略/首字 TTFT/IP/UA）与手动清理 |
 | `GET` / `DELETE` | `/api/gateway/bindings` & `bindings/{hash}` | 查询、解绑或清空 7 天会话绑定 |
-| `POST` / `PATCH` / `DELETE` | `/api/gateway/keys` & `keys/{id}` | 管理 `/v1/*` API Key |
+| `GET` / `POST` / `PATCH` / `DELETE` | `/api/gateway/keys` & `keys/{id}` | 管理 `/v1/*` API Key、模型/速率/并发/有效期/Token 额度策略及用量；`POST keys/{id}/regenerate` 轮换密钥 |
 | `POST` | `/api/gateway/{models/refresh,preflight,playground}` | 刷新模型目录、额度预检与在线调试 |
 
 ### OpenAI 兼容接口（`/v1/*`）
@@ -179,7 +180,7 @@ docs-site/               VitePress 文档工程
 | --- | --- | --- |
 | `GET` | `/v1/models` | 获取可用模型目录 |
 | `GET` | `/v1/models/{id}` | 查询单个模型信息 |
-| `GET` | `/v1/balance` | 路由池聚合余额与账号明细 |
+| `GET` | `/v1/user/balance` | CC Switch 通用余额接口；返回当前 Key 的有效剩余 Token 与累计/每日额度明细（`/v1/balance` 为兼容别名） |
 | `POST` | `/v1/chat/completions` | Chat Completions（支持流式 SSE、tools、reasoning、vision） |
 | `POST` | `/v1/responses` | Responses API（支持流式 SSE、`previous_response_id` 链式上下文） |
 | `GET` / `DELETE` | `/v1/responses/{id}` | 查询或删除已保存的响应记录 |

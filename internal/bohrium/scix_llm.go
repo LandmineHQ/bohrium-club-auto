@@ -34,6 +34,20 @@ var canonicalUUIDRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[
 // ErrBohriumNotLoggedIn indicates that no Bohrium brmToken is currently stored.
 var ErrBohriumNotLoggedIn = errors.New("Bohrium account is not logged in; please sign in via the Web Console first")
 
+// ErrSciXUnauthorized indicates the upstream rejected the account's brmToken (HTTP 401) even after a refresh attempt.
+var ErrSciXUnauthorized = errors.New("upstream Bohrium token unauthorized")
+
+var w3cTraceparentRe = regexp.MustCompile(`^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$`)
+
+// IsValidTraceparent reports whether raw is a well-formed W3C traceparent (version 00, non-zero trace/span IDs).
+func IsValidTraceparent(raw string) bool {
+	m := w3cTraceparentRe.FindStringSubmatch(strings.TrimSpace(raw))
+	if m == nil {
+		return false
+	}
+	return m[1] != strings.Repeat("0", 32) && m[2] != strings.Repeat("0", 16)
+}
+
 // SciXModelPresentation mirrors the desktop client UI metadata returned by Sigma.
 type SciXModelPresentation struct {
 	Visible         bool    `json:"visible"`
@@ -505,22 +519,40 @@ type SciXExecOptions struct {
 	ModelID          string
 }
 
-// SciXExecutionPayload mirrors the exact JSON schema sent in the x-scix-execution header by scix.exe v0.10.25.
+// SciXExecutionPayload mirrors the exact JSON schema sent in the x-scix-execution header by scix.exe v0.10.25–v0.11.0.
 type SciXExecutionPayload struct {
-	Version          int    `json:"version"`
-	Scenario         string `json:"scenario"`
-	StoreID          string `json:"storeId"`
-	RootSessionID    string `json:"rootSessionId"`
-	SessionID        string `json:"sessionId"`
-	CallID           string `json:"callId"`
-	Purpose          string `json:"purpose"`
-	RecoveryAttempt  int    `json:"recoveryAttempt"`
-	RootRunID        string `json:"rootRunId,omitempty"`
-	RunID            string `json:"runId,omitempty"`
-	ToolCallID       string `json:"toolCallId,omitempty"`
-	Visibility       string `json:"visibility,omitempty"`
-	SessionCreatedAt string `json:"sessionCreatedAt"`
-	Question         string `json:"question"`
+	Version            int    `json:"version"`
+	Scenario           string `json:"scenario"`
+	StoreID            string `json:"storeId"`
+	RootSessionID      string `json:"rootSessionId"`
+	SessionID          string `json:"sessionId"`
+	CallID             string `json:"callId"`
+	Purpose            string `json:"purpose"`
+	RecoveryAttempt    int    `json:"recoveryAttempt"`
+	RootRunID          string `json:"rootRunId,omitempty"`
+	RunID              string `json:"runId,omitempty"`
+	ToolCallID         string `json:"toolCallId,omitempty"`
+	KnowledgeContextID string `json:"knowledgeContextId,omitempty"`
+	Visibility         string `json:"visibility,omitempty"`
+	SessionCreatedAt   string `json:"sessionCreatedAt"`
+	Question           string `json:"question"`
+}
+
+// ParseSciXExecutionHeader decodes an x-scix-execution header value (padded or unpadded base64url JSON).
+func ParseSciXExecutionHeader(raw string) (SciXExecutionPayload, bool) {
+	var p SciXExecutionPayload
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return p, false
+	}
+	decoded, err := decodeBase64URLFlexible(raw)
+	if err != nil {
+		return p, false
+	}
+	if err := json.Unmarshal(decoded, &p); err != nil {
+		return SciXExecutionPayload{}, false
+	}
+	return p, true
 }
 
 // BuildSciXExecutionHeader produces an authentic unpadded-base64url x-scix-execution header matching scix.exe.
@@ -545,25 +577,20 @@ func (c *Client) BuildSciXExecutionHeader(opts SciXExecOptions) string {
 			purpose = "session-title"
 		case "summary":
 			purpose = "tool-batch-summary"
+		case "vision":
+			purpose = "read_image"
 		default:
 			purpose = "agent"
 		}
 	}
 
-	var p SciXExecutionPayload
-	if raw := strings.TrimSpace(opts.IncomingHeader); raw != "" {
-		if decoded, err := decodeBase64URLFlexible(raw); err == nil {
-			_ = json.Unmarshal(decoded, &p)
-		}
-	}
+	p, _ := ParseSciXExecutionHeader(opts.IncomingHeader)
 
+	// Always enforce the routed account's isolated storeId and the desktop scenario,
+	// regardless of what a downstream caller placed in an incoming header.
 	p.Version = 1
-	if strings.TrimSpace(p.Scenario) == "" {
-		p.Scenario = SciXExecutionScenario
-	}
-	if !isCanonicalUUID(p.StoreID) {
-		p.StoreID = storeID
-	}
+	p.Scenario = SciXExecutionScenario
+	p.StoreID = storeID
 	sessionID := strings.TrimSpace(p.SessionID)
 	if !isCanonicalUUID(sessionID) {
 		if isCanonicalUUID(opts.SessionID) {
@@ -719,6 +746,9 @@ func (c *Client) SciXBillingPreflight(ctx context.Context, modelID, traceparent 
 				msg = "[insufficient_balance] Insufficient balance"
 			}
 			return false, msg, nil
+		}
+		if resp.StatusCode == http.StatusUnauthorized {
+			return false, msg, fmt.Errorf("%w: billing preflight HTTP 401: %s", ErrSciXUnauthorized, truncateText(string(raw), 240))
 		}
 		return false, msg, fmt.Errorf("billing preflight HTTP %d: %s", resp.StatusCode, truncateText(string(raw), 240))
 	}

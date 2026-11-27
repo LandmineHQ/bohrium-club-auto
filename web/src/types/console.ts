@@ -2,6 +2,7 @@ export type ConsoleTab =
   | "overview"
   | "assets"
   | "gateway"
+  | "apiKeys"
   | "analytics"
   | "logs"
   | "recon"
@@ -282,7 +283,24 @@ export interface GatewayApiKey {
   name: string
   key: string
   createdAt?: string
+  updatedAt?: string
   enabled: boolean
+  defaultModel?: string
+  restrictModels: boolean
+  allowedModels: string[]
+  rateLimit: number
+  concurrencyLimit: number
+  expiresAt?: string
+  tokenQuota: number
+  dailyTokenQuota: number
+  status: "active" | "disabled" | "expired" | "quota_exhausted" | string
+  requestCount: number
+  totalTokens: number
+  todayRequests: number
+  todayTokens: number
+  lastUsedAt?: string
+  remainingQuota?: number
+  remainingDailyQuota?: number
 }
 
 export interface GatewayConfigView {

@@ -26,19 +26,20 @@ const NAV_GROUPS: Array<{
       { id: "overview", index: "01", title: "多账号与签到" },
       { id: "assets", index: "02", title: "积分与容量" },
       { id: "gateway", index: "03", title: "OpenAI 路由池" },
-      { id: "analytics", index: "04", title: "OpenAI 数据看板" },
+      { id: "apiKeys", index: "04", title: "API Key 管理" },
+      { id: "analytics", index: "05", title: "OpenAI 数据看板" },
     ],
   },
   {
     label: "可观测性",
     items: [
-      { id: "logs", index: "05", title: "执行日志" },
-      { id: "recon", index: "06", title: "前端 Recon" },
+      { id: "logs", index: "06", title: "执行日志" },
+      { id: "recon", index: "07", title: "前端 Recon" },
     ],
   },
   {
     label: "系统",
-    items: [{ id: "settings", index: "07", title: "定时与设置" }],
+    items: [{ id: "settings", index: "08", title: "定时与设置" }],
   },
 ]
 

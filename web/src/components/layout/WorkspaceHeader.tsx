@@ -5,6 +5,7 @@ const TAB_TITLES: Record<ConsoleTab, string> = {
   overview: "多账号与签到",
   assets: "积分与容量",
   gateway: "OpenAI 路由池",
+  apiKeys: "API Key 管理",
   analytics: "OpenAI 数据看板",
   logs: "执行日志",
   recon: "前端 Recon",

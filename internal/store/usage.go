@@ -45,6 +45,195 @@ type GatewayUsageRecord struct {
 	Error            string    `json:"error,omitempty"`
 }
 
+// GatewayKeyUsage contains persisted per-key counters used by the key-management
+// page and by admission-time quota checks.
+type GatewayKeyUsage struct {
+	APIKeyID      string     `json:"apiKeyId"`
+	RequestCount  int64      `json:"requestCount"`
+	TotalTokens   int64      `json:"totalTokens"`
+	TodayRequests int64      `json:"todayRequests"`
+	TodayTokens   int64      `json:"todayTokens"`
+	LastUsedAt    *time.Time `json:"lastUsedAt,omitempty"`
+}
+
+// GatewayKeyUsageSummary combines durable all-time counters with the retained
+// local-calendar-day rows used for daily quota enforcement.
+func (s *Store) GatewayKeyUsageSummary(now time.Time, timezone string) (map[string]GatewayKeyUsage, error) {
+	out := make(map[string]GatewayKeyUsage)
+	if s == nil || s.db == nil {
+		return out, nil
+	}
+	rows, err := s.db.Query(`SELECT api_key_id, request_count, total_tokens, last_used_at FROM gateway_key_usage_totals`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var keyID string
+		var requests, tokens, lastSec int64
+		if err := rows.Scan(&keyID, &requests, &tokens, &lastSec); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		u := GatewayKeyUsage{APIKeyID: keyID, RequestCount: requests, TotalTokens: tokens}
+		if lastSec > 0 {
+			t := time.Unix(lastSec, 0).UTC()
+			u.LastUsedAt = &t
+		}
+		out[keyID] = u
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	_ = rows.Close()
+
+	daily, err := s.gatewayDailyUsage(now, timezone, "")
+	if err != nil {
+		return nil, err
+	}
+	for keyID, counter := range daily {
+		u := out[keyID]
+		u.APIKeyID = keyID
+		u.TodayRequests = counter.requests
+		u.TodayTokens = counter.tokens
+		out[keyID] = u
+	}
+	return out, nil
+}
+
+// GatewayKeyUsageForAdmission returns durable total usage and retained daily
+// usage without loading individual request rows.
+func (s *Store) GatewayKeyUsageForAdmission(apiKeyID string, now time.Time, timezone string) (totalTokens, todayTokens int64, err error) {
+	if s == nil || s.db == nil || strings.TrimSpace(apiKeyID) == "" {
+		return 0, 0, nil
+	}
+	if err = s.db.QueryRow(`SELECT COALESCE(total_tokens, 0) FROM gateway_key_usage_totals WHERE api_key_id = ?`, apiKeyID).Scan(&totalTokens); err != nil && !isErrNoRows(err) {
+		return 0, 0, err
+	}
+	daily, err := s.gatewayDailyUsage(now, timezone, apiKeyID)
+	if err != nil {
+		return 0, 0, err
+	}
+	todayTokens = daily[apiKeyID].tokens
+	return totalTokens, todayTokens, nil
+}
+
+type gatewayDailyCounter struct {
+	requests int64
+	tokens   int64
+}
+
+func gatewayDayStart(now time.Time, timezone string) int64 {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if strings.TrimSpace(timezone) == "" {
+		timezone = "Asia/Shanghai"
+	}
+	loc, err := time.LoadLocation(timezone)
+	if err != nil {
+		loc = time.FixedZone("CST", 8*3600)
+	}
+	y, m, d := now.In(loc).Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, loc).UTC().Unix()
+}
+
+// gatewayDailyUsage combines the retained current-day logs with the durable
+// baseline captured before an administrator clears analytics history.
+func (s *Store) gatewayDailyUsage(now time.Time, timezone, apiKeyID string) (map[string]gatewayDailyCounter, error) {
+	out := make(map[string]gatewayDailyCounter)
+	dayStart := gatewayDayStart(now, timezone)
+	baselineQuery := `SELECT api_key_id, request_count, total_tokens FROM gateway_key_daily_baselines WHERE day_start = ?`
+	baselineArgs := []any{dayStart}
+	if apiKeyID != "" {
+		baselineQuery += ` AND api_key_id = ?`
+		baselineArgs = append(baselineArgs, apiKeyID)
+	}
+	baselineRows, err := s.db.Query(baselineQuery, baselineArgs...)
+	if err != nil {
+		return nil, err
+	}
+	for baselineRows.Next() {
+		var keyID string
+		var counter gatewayDailyCounter
+		if err := baselineRows.Scan(&keyID, &counter.requests, &counter.tokens); err != nil {
+			_ = baselineRows.Close()
+			return nil, err
+		}
+		out[keyID] = counter
+	}
+	if err := baselineRows.Err(); err != nil {
+		_ = baselineRows.Close()
+		return nil, err
+	}
+	_ = baselineRows.Close()
+
+	logQuery := `
+		SELECT api_key_id, COUNT(*),
+		       COALESCE(SUM(CASE WHEN total_tokens > 0 THEN total_tokens ELSE prompt_tokens + completion_tokens END), 0)
+		FROM gateway_usage_logs WHERE created_at >= ?`
+	logArgs := []any{dayStart}
+	if apiKeyID != "" {
+		logQuery += ` AND api_key_id = ?`
+		logArgs = append(logArgs, apiKeyID)
+	}
+	logQuery += ` GROUP BY api_key_id`
+	logRows, err := s.db.Query(logQuery, logArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer logRows.Close()
+	for logRows.Next() {
+		var keyID string
+		var counter gatewayDailyCounter
+		if err := logRows.Scan(&keyID, &counter.requests, &counter.tokens); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(keyID) == "" {
+			keyID = "default"
+		}
+		baseline := out[keyID]
+		baseline.requests += counter.requests
+		baseline.tokens += counter.tokens
+		out[keyID] = baseline
+	}
+	return out, logRows.Err()
+}
+
+// backfillGatewayKeyUsageTotals imports pre-existing analytics exactly once.
+// Subsequent writes use transactional upserts, so retention purges never reduce
+// the lifetime token balance used for quota admission.
+func (s *Store) backfillGatewayKeyUsageTotals() error {
+	var done string
+	err := s.db.QueryRow(`SELECT value FROM meta WHERE key = 'gateway_key_usage_totals_backfilled_v1'`).Scan(&done)
+	if err == nil && done == "1" {
+		return nil
+	}
+	if err != nil && !isErrNoRows(err) {
+		return err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.Exec(`
+		INSERT INTO gateway_key_usage_totals (api_key_id, request_count, total_tokens, last_used_at)
+		SELECT CASE WHEN api_key_id = '' THEN 'default' ELSE api_key_id END,
+		       COUNT(*),
+		       COALESCE(SUM(CASE WHEN total_tokens > 0 THEN total_tokens ELSE prompt_tokens + completion_tokens END), 0),
+		       COALESCE(MAX(created_at), 0)
+		FROM gateway_usage_logs GROUP BY CASE WHEN api_key_id = '' THEN 'default' ELSE api_key_id END
+		ON CONFLICT(api_key_id) DO NOTHING`)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT OR REPLACE INTO meta(key, value) VALUES ('gateway_key_usage_totals_backfilled_v1', '1')`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // UsageQueryOptions filters and groups gateway analytics queries.
 type UsageQueryOptions struct {
 	RangeDays   int    // 1 (24h), 7, 30, 90, 180, or <=0 for all retained records
@@ -305,8 +494,13 @@ func (s *Store) RecordGatewayUsage(rec GatewayUsageRecord) error {
 		rec.Error = rec.Error[:512]
 	}
 
-	_, err := s.db.Exec(`
-		INSERT OR REPLACE INTO gateway_usage_logs (
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.Exec(`
+		INSERT OR IGNORE INTO gateway_usage_logs (
 			id, created_at, api_key_id, api_key_name, account_id, account_label,
 			model, requested_model, reasoning_effort, endpoint, upstream_api, bridged,
 			routing_mode, session_hash, request_id, client_ip, user_agent,
@@ -322,7 +516,27 @@ func (s *Store) RecordGatewayUsage(rec GatewayUsageRecord) error {
 		rec.UsageMultiplier, rec.WeightedTokens, rec.Status, rec.FirstTokenMs, rec.DurationMs,
 		rec.PromptTokens, rec.CompletionTokens, rec.ReasoningTokens, rec.CachedTokens, rec.TotalTokens, rec.Error,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if inserted == 0 {
+		return tx.Commit()
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO gateway_key_usage_totals (api_key_id, request_count, total_tokens, last_used_at)
+		VALUES (?, 1, ?, ?)
+		ON CONFLICT(api_key_id) DO UPDATE SET
+			request_count = request_count + 1,
+			total_tokens = total_tokens + excluded.total_tokens,
+			last_used_at = MAX(last_used_at, excluded.last_used_at)
+	`, rec.APIKeyID, rec.TotalTokens, rec.CreatedAt.UTC().Unix()); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // PurgeExpiredGatewayUsage removes usage rows older than retentionDays (relative to now).
@@ -348,18 +562,46 @@ func (s *Store) PurgeExpiredGatewayUsage(now time.Time, retentionDays int) (int6
 	return n, nil
 }
 
-// ClearGatewayUsage deletes all persisted OpenAI gateway usage records.
+// ClearGatewayUsage deletes analytics history without resetting key quota accounting.
 func (s *Store) ClearGatewayUsage() (int64, error) {
+	return s.ClearGatewayUsageInTimezone(time.Now().UTC(), "Asia/Shanghai")
+}
+
+// ClearGatewayUsageInTimezone durably captures the current-day counters before
+// deleting all request logs. Repeating the operation is idempotent per log row.
+func (s *Store) ClearGatewayUsageInTimezone(now time.Time, timezone string) (int64, error) {
 	if s == nil || s.db == nil {
 		return 0, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.db.Exec(`DELETE FROM gateway_usage_logs`)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	dayStart := gatewayDayStart(now, timezone)
+	if _, err := tx.Exec(`
+		INSERT INTO gateway_key_daily_baselines (api_key_id, day_start, request_count, total_tokens)
+		SELECT CASE WHEN api_key_id = '' THEN 'default' ELSE api_key_id END,
+		       ?, COUNT(*),
+		       COALESCE(SUM(CASE WHEN total_tokens > 0 THEN total_tokens ELSE prompt_tokens + completion_tokens END), 0)
+		FROM gateway_usage_logs WHERE created_at >= ?
+		GROUP BY CASE WHEN api_key_id = '' THEN 'default' ELSE api_key_id END
+		ON CONFLICT(api_key_id, day_start) DO UPDATE SET
+			request_count = request_count + excluded.request_count,
+			total_tokens = total_tokens + excluded.total_tokens
+	`, dayStart, dayStart); err != nil {
+		return 0, err
+	}
+	res, err := tx.Exec(`DELETE FROM gateway_usage_logs`)
 	if err != nil {
 		return 0, err
 	}
 	n, _ := res.RowsAffected()
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
 	return n, nil
 }
 
@@ -684,12 +926,12 @@ func (s *Store) QueryGatewayAnalytics(opts UsageQueryOptions) (*GatewayAnalytics
 
 	for rows.Next() {
 		var (
-			tsSec                                                int64
-			keyID, keyName, accID, accLabel, model               string
-			status                                               int
-			ttftMs, durMs, pTok, cTok, rTok, cacheTok, totTok    int64
-			usageMult, wTok                                      float64
-			errStr                                               string
+			tsSec                                             int64
+			keyID, keyName, accID, accLabel, model            string
+			status                                            int
+			ttftMs, durMs, pTok, cTok, rTok, cacheTok, totTok int64
+			usageMult, wTok                                   float64
+			errStr                                            string
 		)
 		if err := rows.Scan(
 			&tsSec, &keyID, &keyName, &accID, &accLabel,

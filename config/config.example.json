@@ -21,7 +21,15 @@
         "name": "Default Key",
         "key": "sk-brm-replace-with-random-key",
         "createdAt": "2026-01-01T00:00:00Z",
-        "enabled": true
+        "enabled": true,
+        "defaultModel": "dspro-high",
+        "restrictModels": false,
+        "allowedModels": [],
+        "rateLimit": 0,
+        "concurrencyLimit": 0,
+        "expiresAt": "",
+        "tokenQuota": 0,
+        "dailyTokenQuota": 0
       }
     ],
     "defaultModel": "dspro-high",

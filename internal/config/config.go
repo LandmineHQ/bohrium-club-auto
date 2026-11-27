@@ -17,12 +17,58 @@ import (
 )
 
 // APIKey represents a client API key accepted by the OpenAI-compatible /v1/* gateway.
+// Zero-valued limits and an empty ExpiresAt are intentionally unlimited/never-expiring,
+// which keeps keys created by older versions backward compatible.
 type APIKey struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Key       string `json:"key"`
-	CreatedAt string `json:"createdAt"`
-	Enabled   bool   `json:"enabled"`
+	ID               string   `json:"id"`
+	Name             string   `json:"name"`
+	Key              string   `json:"key"`
+	CreatedAt        string   `json:"createdAt"`
+	UpdatedAt        string   `json:"updatedAt,omitempty"`
+	Enabled          bool     `json:"enabled"`
+	DefaultModel     string   `json:"defaultModel,omitempty"`
+	RestrictModels   bool     `json:"restrictModels"`
+	AllowedModels    []string `json:"allowedModels,omitempty"`
+	RateLimit        int      `json:"rateLimit"`
+	ConcurrencyLimit int      `json:"concurrencyLimit"`
+	ExpiresAt        string   `json:"expiresAt,omitempty"`
+	TokenQuota       int64    `json:"tokenQuota"`
+	DailyTokenQuota  int64    `json:"dailyTokenQuota"`
+}
+
+// AllowsModel reports whether this key may access modelID. The gateway-wide
+// enabled/disabled switch is still applied separately.
+func (k APIKey) AllowsModel(modelID string) bool {
+	if !k.RestrictModels {
+		return true
+	}
+	normalized := NormalizeModelID(modelID)
+	for _, allowed := range k.AllowedModels {
+		if NormalizeModelID(allowed) == normalized {
+			return true
+		}
+	}
+	return false
+}
+
+// Expired reports whether the key has reached its optional expiration time.
+func (k APIKey) Expired(now time.Time) bool {
+	raw := strings.TrimSpace(k.ExpiresAt)
+	if raw == "" {
+		return false
+	}
+	expiresAt, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		// Invalid persisted timestamps fail closed rather than silently granting
+		// an unlimited key.
+		return true
+	}
+	return !expiresAt.After(now)
+}
+
+// NormalizeModelID canonicalizes optional scix/ prefixes and case.
+func NormalizeModelID(modelID string) string {
+	return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(modelID)), "scix/")
 }
 
 // DefaultAnalyticsRetentionDays is the default retention window for OpenAI gateway token usage logs.
@@ -45,7 +91,7 @@ type GatewayConfig struct {
 // IsModelEnabled reports whether modelID is enabled for OpenAI /v1/* gateway endpoints,
 // falling back to defaultEnabled when no explicit admin override is configured.
 func (g GatewayConfig) IsModelEnabled(modelID string, defaultEnabled bool) bool {
-	key := strings.ToLower(strings.TrimSpace(modelID))
+	key := NormalizeModelID(modelID)
 	if key == "" || len(g.ModelEnabled) == 0 {
 		return defaultEnabled
 	}
@@ -262,15 +308,15 @@ func Load() (*Manager, error) {
 
 func defaultConfig(dataDir string) Config {
 	return Config{
-		Host:          "0.0.0.0",
-		Port:          8788,
-		DataDir:       dataDir,
-		UserAgent:     chromehttp.DefaultChromeUA,
-		PDFCacheDir:   filepath.Join(dataDir, "pdfs"),
-		LocalPDFDir:   filepath.Join(dataDir, "custom_pdfs"),
-		ReconDir:      filepath.Join("recon", "bohrium-web"),
-		TaskDelaySec:  3,
-		CancelAfterMs: 450,
+		Host:            "0.0.0.0",
+		Port:            8788,
+		DataDir:         dataDir,
+		UserAgent:       chromehttp.DefaultChromeUA,
+		PDFCacheDir:     filepath.Join(dataDir, "pdfs"),
+		LocalPDFDir:     filepath.Join(dataDir, "custom_pdfs"),
+		ReconDir:        filepath.Join("recon", "bohrium-web"),
+		TaskDelaySec:    3,
+		CancelAfterMs:   450,
 		MaxPDFSizeBytes: 25 * 1024 * 1024,
 		Schedule: ScheduleConfig{
 			Enabled:       true,
@@ -348,7 +394,10 @@ func cloneConfig(src Config) Config {
 	cp := src
 	if src.Gateway.APIKeys != nil {
 		cp.Gateway.APIKeys = make([]APIKey, len(src.Gateway.APIKeys))
-		copy(cp.Gateway.APIKeys, src.Gateway.APIKeys)
+		for i, key := range src.Gateway.APIKeys {
+			cp.Gateway.APIKeys[i] = key
+			cp.Gateway.APIKeys[i].AllowedModels = append([]string(nil), key.AllowedModels...)
+		}
 	}
 	if src.Gateway.ModelEnabled != nil {
 		cp.Gateway.ModelEnabled = make(map[string]bool, len(src.Gateway.ModelEnabled))

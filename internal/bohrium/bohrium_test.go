@@ -1993,3 +1993,74 @@ func TestTaskPreExecutionStatusGateStrictSchema(t *testing.T) {
 	}
 	mu.Unlock()
 }
+
+func TestSciXExecutionHeaderIsolationPurposesAndTraceparent(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("BOHRIUM_DATA_DIR", tmp)
+	t.Setenv("BOHRIUM_ADMIN_PASSWORD", "test-pw-1234")
+	cfgMgr, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	st, err := store.Open(tmp)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	_ = st.SetAuth(store.AuthState{Token: makeTestJWT(1, 2, time.Now().Add(time.Hour))})
+	if st.StoreID() == "" {
+		t.Fatalf("expected non-empty account storeId")
+	}
+	httpCli, _ := chromehttp.New(chromehttp.Options{})
+	cli := NewClient(httpCli, cfgMgr, st)
+
+	foreignStore := newUUIDv4()
+	rootSess := newUUIDv4()
+	sess := newUUIDv4()
+	raw, _ := json.Marshal(SciXExecutionPayload{
+		Version: 7, Scenario: "cloud", StoreID: foreignStore,
+		RootSessionID: rootSess, SessionID: sess, KnowledgeContextID: "kc-1",
+	})
+	for name, enc := range map[string]string{
+		"unpadded": base64.RawURLEncoding.EncodeToString(raw),
+		"padded":   base64.URLEncoding.EncodeToString(raw),
+	} {
+		hdr := cli.BuildSciXExecutionHeader(SciXExecOptions{IncomingHeader: enc, ModelID: "dspro-high"})
+		p, ok := ParseSciXExecutionHeader(hdr)
+		if !ok {
+			t.Fatalf("%s: built header does not parse", name)
+		}
+		if p.Version != 1 || p.Scenario != SciXExecutionScenario || p.StoreID == foreignStore || p.StoreID != st.StoreID() {
+			t.Fatalf("%s: version/scenario/storeId not enforced: %+v", name, p)
+		}
+		if p.RootSessionID != rootSess || p.SessionID != sess || p.KnowledgeContextID != "kc-1" {
+			t.Fatalf("%s: session identity / knowledgeContextId not preserved: %+v", name, p)
+		}
+	}
+
+	for model, want := range map[string]string{
+		"vision": "read_image", "title": "session-title", "summary": "tool-batch-summary", "dspro-high": "agent",
+	} {
+		p, ok := ParseSciXExecutionHeader(cli.BuildSciXExecutionHeader(SciXExecOptions{ModelID: model}))
+		if !ok || p.Purpose != want {
+			t.Fatalf("model %q: expected purpose %q, got %+v", model, want, p)
+		}
+	}
+
+	if !IsValidTraceparent(NewTraceparent()) {
+		t.Fatalf("NewTraceparent must be valid")
+	}
+	for _, bad := range []string{
+		"", "garbage", "00-short-0123456789abcdef-01",
+		"00-0123456789ABCDEF0123456789ABCDEF-0123456789abcdef-01",
+		"00-00000000000000000000000000000000-0123456789abcdef-01",
+		"00-0123456789abcdef0123456789abcdef-0000000000000000-01",
+	} {
+		if IsValidTraceparent(bad) {
+			t.Fatalf("expected %q to be invalid", bad)
+		}
+	}
+	if !IsValidTraceparent("00-0123456789abcdef0123456789abcdef-0123456789abcdef-01") {
+		t.Fatalf("expected well-formed traceparent to be valid")
+	}
+}

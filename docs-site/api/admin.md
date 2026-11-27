@@ -50,9 +50,11 @@
 | <span class="api-method get">GET</span> | `/api/gateway/bindings` | 管理员 | 查看 SQLite 中所有未过期的 7 天会话绑定（`sessionHash`、归属账号、命中次数、到期时间） |
 | <span class="api-method delete">DELETE</span> | `/api/gateway/bindings/{hash}` | 管理员 | 手动解绑单个会话哈希 |
 | <span class="api-method delete">DELETE</span> | `/api/gateway/bindings` | 管理员 | 清空全部会话绑定缓存 |
-| <span class="api-method post">POST</span> | `/api/gateway/keys` | 管理员 | 创建新的 `sk-brm-...` API Key |
-| <span class="api-method patch">PATCH</span> | `/api/gateway/keys/{id}` | 管理员 | 启用或禁用指定 API Key |
-| <span class="api-method delete">DELETE</span> | `/api/gateway/keys/{id}` | 管理员 | 吊销并删除指定 API Key |
+| <span class="api-method get">GET</span> | `/api/gateway/keys` | 管理员 | 列出 API Key、派生状态、每 Key 策略与 SQLite 累计/今日 Token 用量 |
+| <span class="api-method post">POST</span> | `/api/gateway/keys` | 管理员 | 创建新的 `sk-brm-...` API Key，可同时设置默认模型、模型白名单、速率、并发、有效期与累计/每日 Token 额度 |
+| <span class="api-method patch">PATCH</span> | `/api/gateway/keys/{id}` | 管理员 | 部分更新指定 Key；缺省字段不修改，`0` 清除数值限制，`expiresAt: ""` 清除过期时间 |
+| <span class="api-method post">POST</span> | `/api/gateway/keys/{id}/regenerate` | 管理员 | 轮换密钥并保留 Key ID、策略和历史用量，旧密钥立即失效 |
+| <span class="api-method delete">DELETE</span> | `/api/gateway/keys/{id}` | 管理员 | 吊销并删除指定 API Key，保留历史用量供审计 |
 | <span class="api-method post">POST</span> | `/api/gateway/preflight` | 管理员 | 测试 `/billing/preflight`（支持指定 `accountId` 或使用路由池） |
 | <span class="api-method post">POST</span> | `/api/gateway/playground` | 管理员 | 控制台在线测试 `/v1/chat/completions` 与 `/v1/responses`（支持自动加权路由或指定 `accountId`） |
 
