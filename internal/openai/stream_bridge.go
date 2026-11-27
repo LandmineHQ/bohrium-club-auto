@@ -14,8 +14,9 @@ import (
 )
 
 const (
-	maxSSELineBytes          = 16 * 1024 * 1024
-	defaultKeepaliveInterval = 15 * time.Second
+	maxSSELineBytes               = 16 * 1024 * 1024
+	defaultKeepaliveInterval      = 10 * time.Second
+	defaultPreHeaderKeepaliveDelay = 8 * time.Second
 )
 
 func setSSEHeaders(w http.ResponseWriter) {
@@ -26,10 +27,123 @@ func setSSEHeaders(w http.ResponseWriter) {
 	w.WriteHeader(http.StatusOK)
 }
 
+func setNonStreamKeepaliveHeaders(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store, no-transform")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+}
+
 func flushWriter(w http.ResponseWriter) {
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+type preHeaderKeepalive struct {
+	mu        sync.Mutex
+	done      chan struct{}
+	once      sync.Once
+	wg        sync.WaitGroup
+	committed bool
+}
+
+// startPreHeaderKeepalive waits `delay` while waiting for slow upstream response headers
+// (such as large-context LLM prefill). If the upstream still hasn't sent headers when `delay`
+// expires, it commits HTTP 200 headers with an initial keepalive byte/comment and continues
+// emitting keepalives every `interval` until Stop() or ctx cancellation.
+func startPreHeaderKeepalive(ctx context.Context, w http.ResponseWriter, stream bool, routingMode string, delay, interval time.Duration) *preHeaderKeepalive {
+	p := &preHeaderKeepalive{
+		done: make(chan struct{}),
+	}
+	if delay <= 0 {
+		return p
+	}
+	if interval <= 0 {
+		interval = defaultKeepaliveInterval
+	}
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.done:
+			return
+		case <-timer.C:
+		}
+
+		payload := " "
+		if stream {
+			payload = ": keepalive\n\n"
+		}
+
+		p.mu.Lock()
+		select {
+		case <-ctx.Done():
+			p.mu.Unlock()
+			return
+		case <-p.done:
+			p.mu.Unlock()
+			return
+		default:
+		}
+		if routingMode != "" {
+			w.Header().Set("X-Bohrium-Routing-Mode", routingMode)
+		}
+		if stream {
+			setSSEHeaders(w)
+		} else {
+			setNonStreamKeepaliveHeaders(w)
+		}
+		_, _ = io.WriteString(w, payload)
+		flushWriter(w)
+		p.committed = true
+		p.mu.Unlock()
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-p.done:
+				return
+			case <-ticker.C:
+				p.mu.Lock()
+				select {
+				case <-ctx.Done():
+					p.mu.Unlock()
+					return
+				case <-p.done:
+					p.mu.Unlock()
+					return
+				default:
+				}
+				_, _ = io.WriteString(w, payload)
+				flushWriter(w)
+				p.mu.Unlock()
+			}
+		}
+	}()
+	return p
+}
+
+// Stop cancels pre-header keepalive emission, waits for its goroutine to exit,
+// and reports whether HTTP response headers were already committed to w.
+func (p *preHeaderKeepalive) Stop() bool {
+	if p == nil {
+		return false
+	}
+	p.once.Do(func() {
+		close(p.done)
+	})
+	p.wg.Wait()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.committed
 }
 
 type syncKeepaliveWriter struct {
@@ -96,16 +210,15 @@ func startKeepalive(ctx context.Context, sw *syncKeepaliveWriter, interval time.
 	}
 }
 
-// beginNonStreamJSONKeepalive commits 200 OK headers with application/json and emits
-// a single leading whitespace byte every interval while waiting on slow upstream aggregation,
-// preventing Cloudflare (100s) / Aliyun ESA (30s) origin read timeouts. JSON allows arbitrary
-// leading whitespace before the root object. Callers MUST invoke stop() before writing the body.
-func beginNonStreamJSONKeepalive(ctx context.Context, w http.ResponseWriter, interval time.Duration) (stop func()) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store, no-transform")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	flushWriter(w)
+// beginNonStreamJSONKeepalive ensures 200 OK headers with application/json (unless already committed
+// by pre-header keepalive) and emits a single leading whitespace byte every interval while waiting on
+// slow upstream aggregation, preventing Cloudflare (100s) / Aliyun ESA (30s) origin read timeouts.
+// JSON allows arbitrary leading whitespace before the root object. Callers MUST invoke stop() before writing the body.
+func beginNonStreamJSONKeepalive(ctx context.Context, w http.ResponseWriter, interval time.Duration, headersCommitted bool) (stop func()) {
+	if !headersCommitted {
+		setNonStreamKeepaliveHeaders(w)
+		flushWriter(w)
+	}
 	return startKeepalive(ctx, newSyncKeepaliveWriter(w), interval, " ")
 }
 
@@ -125,6 +238,45 @@ func writeCommittedJSONError(w http.ResponseWriter, errType, code, message strin
 	flushWriter(w)
 }
 
+func writeCommittedChatSSEError(w http.ResponseWriter, errType, code, message string) {
+	var codeVal any
+	if code != "" {
+		codeVal = code
+	}
+	b, _ := json.Marshal(ErrorEnvelope{
+		Error: ErrorDetail{
+			Message: message,
+			Type:    errType,
+			Param:   nil,
+			Code:    codeVal,
+		},
+	})
+	_, _ = io.WriteString(w, "data: "+string(b)+"\n\ndata: [DONE]\n\n")
+	flushWriter(w)
+}
+
+func writeCommittedResponsesSSEError(w http.ResponseWriter, req *ResponsesRequest, modelID, errType, code, message string) {
+	now := time.Now().UTC().Unix()
+	failedResp := buildResponseEnvelope(RandomID("resp_"), modelID, now, &now, "failed", nil, []map[string]any{}, nil, req)
+	var codeVal any
+	if code != "" {
+		codeVal = code
+	}
+	failedResp.Error = &ErrorDetail{
+		Message: message,
+		Type:    errType,
+		Param:   nil,
+		Code:    codeVal,
+	}
+	b, _ := json.Marshal(map[string]any{
+		"type":            "response.failed",
+		"sequence_number": 0,
+		"response":        failedResp,
+	})
+	_, _ = io.WriteString(w, formatSSEEvent("response.failed", b))
+	flushWriter(w)
+}
+
 func newSSEScanner(r io.Reader) *bufio.Scanner {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64*1024), maxSSELineBytes)
@@ -134,12 +286,14 @@ func newSSEScanner(r io.Reader) *bufio.Scanner {
 // PipeChatSSE streams Bohrium's native /chat/completions SSE directly to an OpenAI client,
 // filtering `: heartbeat` keepalive comments, guaranteeing a trailing `data: [DONE]`, and capturing usage.
 func PipeChatSSE(w http.ResponseWriter, body io.Reader) (UsageMetrics, error) {
-	return pipeChatSSE(context.Background(), w, body, defaultKeepaliveInterval)
+	return pipeChatSSE(context.Background(), w, body, defaultKeepaliveInterval, false)
 }
 
-func pipeChatSSE(ctx context.Context, w http.ResponseWriter, body io.Reader, keepaliveInterval time.Duration) (UsageMetrics, error) {
-	setSSEHeaders(w)
-	flushWriter(w)
+func pipeChatSSE(ctx context.Context, w http.ResponseWriter, body io.Reader, keepaliveInterval time.Duration, headersCommitted bool) (UsageMetrics, error) {
+	if !headersCommitted {
+		setSSEHeaders(w)
+		flushWriter(w)
+	}
 	sw := newSyncKeepaliveWriter(w)
 	stopKA := startKeepalive(ctx, sw, keepaliveInterval, ": keepalive\n\n")
 	defer stopKA()
@@ -182,12 +336,14 @@ func pipeChatSSE(ctx context.Context, w http.ResponseWriter, body io.Reader, kee
 // PipeResponsesSSE streams Bohrium's native /responses SSE directly to an OpenAI client,
 // filtering `: heartbeat` comments and capturing the completed response object for storage & usage.
 func PipeResponsesSSE(w http.ResponseWriter, body io.Reader, req *ResponsesRequest) (map[string]any, UsageMetrics, error) {
-	return pipeResponsesSSE(context.Background(), w, body, req, defaultKeepaliveInterval)
+	return pipeResponsesSSE(context.Background(), w, body, req, defaultKeepaliveInterval, false)
 }
 
-func pipeResponsesSSE(ctx context.Context, w http.ResponseWriter, body io.Reader, req *ResponsesRequest, keepaliveInterval time.Duration) (map[string]any, UsageMetrics, error) {
-	setSSEHeaders(w)
-	flushWriter(w)
+func pipeResponsesSSE(ctx context.Context, w http.ResponseWriter, body io.Reader, req *ResponsesRequest, keepaliveInterval time.Duration, headersCommitted bool) (map[string]any, UsageMetrics, error) {
+	if !headersCommitted {
+		setSSEHeaders(w)
+		flushWriter(w)
+	}
 	sw := newSyncKeepaliveWriter(w)
 	stopKA := startKeepalive(ctx, sw, keepaliveInterval, ": keepalive\n\n")
 	defer stopKA()
@@ -255,12 +411,14 @@ func pipeResponsesSSE(ctx context.Context, w http.ResponseWriter, body io.Reader
 // the full official OpenAI Responses API SSE event sequence (response.created, response.in_progress,
 // reasoning/message/function_call output items + deltas + done, response.completed/incomplete).
 func StreamChatToResponsesSSE(w http.ResponseWriter, body io.Reader, req *ResponsesRequest, modelID, respID string) (*ResponseObject, UsageMetrics, error) {
-	return streamChatToResponsesSSE(context.Background(), w, body, req, modelID, respID, defaultKeepaliveInterval)
+	return streamChatToResponsesSSE(context.Background(), w, body, req, modelID, respID, defaultKeepaliveInterval, false)
 }
 
-func streamChatToResponsesSSE(ctx context.Context, w http.ResponseWriter, body io.Reader, req *ResponsesRequest, modelID, respID string, keepaliveInterval time.Duration) (*ResponseObject, UsageMetrics, error) {
-	setSSEHeaders(w)
-	flushWriter(w)
+func streamChatToResponsesSSE(ctx context.Context, w http.ResponseWriter, body io.Reader, req *ResponsesRequest, modelID, respID string, keepaliveInterval time.Duration, headersCommitted bool) (*ResponseObject, UsageMetrics, error) {
+	if !headersCommitted {
+		setSSEHeaders(w)
+		flushWriter(w)
+	}
 	sw := newSyncKeepaliveWriter(w)
 	stopKA := startKeepalive(ctx, sw, keepaliveInterval, ": keepalive\n\n")
 	defer stopKA()
@@ -610,12 +768,14 @@ func streamChatToResponsesSSE(ctx context.Context, w http.ResponseWriter, body i
 // StreamResponsesToChatSSE translates a Bohrium native /responses SSE stream into
 // standard OpenAI /v1/chat/completions chunks (`chat.completion.chunk` + `[DONE]`).
 func StreamResponsesToChatSSE(w http.ResponseWriter, body io.Reader, modelID string, includeUsage bool) (UsageMetrics, error) {
-	return streamResponsesToChatSSE(context.Background(), w, body, modelID, includeUsage, defaultKeepaliveInterval)
+	return streamResponsesToChatSSE(context.Background(), w, body, modelID, includeUsage, defaultKeepaliveInterval, false)
 }
 
-func streamResponsesToChatSSE(ctx context.Context, w http.ResponseWriter, body io.Reader, modelID string, includeUsage bool, keepaliveInterval time.Duration) (UsageMetrics, error) {
-	setSSEHeaders(w)
-	flushWriter(w)
+func streamResponsesToChatSSE(ctx context.Context, w http.ResponseWriter, body io.Reader, modelID string, includeUsage bool, keepaliveInterval time.Duration, headersCommitted bool) (UsageMetrics, error) {
+	if !headersCommitted {
+		setSSEHeaders(w)
+		flushWriter(w)
+	}
 	sw := newSyncKeepaliveWriter(w)
 	stopKA := startKeepalive(ctx, sw, keepaliveInterval, ": keepalive\n\n")
 	defer stopKA()
@@ -1141,48 +1301,46 @@ func extractOutputItems(respMap map[string]any) []map[string]any {
 	return out
 }
 
-func forwardUpstreamError(w http.ResponseWriter, status int, body []byte) string {
+func classifyUpstreamError(status int, body []byte) (errType, code, msg string, parsedEnvelope bool, insufficientBalance bool) {
 	trimmed := strings.TrimSpace(string(body))
 	lower := strings.ToLower(trimmed)
-	isInsufficientBalance := status == http.StatusPaymentRequired ||
+	insufficientBalance = status == http.StatusPaymentRequired ||
 		strings.Contains(lower, "insufficient_balance") ||
 		strings.Contains(trimmed, "BILLING_PHOTON_NOT_ENOUGH")
 
 	var parsed ErrorEnvelope
 	if json.Unmarshal(body, &parsed) == nil && parsed.Error.Message != "" {
-		if isInsufficientBalance {
-			outStatus := status
-			if outStatus == http.StatusBadRequest || outStatus == http.StatusForbidden {
-				outStatus = http.StatusPaymentRequired
-			}
-			WriteError(w, outStatus, "insufficient_quota", "insufficient_balance", parsed.Error.Message)
-			return parsed.Error.Message
+		if insufficientBalance {
+			return "insufficient_quota", "insufficient_balance", parsed.Error.Message, true, true
 		}
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-		w.WriteHeader(status)
-		_, _ = w.Write(body)
-		return parsed.Error.Message
+		et := strings.TrimSpace(parsed.Error.Type)
+		if et == "" {
+			et = "upstream_error"
+		}
+		ec := ""
+		if parsed.Error.Code != nil {
+			ec = strings.TrimSpace(fmt.Sprint(parsed.Error.Code))
+		}
+		return et, ec, parsed.Error.Message, true, false
 	}
-	if isInsufficientBalance {
-		msg := "[insufficient_balance] Insufficient balance"
+	if insufficientBalance {
+		msg = "[insufficient_balance] Insufficient balance"
 		if trimmed != "" {
 			if len(trimmed) > 300 {
 				trimmed = trimmed[:300] + "..."
 			}
 			msg = trimmed
 		}
-		WriteError(w, http.StatusPaymentRequired, "insufficient_quota", "insufficient_balance", msg)
-		return msg
+		return "insufficient_quota", "insufficient_balance", msg, false, true
 	}
-	msg := fmt.Sprintf("Bohrium upstream returned HTTP %d", status)
+	msg = fmt.Sprintf("Bohrium upstream returned HTTP %d", status)
 	if trimmed != "" {
 		if len(trimmed) > 300 {
 			trimmed = trimmed[:300] + "..."
 		}
 		msg += ": " + trimmed
 	}
-	errType := "upstream_error"
+	errType = "upstream_error"
 	switch status {
 	case http.StatusBadRequest:
 		errType = "invalid_request_error"
@@ -1191,6 +1349,35 @@ func forwardUpstreamError(w http.ResponseWriter, status int, body []byte) string
 	case http.StatusTooManyRequests:
 		errType = "rate_limit_error"
 	}
-	WriteError(w, status, errType, fmt.Sprintf("http_%d", status), msg)
+	return errType, fmt.Sprintf("http_%d", status), msg, false, false
+}
+
+func extractCommittedErrorParts(status int, body []byte) (errType, code, msg string) {
+	errType, code, msg, _, _ = classifyUpstreamError(status, body)
+	return errType, code, msg
+}
+
+func forwardUpstreamError(w http.ResponseWriter, status int, body []byte) string {
+	errType, code, msg, parsedEnvelope, insufficientBalance := classifyUpstreamError(status, body)
+	if parsedEnvelope {
+		if insufficientBalance {
+			outStatus := status
+			if outStatus == http.StatusBadRequest || outStatus == http.StatusForbidden {
+				outStatus = http.StatusPaymentRequired
+			}
+			WriteError(w, outStatus, errType, code, msg)
+			return msg
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(status)
+		_, _ = w.Write(body)
+		return msg
+	}
+	if insufficientBalance {
+		WriteError(w, http.StatusPaymentRequired, errType, code, msg)
+		return msg
+	}
+	WriteError(w, status, errType, code, msg)
 	return msg
 }

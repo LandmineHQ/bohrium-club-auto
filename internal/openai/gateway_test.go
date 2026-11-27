@@ -1743,3 +1743,159 @@ func TestCDNSSEAndNonStreamJSONKeepaliveAndClientDisconnect499(t *testing.T) {
 		t.Fatalf("expected client/CDN disconnect to log status 499, got items=%+v", page.Items)
 	}
 }
+
+func TestPreHeaderDelayedKeepaliveAndFastErrorPreservation(t *testing.T) {
+	var (
+		headerDelayNanos     atomic.Int64
+		upstreamStatus       atomic.Int32
+		upstreamHeaderSentNs atomic.Int64
+	)
+	upstreamStatus.Store(http.StatusOK)
+
+	gw, gwSrv, st, _, apiKey, _ := setupTestGatewayEnv(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if d := time.Duration(headerDelayNanos.Load()); d > 0 {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(d):
+			}
+		}
+		upstreamHeaderSentNs.Store(time.Now().UnixNano())
+		code := int(upstreamStatus.Load())
+		if code != http.StatusOK {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(code)
+			_, _ = io.WriteString(w, fmt.Sprintf(`{"error":{"type":"upstream_error","code":"up_%d","message":"upstream error %d"}}`, code, code))
+			return
+		}
+		fl, _ := w.(http.Flusher)
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		if fl != nil {
+			fl.Flush()
+		}
+		_, _ = io.WriteString(w, `data: {"id":"chatcmpl-preka","object":"chat.completion.chunk","created":1700000950,"model":"dsflash-high","choices":[{"index":0,"delta":{"role":"assistant","content":"Prefill OK"},"finish_reason":null}]}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"id":"chatcmpl-preka","object":"chat.completion.chunk","created":1700000950,"model":"dsflash-high","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":200000,"completion_tokens":3,"total_tokens":200003}}`+"\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	})
+
+	gw.SetPreHeaderKeepaliveDelay(40 * time.Millisecond)
+	gw.SetKeepaliveInterval(40 * time.Millisecond)
+
+	// Case A: Slow upstream headers (220ms > 40ms delay) BEFORE WriteHeader(200).
+	// Client MUST receive HTTP 200 headers from pre-header keepalive well before upstream writes its own headers.
+	headerDelayNanos.Store(int64(220 * time.Millisecond))
+	for _, tc := range []struct {
+		path   string
+		body   string
+		stream bool
+		want   string
+	}{
+		{"/v1/responses", `{"model":"dsflash-high","stream":true,"input":"big prompt"}`, true, "response.completed"},
+		{"/v1/chat/completions", `{"model":"dsflash-high","stream":true,"messages":[{"role":"user","content":"big prompt"}]}`, true, "data: [DONE]"},
+		{"/v1/responses", `{"model":"dsflash-high","stream":false,"input":"big prompt"}`, false, "Prefill OK"},
+		{"/v1/chat/completions", `{"model":"dsflash-high","stream":false,"messages":[{"role":"user","content":"big prompt"}]}`, false, "Prefill OK"},
+	} {
+		upstreamHeaderSentNs.Store(0)
+		req, _ := http.NewRequest(http.MethodPost, gwSrv.URL+tc.path, strings.NewReader(tc.body))
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		clientGotHeadersAt := time.Now()
+		if err != nil {
+			t.Fatalf("Case A %s (stream=%v): %v", tc.path, tc.stream, err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Case A %s (stream=%v) status=%d body=%q", tc.path, tc.stream, resp.StatusCode, string(raw))
+		}
+		upSentAt := time.Unix(0, upstreamHeaderSentNs.Load())
+		if lead := upSentAt.Sub(clientGotHeadersAt); lead < 60*time.Millisecond {
+			t.Fatalf("Case A %s (stream=%v) expected pre-header keepalive headers >=60ms before upstream headers, got lead=%v", tc.path, tc.stream, lead)
+		}
+		if tc.stream {
+			if !strings.Contains(string(raw), ": keepalive\n\n") || !strings.Contains(string(raw), "Prefill OK") || !strings.Contains(string(raw), tc.want) {
+				t.Fatalf("Case A %s stream missing keepalive/content: %q", tc.path, string(raw))
+			}
+		} else {
+			if !bytes.HasPrefix(raw, []byte(" ")) {
+				t.Fatalf("Case A %s non-stream missing leading whitespace keepalive: %q", tc.path, string(raw[:min(24, len(raw))]))
+			}
+			var obj map[string]any
+			if err := json.Unmarshal(raw, &obj); err != nil {
+				t.Fatalf("Case A %s non-stream invalid JSON: %v; raw=%q", tc.path, err, string(raw))
+			}
+			if !strings.Contains(string(raw), tc.want) {
+				t.Fatalf("Case A %s non-stream missing %q in %q", tc.path, tc.want, string(raw))
+			}
+		}
+	}
+
+	// Case B: Fast upstream 400 (0ms < 40ms delay) preserves real HTTP 400 status code.
+	headerDelayNanos.Store(0)
+	upstreamStatus.Store(http.StatusBadRequest)
+	reqFastErr, _ := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/responses", strings.NewReader(`{"model":"dsflash-high","stream":true,"input":"fast err"}`))
+	reqFastErr.Header.Set("Authorization", "Bearer "+apiKey)
+	reqFastErr.Header.Set("Content-Type", "application/json")
+	respFastErr, err := http.DefaultClient.Do(reqFastErr)
+	if err != nil {
+		t.Fatalf("Case B request: %v", err)
+	}
+	rawFastErr, _ := io.ReadAll(respFastErr.Body)
+	respFastErr.Body.Close()
+	if respFastErr.StatusCode != http.StatusBadRequest || !strings.Contains(string(rawFastErr), "upstream error 400") {
+		t.Fatalf("Case B expected HTTP 400 preserved, got %d %q", respFastErr.StatusCode, string(rawFastErr))
+	}
+
+	// Case C: Slow upstream 502 (90ms > 40ms delay) after headers committed emits committed SSE/JSON error AND logs status 502.
+	headerDelayNanos.Store(int64(90 * time.Millisecond))
+	upstreamStatus.Store(http.StatusBadGateway)
+
+	reqSlowSSE, _ := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/responses", strings.NewReader(`{"model":"dsflash-high","stream":true,"input":"slow err stream"}`))
+	reqSlowSSE.Header.Set("Authorization", "Bearer "+apiKey)
+	reqSlowSSE.Header.Set("Content-Type", "application/json")
+	respSlowSSE, err := http.DefaultClient.Do(reqSlowSSE)
+	if err != nil {
+		t.Fatalf("Case C stream request: %v", err)
+	}
+	rawSlowSSE, _ := io.ReadAll(respSlowSSE.Body)
+	respSlowSSE.Body.Close()
+	if respSlowSSE.StatusCode != http.StatusOK || !strings.Contains(string(rawSlowSSE), ": keepalive\n\n") || !strings.Contains(string(rawSlowSSE), "event: response.failed") || !strings.Contains(string(rawSlowSSE), "upstream error 502") {
+		t.Fatalf("Case C stream expected 200 keepalive + response.failed, got %d %q", respSlowSSE.StatusCode, string(rawSlowSSE))
+	}
+
+	reqSlowJSON, _ := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"dsflash-high","stream":false,"messages":[{"role":"user","content":"slow err json"}]}`))
+	reqSlowJSON.Header.Set("Authorization", "Bearer "+apiKey)
+	reqSlowJSON.Header.Set("Content-Type", "application/json")
+	respSlowJSON, err := http.DefaultClient.Do(reqSlowJSON)
+	if err != nil {
+		t.Fatalf("Case C json request: %v", err)
+	}
+	rawSlowJSON, _ := io.ReadAll(respSlowJSON.Body)
+	respSlowJSON.Body.Close()
+	var errObj map[string]any
+	if respSlowJSON.StatusCode != http.StatusOK || !bytes.HasPrefix(rawSlowJSON, []byte(" ")) || json.Unmarshal(rawSlowJSON, &errObj) != nil || !strings.Contains(string(rawSlowJSON), "upstream error 502") {
+		t.Fatalf("Case C non-stream expected 200 leading-space JSON error, got %d %q", respSlowJSON.StatusCode, string(rawSlowJSON))
+	}
+
+	var count502 int
+	for i := 0; i < 20; i++ {
+		page, err := st.ListGatewayUsageLogs(store.UsageLogsQueryOptions{RangeDays: 1, Page: 1, PageSize: 20})
+		if err == nil {
+			count502 = 0
+			for _, it := range page.Items {
+				if it.Status == http.StatusBadGateway {
+					count502++
+				}
+			}
+			if count502 >= 2 {
+				break
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if count502 < 2 {
+		t.Fatalf("expected >=2 logged 502 records for Case C, got %d", count502)
+	}
+}
