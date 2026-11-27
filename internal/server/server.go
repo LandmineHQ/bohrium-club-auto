@@ -83,6 +83,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/accounts/{id}/tasks/claim", s.requireAdmin(s.handleAccountClaimOne))
 	s.mux.HandleFunc("POST /api/accounts/{id}/tasks/run", s.requireAdmin(s.handleAccountRunOne))
 	s.mux.HandleFunc("POST /api/accounts/{id}/tasks/run-all", s.requireAdmin(s.handleAccountRunAll))
+	s.mux.HandleFunc("GET /api/accounts/{id}/benefits/client-login", s.requireAdmin(s.handleAccountClientLoginBenefitStatus))
+	s.mux.HandleFunc("POST /api/accounts/{id}/benefits/client-login/claim", s.requireAdmin(s.handleAccountClaimClientLoginBenefit))
 
 	// Bohrium login endpoints (add new account or refresh existing account by UID; new accounts default to PoolEnabled=false)
 	s.mux.HandleFunc("GET /api/bohrium/session", s.requireAdmin(s.handleBohriumSession))
@@ -295,11 +297,13 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var (
-		session    bohrium.SessionStatus
-		tasksResp  *bohrium.DailyTasksResponse
-		tasksErr   string
-		assetsResp *bohrium.PointsAndCapacity
-		assetsErr  string
+		session          bohrium.SessionStatus
+		tasksResp        *bohrium.DailyTasksResponse
+		tasksErr         string
+		assetsResp       *bohrium.PointsAndCapacity
+		assetsErr        string
+		clientBenefit    *bohrium.ClientLoginBenefitStatus
+		clientBenefitErr string
 	)
 	if selectedID != "" {
 		cli := s.mgr.ForAccount(selectedID)
@@ -315,6 +319,11 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 			} else {
 				assetsResp = a
 			}
+			if cb, err := cli.GetClientLoginBenefitStatus(ctx); err != nil {
+				clientBenefitErr = err.Error()
+			} else {
+				clientBenefit = cb
+			}
 		}
 		// Always recompute account views so any nickname/profile/balance sync from CheckSession or RefreshAccountBalance is reflected immediately.
 		views, summary = s.buildAccountViews()
@@ -323,20 +332,22 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	cachedPDFs, customPDFs := s.mgr.Ephemeral().CountCachedPDFs()
 	cfg := s.cfg.Get()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":                true,
-		"version":           s.version,
-		"userAgent":         s.httpCli.UserAgent(),
-		"selectedAccountId": selectedID,
-		"accounts":          views,
-		"accountSummary":    summary,
-		"session":           session,
-		"tasks":             tasksResp,
-		"tasksError":        tasksErr,
-		"assets":            assetsResp,
-		"assetsError":       assetsErr,
-		"scheduler":         s.scheduler.Status(),
-		"activeJobs":        s.scheduler.ActiveTaskJobs(),
-		"promptStats":       prompts.GetStats(),
+		"ok":                 true,
+		"version":            s.version,
+		"userAgent":          s.httpCli.UserAgent(),
+		"selectedAccountId":  selectedID,
+		"accounts":           views,
+		"accountSummary":     summary,
+		"session":            session,
+		"tasks":              tasksResp,
+		"tasksError":         tasksErr,
+		"assets":             assetsResp,
+		"assetsError":        assetsErr,
+		"clientBenefit":      clientBenefit,
+		"clientBenefitError": clientBenefitErr,
+		"scheduler":          s.scheduler.Status(),
+		"activeJobs":         s.scheduler.ActiveTaskJobs(),
+		"promptStats":        prompts.GetStats(),
 		"pdfStats": map[string]int{
 			"cached": cachedPDFs,
 			"custom": customPDFs,

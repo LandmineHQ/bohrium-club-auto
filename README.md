@@ -156,6 +156,7 @@ docs-site/               VitePress 文档工程
 | `POST` | `/api/accounts/run-all` | 立即触发全部启用签到的账号执行每日任务 |
 | `POST` | `/api/accounts/{id}/refresh-token` | 手动续期指定账号 Token 并同步资料 |
 | `POST` | `/api/accounts/{id}/tasks/{claim-all,claim,run,run-all}` | 领取或执行指定账号的每日任务 |
+| `GET` / `POST` | `/api/accounts/{id}/benefits/client-login` & `/claim` | 查询或领取一次性客户端首次登录 10,000 光子礼包（领取前强制状态校验） |
 | `POST` | `/api/bohrium/wechat/qr` & `GET /api/bohrium/wechat/poll` | 微信二维码登录与轮询 |
 | `POST` | `/api/bohrium/oauth/url` & `oauth/verify` | 第三方 OAuth 登录 |
 | `POST` | `/api/bohrium/captcha/prepare` | 获取登录图形验证码初始化参数（供控制台弹出官方腾讯云人机验证组件） |

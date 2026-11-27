@@ -149,10 +149,12 @@ func (s *Server) handleAccountDetail(w http.ResponseWriter, r *http.Request) {
 	cli := s.mgr.ForAccount(acc.ID)
 	session := cli.CheckSession(ctx)
 	var (
-		tasksResp  *bohrium.DailyTasksResponse
-		tasksErr   string
-		assetsResp *bohrium.PointsAndCapacity
-		assetsErr  string
+		tasksResp        *bohrium.DailyTasksResponse
+		tasksErr         string
+		assetsResp       *bohrium.PointsAndCapacity
+		assetsErr        string
+		clientBenefit    *bohrium.ClientLoginBenefitStatus
+		clientBenefitErr string
 	)
 	if session.HasToken {
 		if t, tErr := cli.ListDailyTasks(ctx); tErr != nil {
@@ -165,20 +167,27 @@ func (s *Server) handleAccountDetail(w http.ResponseWriter, r *http.Request) {
 		} else {
 			assetsResp = a
 		}
+		if cb, cbErr := cli.GetClientLoginBenefitStatus(ctx); cbErr != nil {
+			clientBenefitErr = cbErr.Error()
+		} else {
+			clientBenefit = cb
+		}
 	}
 	freshAcc, _, _ := s.store.GetAccount(acc.ID)
 	if freshAcc == nil {
 		freshAcc = acc
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":          true,
-		"account":     freshAcc.Redacted(),
-		"session":     session,
-		"tasks":       tasksResp,
-		"tasksError":  tasksErr,
-		"assets":      assetsResp,
-		"assetsError": assetsErr,
-		"logs":        s.store.GetLogsFiltered(acc.ID, 40),
+		"ok":                 true,
+		"account":            freshAcc.Redacted(),
+		"session":            session,
+		"tasks":              tasksResp,
+		"tasksError":         tasksErr,
+		"assets":             assetsResp,
+		"assetsError":        assetsErr,
+		"clientBenefit":      clientBenefit,
+		"clientBenefitError": clientBenefitErr,
+		"logs":               s.store.GetLogsFiltered(acc.ID, 40),
 	})
 }
 
@@ -453,4 +462,39 @@ func (s *Server) finalizeLoginResponse(ctx context.Context, w http.ResponseWrite
 		"accounts": views,
 		"summary":  summary,
 	})
+}
+
+func (s *Server) handleAccountClientLoginBenefitStatus(w http.ResponseWriter, r *http.Request) {
+	id := s.resolveTargetAccountID(r, "")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "尚未登录任何账号"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	st, err := s.mgr.ForAccount(id).GetClientLoginBenefitStatus(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "data": st})
+}
+
+func (s *Server) handleAccountClaimClientLoginBenefit(w http.ResponseWriter, r *http.Request) {
+	id := s.resolveTargetAccountID(r, "")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "尚未登录任何账号"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	res, err := s.mgr.ForAccount(id).ClaimClientLoginPhotons(ctx, "manual")
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if res != nil && res.Claimed {
+		_, _ = s.mgr.RefreshAccountBalance(ctx, id)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "data": res})
 }

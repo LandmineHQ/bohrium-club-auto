@@ -20,7 +20,14 @@ const (
 	DefaultWWWBaseURL      = "https://www.bohrium.com"
 	DefaultSBCloudBaseURL  = "https://sb-cloud.dp.tech"
 	DefaultAgentBaseURL    = "https://agent.bohrium.com"
-	DefaultSigmaLLMBaseURL = "https://www.bohrium.com/bohrapi/v1/sigma-search/api/v1/scix/llm"
+	DefaultSigmaLLMBaseURL        = "https://www.bohrium.com/bohrapi/v1/sigma-search/api/v1/scix/llm"
+	DefaultPlatformGatewayBaseURL = "https://platform-gateway.dp.tech"
+
+	DesktopLoginChannel             = "scix-desktop"
+	TaskKeyClientFirstLogin         = "bohrium_client_first_login"
+	ClientLoginBenefitEventSubject  = "client_register"
+	ClientLoginBenefitRewardPhotons = 10000
+	ClientLoginBenefitValidDays     = 90
 
 	SciXModelCatalogTag   = "shrimp-brain-v2"
 	SciXExecutionScenario = "local_agent"
@@ -45,22 +52,24 @@ const (
 
 // Endpoints allows overriding upstream base URLs (e.g., for httptest unit tests).
 type Endpoints struct {
-	ClubBase     string
-	PlatformBase string
-	WWWBase      string
-	SBCloudBase  string
-	AgentBase    string
-	SigmaLLMBase string
+	ClubBase            string
+	PlatformBase        string
+	WWWBase             string
+	SBCloudBase         string
+	AgentBase           string
+	SigmaLLMBase        string
+	PlatformGatewayBase string
 }
 
 func defaultEndpoints() Endpoints {
 	return Endpoints{
-		ClubBase:     DefaultClubBaseURL,
-		PlatformBase: DefaultPlatformBaseURL,
-		WWWBase:      DefaultWWWBaseURL,
-		SBCloudBase:  DefaultSBCloudBaseURL,
-		AgentBase:    DefaultAgentBaseURL,
-		SigmaLLMBase: DefaultSigmaLLMBaseURL,
+		ClubBase:            DefaultClubBaseURL,
+		PlatformBase:        DefaultPlatformBaseURL,
+		WWWBase:             DefaultWWWBaseURL,
+		SBCloudBase:         DefaultSBCloudBaseURL,
+		AgentBase:           DefaultAgentBaseURL,
+		SigmaLLMBase:        DefaultSigmaLLMBaseURL,
+		PlatformGatewayBase: DefaultPlatformGatewayBaseURL,
 	}
 }
 
@@ -124,15 +133,34 @@ func (c *Client) SetEndpoints(ep Endpoints) {
 	if ep.SigmaLLMBase != "" {
 		c.endpoints.SigmaLLMBase = strings.TrimRight(ep.SigmaLLMBase, "/")
 	}
+	if ep.PlatformGatewayBase != "" {
+		c.endpoints.PlatformGatewayBase = strings.TrimRight(ep.PlatformGatewayBase, "/")
+	} else if ep.WWWBase != "" && c.endpoints.PlatformGatewayBase == DefaultPlatformGatewayBaseURL {
+		c.endpoints.PlatformGatewayBase = strings.TrimRight(ep.WWWBase, "/")
+	}
 }
 
 // JWTClaims captures relevant fields decoded from brmToken's payload segment.
 type JWTClaims struct {
-	UserID    int64
-	OrgID     int64
-	UserType  int
-	ExpiresAt time.Time
-	Raw       map[string]any
+	UserID           int64
+	OrgID            int64
+	UserType         int
+	IdentityUserType string
+	ExpiresAt        time.Time
+	Raw              map[string]any
+}
+
+// IsPersonalAccountToken reports whether the JWT belongs to a personal account ("bohrVersion")
+// rather than an organizational/seat account ("teamVersion" / "seatVersion").
+func (j *JWTClaims) IsPersonalAccountToken() bool {
+	if j == nil {
+		return false
+	}
+	ut := strings.TrimSpace(j.IdentityUserType)
+	if ut == "" {
+		return true
+	}
+	return strings.EqualFold(ut, "bohrVersion")
 }
 
 // ParseJWTClaims decodes the payload of a Bohrium JWT (brmToken) without verifying the remote signing key.
@@ -166,6 +194,7 @@ func ParseJWTClaims(token string) (*JWTClaims, error) {
 		claims.UserID = asInt64(idObj["userId"])
 		claims.OrgID = asInt64(idObj["orgId"])
 		claims.UserType = int(asInt64(idObj["userType"]))
+		claims.IdentityUserType = asString(idObj["userType"])
 	}
 	if claims.UserID == 0 {
 		claims.UserID = asInt64(raw["userId"])

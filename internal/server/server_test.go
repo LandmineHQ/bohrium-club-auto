@@ -3,9 +3,13 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +21,29 @@ import (
 	"bohrium-club-auto/internal/scheduler"
 	"bohrium-club-auto/internal/store"
 )
+
+func TestMain(m *testing.M) {
+	if defTr, ok := http.DefaultTransport.(*http.Transport); ok {
+		origDial := defTr.DialContext
+		if origDial == nil {
+			d := &net.Dialer{Timeout: 5 * time.Second}
+			origDial = d.DialContext
+		}
+		defTr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				host = addr
+			}
+			host = strings.Trim(strings.TrimSpace(host), "[]")
+			ip := net.ParseIP(host)
+			if !strings.EqualFold(host, "localhost") && (ip == nil || !ip.IsLoopback()) {
+				return nil, fmt.Errorf("offline test guard blocked non-loopback network dial to %s", addr)
+			}
+			return origDial(ctx, network, addr)
+		}
+	}
+	os.Exit(m.Run())
+}
 
 func setupTestServer(t *testing.T) (*Server, *store.Store, string) {
 	t.Helper()
@@ -452,5 +479,96 @@ func TestAsyncManualTaskExecutionAndPolling(t *testing.T) {
 	srv.Handler().ServeHTTP(ovDoneRec, ovDoneReq)
 	if ovDoneRec.Code != http.StatusOK || !strings.Contains(ovDoneRec.Body.String(), `"activeJobs":[]`) || strings.Contains(ovDoneRec.Body.String(), `"activeJobs":null`) {
 		t.Fatalf("GET /api/overview after completion expected activeJobs [], got %d %s", ovDoneRec.Code, ovDoneRec.Body.String())
+	}
+}
+
+func TestClientLoginBenefitAdminEndpoints(t *testing.T) {
+	var (
+		mu           sync.Mutex
+		receiveCalls int
+		firstLogin   = true
+		claimedOld   = false
+	)
+	upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/bohrapi/v1/sigma-search/api/v1/scix/membership/client-activity":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 0,
+				"data": map[string]any{
+					"newUserBenefitWithinPeriod": true,
+					"newUserBenefitFirstLogin":   firstLogin,
+					"hasOldActivityLogin":        claimedOld,
+				},
+			})
+		case "/platform-gateway/v1/membership/receive_photon":
+			receiveCalls++
+			firstLogin = false
+			claimedOld = true
+			_, _ = w.Write([]byte(`{"code":0,"data":{"claimed":true}}`))
+		case "/bohrapi/v1/account/info":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"userId":9201,"orgId":9202,"name":"BenefitAdmin"}}`))
+		case "/api/platform/session":
+			_, _ = w.Write([]byte(`{"logged_in":true,"binding":{"nickname":"BenefitAdmin"}}`))
+		default:
+			_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
+		}
+	}))
+	t.Cleanup(upSrv.Close)
+
+	srv, st, pw := setupTestServer(t)
+	srv.mgr.SetEndpoints(bohrium.Endpoints{
+		ClubBase:            upSrv.URL,
+		PlatformBase:        upSrv.URL,
+		WWWBase:             upSrv.URL,
+		SBCloudBase:         upSrv.URL,
+		AgentBase:           upSrv.URL,
+		SigmaLLMBase:        upSrv.URL,
+		PlatformGatewayBase: upSrv.URL,
+	})
+	// Construct a personal-account JWT ("bohrVersion") since ClaimClientLoginPhotons checks token claims offline.
+	hdrB64 := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+	payB64 := base64.RawURLEncoding.EncodeToString([]byte(`{"exp":4102444800,"identity":{"userId":9201,"orgId":9202,"userType":"bohrVersion"}}`))
+	personalTok := hdrB64 + "." + payB64 + ".sig"
+	acc, _, err := st.UpsertAccountFromAuth(store.AuthState{
+		Token: personalTok, UserID: 9201, OrgID: 9202, Nickname: "BenefitAdmin", ExpiresAt: time.Now().Add(24 * time.Hour),
+	}, "BenefitAdmin")
+	if err != nil {
+		t.Fatalf("UpsertAccountFromAuth: %v", err)
+	}
+
+	// 1. Check status returns eligible=true
+	stReq := httptest.NewRequest(http.MethodGet, "/api/accounts/"+acc.ID+"/benefits/client-login", nil)
+	stReq.Header.Set("X-Admin-Password", pw)
+	stRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(stRec, stReq)
+	if stRec.Code != http.StatusOK || !strings.Contains(stRec.Body.String(), `"eligible":true`) {
+		t.Fatalf("GET client-login benefit status failed: %d %s", stRec.Code, stRec.Body.String())
+	}
+
+	// 2. Claim calls receive_photon once
+	clReq := httptest.NewRequest(http.MethodPost, "/api/accounts/"+acc.ID+"/benefits/client-login/claim", nil)
+	clReq.Header.Set("X-Admin-Password", pw)
+	clRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(clRec, clReq)
+	if clRec.Code != http.StatusOK || !strings.Contains(clRec.Body.String(), `"claimed":true`) {
+		t.Fatalf("POST client-login benefit claim failed: %d %s", clRec.Code, clRec.Body.String())
+	}
+
+	// 3. Second claim MUST skip without hitting receive_photon again
+	cl2Req := httptest.NewRequest(http.MethodPost, "/api/accounts/"+acc.ID+"/benefits/client-login/claim", nil)
+	cl2Req.Header.Set("X-Admin-Password", pw)
+	cl2Rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(cl2Rec, cl2Req)
+	if cl2Rec.Code != http.StatusOK || !strings.Contains(cl2Rec.Body.String(), `"skipped":true`) {
+		t.Fatalf("second POST client-login benefit claim should skip: %d %s", cl2Rec.Code, cl2Rec.Body.String())
+	}
+	mu.Lock()
+	gotCalls := receiveCalls
+	mu.Unlock()
+	if gotCalls != 1 {
+		t.Fatalf("expected receiveCalls=1, got %d", gotCalls)
 	}
 }

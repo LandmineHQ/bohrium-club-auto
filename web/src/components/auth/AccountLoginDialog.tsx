@@ -31,7 +31,7 @@ interface AccountLoginDialogProps {
   onSuccess: (accountId?: string) => Promise<void>
 }
 
-const OFFICIAL_LOGIN_URL = "https://platform.bohrium.com/login?business=Bohrium&lang=zh-cn"
+const OFFICIAL_LOGIN_URL = "https://platform.bohrium.com/login?business=Bohrium&channel=scix-desktop&lang=zh-cn"
 
 const OAUTH_PROVIDERS = [
   { id: "google", label: "Google 登录" },

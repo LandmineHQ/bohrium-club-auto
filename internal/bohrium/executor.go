@@ -69,15 +69,17 @@ func (c *Client) RunAllWebTasks(ctx context.Context, trigger string, autoClaim b
 		return nil, err
 	}
 
-	// Step 1: Claim all unclaimed tasks first.
+	// Step 1: Claim all unclaimed tasks first, then re-query live task statuses to verify confirmation.
 	if autoClaim && tasksResp.UnclaimedCount > 0 {
 		if _, err := c.ClaimAllTasks(ctx, trigger); err != nil {
 			return nil, fmt.Errorf("自动领取每日任务失败: %w", err)
 		}
 		out.Claimed = true
-		if refreshed, err := c.ListDailyTasks(ctx); err == nil {
-			tasksResp = refreshed
+		refreshed, err := c.ListDailyTasks(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("接收任务后刷新每日任务状态失败: %w", err)
 		}
+		tasksResp = refreshed
 	}
 
 	delaySec := c.cfg.Get().TaskDelaySec
@@ -109,6 +111,23 @@ func (c *Client) RunAllWebTasks(ctx context.Context, trigger string, autoClaim b
 			})
 			continue
 		}
+		if task.Status != 0 {
+			msg := fmt.Sprintf("任务当前状态未处于已接收可执行状态（status=%d），跳过执行", task.Status)
+			if task.Status == -1 && !autoClaim {
+				msg = "任务尚未接收（待领取 status=-1），跳过执行"
+			} else if task.Status == -1 {
+				msg = "任务领取后状态仍为待接收（status=-1），跳过执行"
+			}
+			out.Results = append(out.Results, TaskExecutionResult{
+				TaskKey:   task.TaskKey,
+				ActionKey: task.ActionKey,
+				TaskTitle: task.TitleZh,
+				Success:   false,
+				Skipped:   true,
+				Message:   msg,
+			})
+			continue
+		}
 		if !task.Executable {
 			out.Results = append(out.Results, TaskExecutionResult{
 				TaskKey:   task.TaskKey,
@@ -134,6 +153,13 @@ func (c *Client) RunAllWebTasks(ctx context.Context, trigger string, autoClaim b
 		executedAny = true
 	}
 
+	// Also attempt pre-checked one-time client first-login benefit claim (never calls receive_photon unless client-activity grants eligibility).
+	if ctx.Err() == nil {
+		bCtx, bCancel := context.WithTimeout(ctx, 5*time.Second)
+		_, _ = c.ClaimClientLoginPhotons(bCtx, trigger)
+		bCancel()
+	}
+
 	// Give Bohrium backend a brief moment to settle query-events before re-querying task statuses.
 	if executedAny {
 		select {
@@ -150,6 +176,9 @@ func (c *Client) RunAllWebTasks(ctx context.Context, trigger string, autoClaim b
 	okCount, failCount, skipCount := 0, 0, 0
 	for _, r := range out.Results {
 		if r.Skipped {
+			if !r.Success {
+				failCount++
+			}
 			skipCount++
 		} else if r.Success {
 			okCount++
@@ -175,26 +204,27 @@ func (c *Client) RunAllWebTasks(ctx context.Context, trigger string, autoClaim b
 }
 
 // ExecuteSingleTask executes a single daily task (Web or Desktop Client) by its taskKey or actionKey.
+// It always queries live task status before executing, claims unclaimed tasks first, and re-verifies
+// status == 0 before starting execution.
 func (c *Client) ExecuteSingleTask(ctx context.Context, taskKey, trigger string) (*TaskExecutionResult, error) {
 	auth := c.store.GetAuth()
 	if auth.Token == "" {
 		return nil, fmt.Errorf("请先登录 Bohrium 账号")
 	}
 
-	// Fetch current tasks so we know if it needs claiming first and have its exact title/actionKey.
-	var target DailyTask
-	found := false
-	if list, err := c.ListDailyTasks(ctx); err == nil {
-		for _, t := range list.Tasks {
-			if t.TaskKey == taskKey || t.ActionKey == taskKey {
-				target = t
-				found = true
-				break
-			}
-		}
+	list, err := c.ListDailyTasks(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("执行前查询每日任务状态失败: %w", err)
 	}
+	target, found := findDailyTask(list, taskKey)
 	if !found {
-		target = classifyTask(DailyTask{TaskKey: taskKey, Status: 0})
+		return &TaskExecutionResult{
+			TaskKey:   taskKey,
+			TaskTitle: taskKey,
+			Success:   false,
+			Skipped:   true,
+			Message:   "当前每日任务列表中未找到该任务，无法确认任务状态，拒绝执行",
+		}, nil
 	}
 	if target.Skipped {
 		return &TaskExecutionResult{
@@ -206,16 +236,104 @@ func (c *Client) ExecuteSingleTask(ctx context.Context, taskKey, trigger string)
 			Message:   target.SkipReason,
 		}, nil
 	}
+	if target.Status == 1 {
+		return &TaskExecutionResult{
+			TaskKey:   target.TaskKey,
+			ActionKey: target.ActionKey,
+			TaskTitle: target.TitleZh,
+			Success:   true,
+			Skipped:   true,
+			Message:   "今日已完成，无需重复执行",
+		}, nil
+	}
 	if target.Status == -1 {
 		// Automatically claim before executing so manual button works in one click.
+		var claimErr error
 		if _, err := c.ClaimTask(ctx, target.TaskKey, trigger); err != nil {
 			// Fallback to claim-all if single claim fails
-			_, _ = c.ClaimAllTasks(ctx, trigger)
+			if _, allErr := c.ClaimAllTasks(ctx, trigger); allErr != nil {
+				claimErr = fmt.Errorf("单独接收(%v)，全量接收(%v)", err, allErr)
+			}
 		}
+		if claimErr != nil {
+			return &TaskExecutionResult{
+				TaskKey:   target.TaskKey,
+				ActionKey: target.ActionKey,
+				TaskTitle: target.TitleZh,
+				Success:   false,
+				Skipped:   true,
+				Message:   fmt.Sprintf("接收任务失败，拒绝执行: %v", claimErr),
+			}, nil
+		}
+		refreshed, err := c.ListDailyTasks(ctx)
+		if err != nil {
+			return &TaskExecutionResult{
+				TaskKey:   target.TaskKey,
+				ActionKey: target.ActionKey,
+				TaskTitle: target.TitleZh,
+				Success:   false,
+				Skipped:   true,
+				Message:   fmt.Sprintf("接收任务后刷新状态失败，拒绝执行: %v", err),
+			}, nil
+		}
+		refreshedTarget, ok := findDailyTask(refreshed, taskKey)
+		if !ok {
+			return &TaskExecutionResult{
+				TaskKey:   target.TaskKey,
+				ActionKey: target.ActionKey,
+				TaskTitle: target.TitleZh,
+				Success:   false,
+				Skipped:   true,
+				Message:   "接收任务后在列表中未找到该任务，拒绝执行",
+			}, nil
+		}
+		target = refreshedTarget
+	}
+	if target.Status == 1 {
+		return &TaskExecutionResult{
+			TaskKey:   target.TaskKey,
+			ActionKey: target.ActionKey,
+			TaskTitle: target.TitleZh,
+			Success:   true,
+			Skipped:   true,
+			Message:   "今日已完成，无需重复执行",
+		}, nil
+	}
+	if target.Status != 0 {
+		return &TaskExecutionResult{
+			TaskKey:   target.TaskKey,
+			ActionKey: target.ActionKey,
+			TaskTitle: target.TitleZh,
+			Success:   false,
+			Skipped:   true,
+			Message:   fmt.Sprintf("任务当前状态未确认已接收（status=%d），拒绝执行", target.Status),
+		}, nil
+	}
+	if !target.Executable {
+		return &TaskExecutionResult{
+			TaskKey:   target.TaskKey,
+			ActionKey: target.ActionKey,
+			TaskTitle: target.TitleZh,
+			Success:   false,
+			Skipped:   true,
+			Message:   target.SkipReason,
+		}, nil
 	}
 
 	res := c.executeClassifiedTask(ctx, target, trigger)
 	return &res, nil
+}
+
+func findDailyTask(list *DailyTasksResponse, taskKey string) (DailyTask, bool) {
+	if list == nil {
+		return DailyTask{}, false
+	}
+	for _, t := range list.Tasks {
+		if t.TaskKey == taskKey || t.ActionKey == taskKey {
+			return t, true
+		}
+	}
+	return DailyTask{}, false
 }
 
 func (c *Client) executeClassifiedTask(ctx context.Context, task DailyTask, trigger string) TaskExecutionResult {

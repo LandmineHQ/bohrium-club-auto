@@ -107,27 +107,17 @@ func (c *Client) PollWeChatQR(ctx context.Context, sceneID string) (*WeChatPollR
 		return nil, fmt.Errorf("sceneId is required")
 	}
 
-	// Build device payload identical to platform.bohrium.com login bundle (note intentional "with" spelling in upstream JS).
-	devicePayload := map[string]any{
-		"userAgent": c.http.UserAgent(),
-		"screenInfo": map[string]int{
-			"with":   1920,
-			"height": 1080,
-		},
-		"memory": 8,
-	}
-	devJSON, _ := json.Marshal(devicePayload)
-	devB64 := base64.StdEncoding.EncodeToString(devJSON)
+	devB64 := c.deviceInfoB64()
 
 	q := url.Values{}
 	q.Set("sceneId", sceneID)
-	q.Set("channel", "web")
+	q.Set("channel", DesktopLoginChannel)
 	q.Set("device", devB64)
 	u := c.endpoints.PlatformBase + "/api/account/wechat/qr_code/check_login_status?" + q.Encode()
 
 	resp, err := c.http.DoJSON(ctx, http.MethodGet, u, nil, map[string]string{
 		"Origin":  c.endpoints.PlatformBase,
-		"Referer": c.endpoints.PlatformBase + "/login",
+		"Referer": c.endpoints.PlatformBase + "/login?business=Bohrium&channel=" + DesktopLoginChannel,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("poll wechat qr status: %w", err)
@@ -319,7 +309,7 @@ func (c *Client) VerifyOAuthCallback(ctx context.Context, provider, callbackInpu
 		"code":         code,
 		"businessLine": "bohrium",
 		"isOversea":    isOversea,
-		"channel":      "web",
+		"channel":      DesktopLoginChannel,
 		"refer":        map[string]any{},
 	}
 	if state != "" {
@@ -331,7 +321,7 @@ func (c *Client) VerifyOAuthCallback(ctx context.Context, provider, callbackInpu
 
 	resp, err := c.http.DoJSON(ctx, http.MethodPost, c.endpoints.PlatformBase+"/api/oauth/verify", payload, map[string]string{
 		"Origin":  c.endpoints.PlatformBase,
-		"Referer": c.endpoints.PlatformBase + "/login",
+		"Referer": c.endpoints.PlatformBase + "/login?business=Bohrium&channel=" + DesktopLoginChannel,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("OAuth 验证请求失败: %w", err)
@@ -364,7 +354,7 @@ func (c *Client) platformHeaders(isOversea bool) map[string]string {
 	}
 	return map[string]string{
 		"Origin":           c.endpoints.PlatformBase,
-		"Referer":          c.endpoints.PlatformBase + "/login",
+		"Referer":          c.endpoints.PlatformBase + "/login?business=Bohrium&channel=" + DesktopLoginChannel,
 		"Content-Language": lang,
 	}
 }
@@ -507,7 +497,7 @@ func (c *Client) SendVerifyCode(ctx context.Context, kind, target, countryCode s
 		endpoint = "/api/account/code/send_by_phone_v3"
 		payload = map[string]any{
 			"phone":          phone,
-			"channel":        "pc",
+			"channel":        DesktopLoginChannel,
 			"sceneType":      2,
 			"tokenKey":       "",
 			"Version":        "v2",
@@ -518,7 +508,7 @@ func (c *Client) SendVerifyCode(ctx context.Context, kind, target, countryCode s
 		endpoint = "/api/account/code/send_by_email_v3"
 		payload = map[string]any{
 			"email":        target,
-			"channel":      "pc",
+			"channel":      DesktopLoginChannel,
 			"sceneType":    2,
 			"tokenKey":     "",
 			"businessLine": "bohrium",
@@ -599,13 +589,11 @@ func (c *Client) LoginWithCode(ctx context.Context, kind, target, countryCode, c
 		payload = map[string]any{
 			"phone":        normalizePhone(target, countryCode),
 			"phoneCode":    code,
-			"channel":      "pc",
-			"sceneType":    2,
-			"autoRegist":   true,
-			"device":       c.deviceInfoB64(),
-			"refer":        map[string]any{},
-			"isOversea":    isOversea,
 			"businessLine": "bohrium",
+			"refer":        map[string]any{},
+			"autoRegist":   true,
+			"channel":      DesktopLoginChannel,
+			"device":       c.deviceInfoB64(),
 		}
 	case "email":
 		endpoint = "/api/account/v2/login/email_code"
@@ -613,13 +601,11 @@ func (c *Client) LoginWithCode(ctx context.Context, kind, target, countryCode, c
 		payload = map[string]any{
 			"email":        target,
 			"code":         code,
-			"channel":      "pc",
-			"sceneType":    2,
-			"autoRegist":   true,
-			"device":       c.deviceInfoB64(),
-			"refer":        map[string]any{},
-			"isOversea":    isOversea,
+			"ext":          platformAESExt,
 			"businessLine": "bohrium",
+			"refer":        map[string]any{},
+			"channel":      DesktopLoginChannel,
+			"device":       c.deviceInfoB64(),
 		}
 	default:
 		return nil, fmt.Errorf("不支持的验证码登录类型: %s", kind)
@@ -694,12 +680,11 @@ func (c *Client) LoginWithPassword(ctx context.Context, account, password string
 	payload := map[string]any{
 		"account":      account,
 		"password":     encPW,
-		"channel":      "pc",
-		"sceneType":    2,
-		"device":       c.deviceInfoB64(),
 		"ext":          platformAESExt,
 		"businessLine": "bohrium",
 		"refer":        map[string]any{},
+		"channel":      DesktopLoginChannel,
+		"device":       c.deviceInfoB64(),
 	}
 	applyCaptchaProof(payload, captcha)
 
@@ -793,6 +778,13 @@ func (c *Client) CompleteLogin(ctx context.Context, rawToken, method string) (*s
 		Success: true,
 		Message: fmt.Sprintf("登录成功（方式: %s，用户: %s / UID %d）", method, nonEmpty(auth.Nickname, "Bohrium用户"), auth.UserID),
 	})
+	// Pre-checked best-effort claim for the one-time desktop client first-login benefit (10,000 photons).
+	// ClaimClientLoginPhotons never calls receive_photon unless client-activity confirms eligibility.
+	if ctx.Err() == nil {
+		bCtx, bCancel := context.WithTimeout(ctx, 5*time.Second)
+		_, _ = c.ClaimClientLoginPhotons(bCtx, "login")
+		bCancel()
+	}
 	return &auth, nil
 }
 

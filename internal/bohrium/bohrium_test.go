@@ -1,16 +1,21 @@
 package bohrium
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +27,67 @@ import (
 	"bohrium-club-auto/internal/prompts"
 	"bohrium-club-auto/internal/store"
 )
+
+func TestMain(m *testing.M) {
+	if defTr, ok := http.DefaultTransport.(*http.Transport); ok {
+		origDial := defTr.DialContext
+		if origDial == nil {
+			d := &net.Dialer{Timeout: 5 * time.Second}
+			origDial = d.DialContext
+		}
+		defTr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				host = addr
+			}
+			host = strings.Trim(strings.TrimSpace(host), "[]")
+			ip := net.ParseIP(host)
+			if !strings.EqualFold(host, "localhost") && (ip == nil || !ip.IsLoopback()) {
+				return nil, fmt.Errorf("offline test guard blocked non-loopback network dial to %s", addr)
+			}
+			return origDial(ctx, network, addr)
+		}
+	}
+	os.Exit(m.Run())
+}
+
+func checkExactKeys(label string, gotKeys, wantKeys []string) string {
+	got := append([]string(nil), gotKeys...)
+	want := append([]string(nil), wantKeys...)
+	sort.Strings(got)
+	sort.Strings(want)
+	if len(got) != len(want) {
+		return fmt.Sprintf("%s: key count mismatch: got %v, want %v", label, got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return fmt.Sprintf("%s: keys mismatch: got %v, want %v", label, got, want)
+		}
+	}
+	return ""
+}
+
+func mapKeys(m map[string]any) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func queryKeys(q url.Values) []string {
+	if len(q) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(q))
+	for k := range q {
+		keys = append(keys, k)
+	}
+	return keys
+}
 
 func makeTestJWT(uid, orgID int64, exp time.Time) string {
 	hdr := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
@@ -133,7 +199,13 @@ func TestRunAllTasksIncludingDesktopClientAndImmediateCancel(t *testing.T) {
 		desktopExecOK      bool
 		desktopTraceMatch  bool
 		preflightTrace     string
+		schemaErrs         []string
 	)
+	addSchemaErr := func(msg string) {
+		if msg != "" {
+			schemaErrs = append(schemaErrs, msg)
+		}
+	}
 
 	var srvURL string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -158,24 +230,39 @@ func TestRunAllTasksIncludingDesktopClientAndImmediateCancel(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/models":
+			addSchemaErr(checkExactKeys("GET /models query", queryKeys(r.URL.Query()), []string{"tag"}))
+			if r.URL.Query().Get("tag") != SciXModelCatalogTag {
+				addSchemaErr(fmt.Sprintf("GET /models tag=%q want %q", r.URL.Query().Get("tag"), SciXModelCatalogTag))
+			}
 			mu.Unlock()
 			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"dspro-high","name":"DeepSeek-V4-Pro","api":"chat_completions","reasoning_effort":"high","reasoning_efforts":["low","high","max"],"presentation":{"visible":true,"default":true}}]}`))
 			return
 		case "/billing/preflight":
 			desktopPreflight = true
 			preflightTrace = r.Header.Get("traceparent")
+			var pfBody map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&pfBody)
+			addSchemaErr(checkExactKeys("POST /billing/preflight body", mapKeys(pfBody), []string{"model"}))
 			mu.Unlock()
 			_, _ = w.Write([]byte(`{"allowed":true}`))
 			return
 		case "/chat/completions":
 			desktopLLMCalls++
+			addSchemaErr(checkExactKeys("POST /chat/completions query", queryKeys(r.URL.Query()), nil))
 			var body map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&body)
+			addSchemaErr(checkExactKeys("POST /chat/completions body", mapKeys(body), []string{
+				"messages", "model", "reasoning_effort", "stream", "stream_options", "tools",
+			}))
+			addSchemaErr(checkExactKeys("POST /chat/completions stream_options", mapKeys(asMap(body["stream_options"])), []string{"include_usage"}))
 			desktopModel, _ = body["model"].(string)
 			if tools, ok := body["tools"].([]any); ok {
 				desktopToolCount = len(tools)
 			}
 			if msgs, ok := body["messages"].([]any); ok && len(msgs) >= 2 {
+				for idx, rawMsg := range msgs {
+					addSchemaErr(checkExactKeys(fmt.Sprintf("POST /chat/completions messages[%d]", idx), mapKeys(asMap(rawMsg)), []string{"content", "role"}))
+				}
 				if sys, ok := msgs[0].(map[string]any); ok {
 					content, _ := sys["content"].(string)
 					if strings.HasPrefix(content, "You are SciMaster,") && strings.Contains(content, "<environment_context>") {
@@ -185,6 +272,13 @@ func TestRunAllTasksIncludingDesktopClientAndImmediateCancel(t *testing.T) {
 			}
 			if rawExec := r.Header.Get(SciXExecutionHeader); rawExec != "" {
 				if dec, err := base64.RawURLEncoding.DecodeString(rawExec); err == nil {
+					var execMap map[string]any
+					if json.Unmarshal(dec, &execMap) == nil {
+						addSchemaErr(checkExactKeys("x-scix-execution", mapKeys(execMap), []string{
+							"callId", "purpose", "question", "recoveryAttempt", "rootRunId", "rootSessionId",
+							"runId", "scenario", "sessionCreatedAt", "sessionId", "storeId", "version",
+						}))
+					}
 					var ep SciXExecutionPayload
 					if json.Unmarshal(dec, &ep) == nil && ep.Version == 1 && ep.Scenario == "local_agent" && ep.Purpose == "agent" && ep.StoreID == st.StoreID() {
 						desktopExecOK = true
@@ -205,6 +299,7 @@ func TestRunAllTasksIncludingDesktopClientAndImmediateCancel(t *testing.T) {
 			<-r.Context().Done()
 			return
 		case "/api/plaza/tasks":
+			addSchemaErr(checkExactKeys("GET /api/plaza/tasks query", queryKeys(r.URL.Query()), nil))
 			if r.Header.Get(PlazaGatewayHeader) != PlazaGatewayProd {
 				mu.Unlock()
 				w.WriteHeader(http.StatusForbidden)
@@ -230,11 +325,18 @@ func TestRunAllTasksIncludingDesktopClientAndImmediateCancel(t *testing.T) {
 				},
 			})
 		case "/api/plaza/tasks/claim":
+			var claimBody map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&claimBody)
+			addSchemaErr(checkExactKeys("POST /api/plaza/tasks/claim body", mapKeys(claimBody), []string{"publisher"}))
 			claimedAll = true
 			_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
 		case "/bohrapi/v1/literature-sage/api/v1/folder/create":
+			var b map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			addSchemaErr(checkExactKeys("folder/create body", mapKeys(b), []string{"folderName", "parentId", "scene"}))
 			_, _ = w.Write([]byte(`{"code":0,"data":{"folderId":101}}`))
 		case "/bohrapi/v1/literature-sage/api/v1/file/multipart":
+			addSchemaErr(checkExactKeys("file/multipart query", queryKeys(r.URL.Query()), []string{"fileName", "md5", "parentId", "scene", "size"}))
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"code": 0,
 				"data": map[string]any{
@@ -245,16 +347,37 @@ func TestRunAllTasksIncludingDesktopClientAndImmediateCancel(t *testing.T) {
 				},
 			})
 		case "/api/upload/binary":
-			if r.Header.Get("X-Storage-Param") != "" {
+			if spRaw := r.Header.Get("X-Storage-Param"); spRaw != "" {
 				binaryUploaded = true
+				if dec, err := base64.StdEncoding.DecodeString(spRaw); err == nil {
+					var spMap map[string]any
+					if json.Unmarshal(dec, &spMap) == nil {
+						addSchemaErr(checkExactKeys("X-Storage-Param", mapKeys(spMap), []string{"option", "path"}))
+						addSchemaErr(checkExactKeys("X-Storage-Param.option", mapKeys(asMap(spMap["option"])), []string{"contentDisposition", "contentType"}))
+					}
+				}
 			}
 			_, _ = w.Write([]byte(`{"ok":true}`))
 		case "/bohrapi/v1/literature-sage/api/v1/file/submit":
+			var b map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			addSchemaErr(checkExactKeys("file/submit body", mapKeys(b), []string{"fileName", "md5", "mimeType", "parentId", "scene", "size", "url"}))
 			_, _ = w.Write([]byte(`{"code":0,"data":{"userResourceId":"res-888"}}`))
 		case "/api/v1/scix/reader/entries":
+			var b map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			addSchemaErr(checkExactKeys("reader/entries body", mapKeys(b), []string{"entries"}))
+			if entries, ok := b["entries"].([]any); ok && len(entries) > 0 {
+				e0 := asMap(entries[0])
+				addSchemaErr(checkExactKeys("reader/entries[0]", mapKeys(e0), []string{"source"}))
+				addSchemaErr(checkExactKeys("reader/entries[0].source", mapKeys(asMap(e0["source"])), []string{"kind", "userResourceId"}))
+			}
 			_, _ = w.Write([]byte(`{"code":0,"data":{"results":[{"index":0,"code":0,"entry":{"id":"entry-777","preparation":{"status":"ready"}}}]}}`))
 		case "/api/v1/scix/reader/entries/entry-777/document":
 			if r.Method == http.MethodPost {
+				var b map[string]any
+				_ = json.NewDecoder(r.Body).Decode(&b)
+				addSchemaErr(checkExactKeys("reader/document body", mapKeys(b), nil))
 				_, _ = w.Write([]byte(`{"code":0,"data":{"kind":"ready"}}`))
 				mu.Unlock()
 				return
@@ -262,6 +385,19 @@ func TestRunAllTasksIncludingDesktopClientAndImmediateCancel(t *testing.T) {
 			_, _ = w.Write([]byte(`{"code":0,"data":{"kind":"upgrade_required"}}`))
 		case "/api/v1/chat":
 			chatCalls++
+			addSchemaErr(checkExactKeys("POST /api/v1/chat query", queryKeys(r.URL.Query()), []string{"historyCapabilities"}))
+			var b map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			if _, isReader := b["readerEntryId"]; isReader {
+				addSchemaErr(checkExactKeys("POST /api/v1/chat(reader) body", mapKeys(b), []string{
+					"clientTimeZone", "invocationRequestId", "queryId", "readerEntryId", "text",
+				}))
+			} else {
+				addSchemaErr(checkExactKeys("POST /api/v1/chat(team) body", mapKeys(b), []string{
+					"clientTimeZone", "invocationRequestId", "queryId", "target", "text",
+				}))
+				addSchemaErr(checkExactKeys("POST /api/v1/chat(team) target", mapKeys(asMap(b["target"])), []string{"kind", "teamId"}))
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"workflowId": "wf-" + string(rune('0'+chatCalls)),
 				"sessionId":  "sess-1",
@@ -270,13 +406,26 @@ func TestRunAllTasksIncludingDesktopClientAndImmediateCancel(t *testing.T) {
 		case "/api/v1/query-events":
 			var body map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&body)
+			addSchemaErr(checkExactKeys("POST /api/v1/query-events body", mapKeys(body), []string{
+				"eventKey", "orgId", "queryId", "queryTime", "task_key", "userId",
+			}))
 			if tk, ok := body["task_key"].(string); ok {
 				reportedKeys[tk] = true
 			}
 			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "/bohrapi/v1/sigma-search/api/v1/scix/membership/client-activity":
+			addSchemaErr(checkExactKeys("client-activity query", queryKeys(r.URL.Query()), []string{"channel"}))
+			if r.URL.Query().Get("channel") != DesktopLoginChannel {
+				addSchemaErr(fmt.Sprintf("client-activity channel=%q want %q", r.URL.Query().Get("channel"), DesktopLoginChannel))
+			}
+			_, _ = w.Write([]byte(`{"code":0,"data":{"newUserBenefitWithinPeriod":false,"newUserBenefitFirstLogin":false,"hasOldActivityLogin":true}}`))
 		default:
 			if strings.HasPrefix(r.URL.Path, "/api/v1/chat/") && strings.HasSuffix(r.URL.Path, "/cancel") {
 				cancelCalls++
+				addSchemaErr(checkExactKeys("POST /api/v1/chat/*/cancel query", queryKeys(r.URL.Query()), nil))
+				var b map[string]any
+				_ = json.NewDecoder(r.Body).Decode(&b)
+				addSchemaErr(checkExactKeys("POST /api/v1/chat/*/cancel body", mapKeys(b), []string{"source"}))
 				_, _ = w.Write([]byte(`{"durationMs":120}`))
 				mu.Unlock()
 				return
@@ -321,11 +470,16 @@ func TestRunAllTasksIncludingDesktopClientAndImmediateCancel(t *testing.T) {
 	gotDesktopExecOK := desktopExecOK
 	gotDesktopTraceMatch := desktopTraceMatch
 	gotBinaryUploaded := binaryUploaded
+	gotSchemaErrs := append([]string(nil), schemaErrs...)
 	gotReportedKeys := make(map[string]bool, len(reportedKeys))
 	for k, v := range reportedKeys {
 		gotReportedKeys[k] = v
 	}
 	mu.Unlock()
+
+	if len(gotSchemaErrs) > 0 {
+		t.Fatalf("strict request schema mismatches:\n%s", strings.Join(gotSchemaErrs, "\n"))
+	}
 
 	if gotDeprecatedHit {
 		t.Fatalf("deprecated /integral_receive endpoint MUST NOT be called")
@@ -920,7 +1074,7 @@ func TestPrepareCaptchaAndLoginWithProof(t *testing.T) {
 		t.Fatalf("expected skip=true for exempt account, got %+v err=%v", prepSkip, err)
 	}
 
-	// 3. SendVerifyCode forwards user-completed Tencent Captcha proof, Content-Language, channel="pc"
+	// 3. SendVerifyCode forwards user-completed Tencent Captcha proof, Content-Language, channel="scix-desktop"
 	proof := &CaptchaProof{Ticket: "t03-user-ticket", RandStr: "@ab12", CaptchaAppID: DefaultTencentCaptchaAppID}
 	if err := cli.SendVerifyCode(context.Background(), "email", "user@example.org", "", true, proof); err != nil {
 		t.Fatalf("SendVerifyCode(email): %v", err)
@@ -929,7 +1083,7 @@ func TestPrepareCaptchaAndLoginWithProof(t *testing.T) {
 	gotSend := lastSendPayload
 	gotLang := lastSendLang
 	mu.Unlock()
-	if asString(gotSend["ticket"]) != "t03-user-ticket" || asString(gotSend["randStr"]) != "@ab12" || asInt64(gotSend["captchaAppId"]) != DefaultTencentCaptchaAppID || asString(gotSend["channel"]) != "pc" || !asBool(gotSend["isOversea"]) || gotLang != "en-us" {
+	if asString(gotSend["ticket"]) != "t03-user-ticket" || asString(gotSend["randStr"]) != "@ab12" || asInt64(gotSend["captchaAppId"]) != DefaultTencentCaptchaAppID || asString(gotSend["channel"]) != DesktopLoginChannel || !asBool(gotSend["isOversea"]) || gotLang != "en-us" {
 		t.Fatalf("SendVerifyCode did not forward expected fields: payload=%+v lang=%q", gotSend, gotLang)
 	}
 
@@ -1198,4 +1352,644 @@ func TestGetSciXModelCatalogRetryAndSharedFallback(t *testing.T) {
 	if catWarmed, err := mgr2.ForAccount(accC.ID).GetSciXModelCatalog(ctx, false); err != nil || len(catWarmed.Data) != 1 {
 		t.Fatalf("expected cold account to survive via warmed sharedCatalog, got err=%v cat=%+v", err, catWarmed)
 	}
+}
+
+func assertExactJSONKeys(t *testing.T, label string, payload map[string]any, expected []string) {
+	t.Helper()
+	got := make([]string, 0, len(payload))
+	for k := range payload {
+		got = append(got, k)
+	}
+	want := append([]string(nil), expected...)
+	sort.Strings(got)
+	sort.Strings(want)
+	if len(got) != len(want) {
+		t.Fatalf("%s: JSON key count mismatch: got %v, want %v (payload=%+v)", label, got, want, payload)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("%s: JSON keys mismatch: got %v, want %v (payload=%+v)", label, got, want, payload)
+		}
+	}
+}
+
+func assertExactQueryKeys(t *testing.T, label string, q url.Values, expected []string) {
+	t.Helper()
+	got := make([]string, 0, len(q))
+	for k := range q {
+		got = append(got, k)
+	}
+	want := append([]string(nil), expected...)
+	sort.Strings(got)
+	sort.Strings(want)
+	if len(got) != len(want) {
+		t.Fatalf("%s: query key count mismatch: got %v, want %v", label, got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("%s: query keys mismatch: got %v, want %v", label, got, want)
+		}
+	}
+}
+
+func makeTypedTestJWT(userID, orgID int64, userType string, exp time.Time) string {
+	hdr := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	idMap := map[string]any{
+		"userId": userID,
+		"orgId":  orgID,
+	}
+	if userType != "" {
+		idMap["userType"] = userType
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"exp":      exp.Unix(),
+		"identity": idMap,
+	})
+	return hdr + "." + base64.RawURLEncoding.EncodeToString(payload) + ".sig"
+}
+
+func TestDesktopChannelLoginStrictRequestSchemas(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("BOHRIUM_DATA_DIR", tmp)
+	cfgMgr, _ := config.Load()
+	st, _ := store.Open(tmp)
+	t.Cleanup(func() { _ = st.Close() })
+
+	tok := makeTypedTestJWT(501, 601, "bohrVersion", time.Now().Add(24*time.Hour))
+
+	type capturedReq struct {
+		Method  string
+		Path    string
+		Query   url.Values
+		Headers http.Header
+		Body    map[string]any
+	}
+	var (
+		mu         sync.Mutex
+		skipUser   = true
+		captured   []capturedReq
+		schemaErrs []string
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var bodyMap map[string]any
+		rawBody, _ := io.ReadAll(r.Body)
+		if len(bytes.TrimSpace(rawBody)) > 0 {
+			if err := json.Unmarshal(rawBody, &bodyMap); err != nil {
+				mu.Lock()
+				schemaErrs = append(schemaErrs, fmt.Sprintf("expected JSON body for %s %s: %v (raw=%s)", r.Method, r.URL.Path, err, string(rawBody)))
+				mu.Unlock()
+			}
+		}
+		mu.Lock()
+		captured = append(captured, capturedReq{
+			Method:  r.Method,
+			Path:    r.URL.Path,
+			Query:   r.URL.Query(),
+			Headers: r.Header.Clone(),
+			Body:    bodyMap,
+		})
+		curSkip := skipUser
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/account/wechat/login_qrcode":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"sceneId":"sc-1","qrCode":"https://qr.example/1"}}`))
+		case "/api/account/wechat/qr_code/check_login_status":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"status":1}}`))
+		case "/api/oauth/verify", "/api/account/v2/login/phone_code", "/api/account/v2/login/email_code", "/api/account/v3/login", "/platform-gateway/v1/account/refresh_token":
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"token": tok}})
+		case "/api/account/code/send_by_phone_v3", "/api/account/code/send_by_email_v3":
+			_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
+		case "/api/captcha/check_user":
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"skip": curSkip}})
+		case "/api/captcha/encrypt_appid":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"signAppIdStr":"enc-aid-1"}}`))
+		case "/bohrapi/v1/account/info":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"userId":501,"orgId":601,"name":"DesktopLoginUser"}}`))
+		case "/api/platform/session":
+			_, _ = w.Write([]byte(`{"logged_in":true,"binding":{"nickname":"DesktopLoginUser"}}`))
+		case "/bohrapi/v1/sigma-search/api/v1/scix/membership/client-activity":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"newUserBenefitWithinPeriod":true,"newUserBenefitFirstLogin":false,"hasOldActivityLogin":true}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	httpCli, _ := chromehttp.New(chromehttp.Options{})
+	cli := NewClient(httpCli, cfgMgr, st)
+	cli.SetEndpoints(Endpoints{
+		ClubBase:     srv.URL,
+		PlatformBase: srv.URL,
+		WWWBase:      srv.URL,
+	})
+
+	lastByPath := func(path string) capturedReq {
+		mu.Lock()
+		defer mu.Unlock()
+		for i := len(captured) - 1; i >= 0; i-- {
+			if captured[i].Path == path {
+				return captured[i]
+			}
+		}
+		t.Fatalf("no request recorded for path %s", path)
+		return capturedReq{}
+	}
+
+	ctx := context.Background()
+
+	// 0. StartWeChatQR: exact query ["refer"] == "{}" and empty body
+	if _, err := cli.StartWeChatQR(ctx); err != nil {
+		t.Fatalf("StartWeChatQR: %v", err)
+	}
+	qrStart := lastByPath("/api/account/wechat/login_qrcode")
+	assertExactQueryKeys(t, "StartWeChatQR query", qrStart.Query, []string{"refer"})
+	if qrStart.Query.Get("refer") != "{}" || qrStart.Body != nil {
+		t.Fatalf("StartWeChatQR unexpected query/body: query=%v body=%+v", qrStart.Query, qrStart.Body)
+	}
+
+	// 1. WeChat QR Poll: strict query fields & device JSON schema
+	if _, err := cli.PollWeChatQR(ctx, "scene-xyz"); err != nil {
+		t.Fatalf("PollWeChatQR: %v", err)
+	}
+	qrReq := lastByPath("/api/account/wechat/qr_code/check_login_status")
+	assertExactQueryKeys(t, "PollWeChatQR", qrReq.Query, []string{"channel", "device", "sceneId"})
+	if qrReq.Query.Get("channel") != DesktopLoginChannel || qrReq.Query.Get("sceneId") != "scene-xyz" {
+		t.Fatalf("PollWeChatQR unexpected query values: %v", qrReq.Query)
+	}
+	devRaw, err := base64.StdEncoding.DecodeString(qrReq.Query.Get("device"))
+	if err != nil {
+		t.Fatalf("decode PollWeChatQR device param: %v", err)
+	}
+	var devMap map[string]any
+	if err := json.Unmarshal(devRaw, &devMap); err != nil {
+		t.Fatalf("unmarshal PollWeChatQR device JSON: %v", err)
+	}
+	assertExactJSONKeys(t, "PollWeChatQR.device", devMap, []string{"memory", "screenInfo", "userAgent"})
+	assertExactJSONKeys(t, "PollWeChatQR.device.screenInfo", asMap(devMap["screenInfo"]), []string{"height", "with"})
+
+	// 2. PrepareCaptcha ("password", skip=false): strict check_user & encrypt_appid schemas
+	mu.Lock()
+	skipUser = false
+	mu.Unlock()
+	prep, err := cli.PrepareCaptcha(ctx, "password", "a@example.com")
+	if err != nil || prep.Skip || prep.AidEncrypted != "enc-aid-1" {
+		t.Fatalf("PrepareCaptcha: err=%v prep=%+v", err, prep)
+	}
+	chkReq := lastByPath("/api/captcha/check_user")
+	assertExactJSONKeys(t, "PrepareCaptcha check_user", chkReq.Body, []string{"account"})
+	encReq := lastByPath("/api/captcha/encrypt_appid")
+	assertExactJSONKeys(t, "PrepareCaptcha encrypt_appid", encReq.Body, []string{"captchaAppId"})
+	mu.Lock()
+	skipUser = true
+	mu.Unlock()
+
+	// 3. OAuth Verify: strict JSON fields & channel="scix-desktop"
+	if _, err := cli.VerifyOAuthCallback(ctx, "google", "https://login.bohrium.com/?code=abc&state=st1"); err != nil {
+		t.Fatalf("VerifyOAuthCallback: %v", err)
+	}
+	oauthReq := lastByPath("/api/oauth/verify")
+	assertExactQueryKeys(t, "VerifyOAuthCallback query", oauthReq.Query, nil)
+	assertExactJSONKeys(t, "VerifyOAuthCallback body", oauthReq.Body, []string{
+		"businessLine", "channel", "code", "isOversea", "method", "refer", "state", "type",
+	})
+	if asString(oauthReq.Body["channel"]) != DesktopLoginChannel {
+		t.Fatalf("VerifyOAuthCallback channel=%q want %q", asString(oauthReq.Body["channel"]), DesktopLoginChannel)
+	}
+
+	// 4. SendVerifyCode (phone, without & with captcha proof)
+	if err := cli.SendVerifyCode(ctx, "phone", "13800138000", "86", false, nil); err != nil {
+		t.Fatalf("SendVerifyCode(phone): %v", err)
+	}
+	sendPhone := lastByPath("/api/account/code/send_by_phone_v3")
+	assertExactJSONKeys(t, "SendVerifyCode(phone)", sendPhone.Body, []string{
+		"Version", "businessLine", "captchaSceneId", "channel", "phone", "sceneType", "tokenKey",
+	})
+	if asString(sendPhone.Body["channel"]) != DesktopLoginChannel || asString(sendPhone.Body["phone"]) != "+8613800138000" {
+		t.Fatalf("unexpected sendPhone payload: %+v", sendPhone.Body)
+	}
+	proof := &CaptchaProof{Ticket: "t-1", RandStr: "@r-1", CaptchaAppID: DefaultTencentCaptchaAppID}
+	if err := cli.SendVerifyCode(ctx, "phone", "13800138000", "86", false, proof); err != nil {
+		t.Fatalf("SendVerifyCode(phone+proof): %v", err)
+	}
+	sendPhoneProof := lastByPath("/api/account/code/send_by_phone_v3")
+	assertExactJSONKeys(t, "SendVerifyCode(phone+proof)", sendPhoneProof.Body, []string{
+		"Version", "businessLine", "captchaAppId", "captchaSceneId", "channel", "phone", "randStr", "sceneType", "ticket", "tokenKey",
+	})
+
+	// 5. SendVerifyCode (email, without & with captcha proof)
+	if err := cli.SendVerifyCode(ctx, "email", "a@example.com", "", false, nil); err != nil {
+		t.Fatalf("SendVerifyCode(email): %v", err)
+	}
+	sendEmail := lastByPath("/api/account/code/send_by_email_v3")
+	assertExactJSONKeys(t, "SendVerifyCode(email)", sendEmail.Body, []string{
+		"businessLine", "channel", "email", "isOversea", "sceneType", "tokenKey",
+	})
+	if asString(sendEmail.Body["channel"]) != DesktopLoginChannel {
+		t.Fatalf("unexpected sendEmail channel: %+v", sendEmail.Body)
+	}
+	if err := cli.SendVerifyCode(ctx, "email", "a@example.com", "", true, proof); err != nil {
+		t.Fatalf("SendVerifyCode(email+proof): %v", err)
+	}
+	sendEmailProof := lastByPath("/api/account/code/send_by_email_v3")
+	assertExactJSONKeys(t, "SendVerifyCode(email+proof)", sendEmailProof.Body, []string{
+		"businessLine", "captchaAppId", "channel", "email", "isOversea", "randStr", "sceneType", "ticket", "tokenKey",
+	})
+
+	// 6. LoginWithCode (phone): exact 7 fields (no sceneType/isOversea)
+	if _, err := cli.LoginWithCode(ctx, "phone", "13800138000", "86", "123456", false); err != nil {
+		t.Fatalf("LoginWithCode(phone): %v", err)
+	}
+	phoneLogin := lastByPath("/api/account/v2/login/phone_code")
+	assertExactJSONKeys(t, "LoginWithCode(phone)", phoneLogin.Body, []string{
+		"autoRegist", "businessLine", "channel", "device", "phone", "phoneCode", "refer",
+	})
+	if asString(phoneLogin.Body["channel"]) != DesktopLoginChannel || !asBool(phoneLogin.Body["autoRegist"]) {
+		t.Fatalf("unexpected phoneLogin payload: %+v", phoneLogin.Body)
+	}
+
+	// 7. LoginWithCode (email): exact 7 fields (with ext, no autoRegist/sceneType/isOversea)
+	if _, err := cli.LoginWithCode(ctx, "email", "a@example.com", "", "654321", true); err != nil {
+		t.Fatalf("LoginWithCode(email): %v", err)
+	}
+	emailLogin := lastByPath("/api/account/v2/login/email_code")
+	assertExactJSONKeys(t, "LoginWithCode(email)", emailLogin.Body, []string{
+		"businessLine", "channel", "code", "device", "email", "ext", "refer",
+	})
+	if asString(emailLogin.Body["channel"]) != DesktopLoginChannel || asString(emailLogin.Body["ext"]) != platformAESExt {
+		t.Fatalf("unexpected emailLogin payload: %+v", emailLogin.Body)
+	}
+
+	// 8. LoginWithPassword (exempt skip=true, no proof): exact 7 fields (no sceneType)
+	if _, err := cli.LoginWithPassword(ctx, "a@example.com", "pw123456", nil); err != nil {
+		t.Fatalf("LoginWithPassword(no proof): %v", err)
+	}
+	pwNoProof := lastByPath("/api/account/v3/login")
+	assertExactJSONKeys(t, "LoginWithPassword(no proof)", pwNoProof.Body, []string{
+		"account", "businessLine", "channel", "device", "ext", "password", "refer",
+	})
+	if asString(pwNoProof.Body["channel"]) != DesktopLoginChannel || asString(pwNoProof.Body["ext"]) != platformAESExt {
+		t.Fatalf("unexpected pwNoProof payload: %+v", pwNoProof.Body)
+	}
+
+	// 9. LoginWithPassword (with proof): exact 10 fields
+	if _, err := cli.LoginWithPassword(ctx, "a@example.com", "pw123456", proof); err != nil {
+		t.Fatalf("LoginWithPassword(with proof): %v", err)
+	}
+	pwProof := lastByPath("/api/account/v3/login")
+	assertExactJSONKeys(t, "LoginWithPassword(with proof)", pwProof.Body, []string{
+		"account", "businessLine", "captchaAppId", "channel", "device", "ext", "password", "randStr", "refer", "ticket",
+	})
+
+	// 10. RefreshToken: exact JSON keys ["businessLine", "token"]
+	if _, err := cli.RefreshToken(ctx, "manual"); err != nil {
+		t.Fatalf("RefreshToken: %v", err)
+	}
+	refReq := lastByPath("/platform-gateway/v1/account/refresh_token")
+	assertExactQueryKeys(t, "RefreshToken query", refReq.Query, nil)
+	assertExactJSONKeys(t, "RefreshToken body", refReq.Body, []string{"businessLine", "token"})
+	if asString(refReq.Body["businessLine"]) != "bohrium" || asString(refReq.Body["token"]) != tok {
+		t.Fatalf("unexpected RefreshToken body: %+v", refReq.Body)
+	}
+
+	mu.Lock()
+	gotSchemaErrs := append([]string(nil), schemaErrs...)
+	mu.Unlock()
+	if len(gotSchemaErrs) > 0 {
+		t.Fatalf("handler decode errors:\n%s", strings.Join(gotSchemaErrs, "\n"))
+	}
+}
+
+func TestClientLoginBenefitStrictStatusGateAndSchema(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("BOHRIUM_DATA_DIR", tmp)
+	cfgMgr, _ := config.Load()
+	st, _ := store.Open(tmp)
+	t.Cleanup(func() { _ = st.Close() })
+
+	var (
+		mu                  sync.Mutex
+		withinPeriod        = true
+		firstLogin          = true
+		hasOldActivityLogin = false
+		activityCalls       int
+		receiveCalls        int
+		lastActivityQuery   url.Values
+		lastReceiveBody     map[string]any
+		lastReceiveHeaders  http.Header
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/bohrapi/v1/sigma-search/api/v1/scix/membership/client-activity":
+			activityCalls++
+			lastActivityQuery = r.URL.Query()
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 0,
+				"data": map[string]any{
+					"newUserBenefitWithinPeriod": withinPeriod,
+					"newUserBenefitFirstLogin":   firstLogin,
+					"hasOldActivityLogin":        hasOldActivityLogin,
+				},
+			})
+		case "/platform-gateway/v1/membership/receive_photon":
+			receiveCalls++
+			lastReceiveHeaders = r.Header.Clone()
+			rawBody, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(rawBody, &lastReceiveBody)
+			hasOldActivityLogin = true
+			firstLogin = false
+			_, _ = w.Write([]byte(`{"code":0,"data":{"claimed":true}}`))
+		case "/bohrapi/v1/account/info":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"userId":801,"orgId":901,"name":"BenefitUser"}}`))
+		case "/api/platform/session":
+			_, _ = w.Write([]byte(`{"logged_in":true,"binding":{"nickname":"BenefitUser"}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	httpCli, _ := chromehttp.New(chromehttp.Options{})
+	cli := NewClient(httpCli, cfgMgr, st)
+	// PlatformGatewayBase intentionally omitted to verify automatic WWWBase fallback in offline tests.
+	cli.SetEndpoints(Endpoints{
+		ClubBase:     srv.URL,
+		PlatformBase: srv.URL,
+		WWWBase:      srv.URL,
+	})
+
+	personalTok := makeTypedTestJWT(801, 901, "bohrVersion", time.Now().Add(24*time.Hour))
+	if err := st.SetAuth(store.AuthState{Token: personalTok, UserID: 801, OrgID: 901}); err != nil {
+		t.Fatalf("SetAuth: %v", err)
+	}
+
+	// 1. Eligible personal user checks client-activity first, then posts exact {"eventSubject":"client_register"}.
+	ctx := context.Background()
+	res, err := cli.ClaimClientLoginPhotons(ctx, "manual")
+	if err != nil {
+		t.Fatalf("ClaimClientLoginPhotons(eligible): %v", err)
+	}
+	if !res.Success || !res.Claimed || res.RewardPhotons != 10000 || res.ValidDays != 90 {
+		t.Fatalf("unexpected claim result: %+v", res)
+	}
+	mu.Lock()
+	assertExactQueryKeys(t, "client-activity query", lastActivityQuery, []string{"channel"})
+	if lastActivityQuery.Get("channel") != DesktopLoginChannel {
+		t.Fatalf("unexpected channel query: %v", lastActivityQuery)
+	}
+	assertExactJSONKeys(t, "receive_photon payload", lastReceiveBody, []string{"eventSubject"})
+	if asString(lastReceiveBody["eventSubject"]) != ClientLoginBenefitEventSubject {
+		t.Fatalf("unexpected eventSubject: %+v", lastReceiveBody)
+	}
+	if lastReceiveHeaders.Get("X-Bohrium-Platform") != "web" || lastReceiveHeaders.Get("Authorization") != "Bearer "+personalTok {
+		t.Fatalf("unexpected receive_photon headers: %+v", lastReceiveHeaders)
+	}
+	if activityCalls != 1 || receiveCalls != 1 {
+		t.Fatalf("expected 1 activity call and 1 receive call, got activity=%d receive=%d", activityCalls, receiveCalls)
+	}
+	mu.Unlock()
+
+	// 2. Second claim after already claimed MUST NOT call receive_photon at all.
+	res2, err := cli.ClaimClientLoginPhotons(ctx, "manual")
+	if err != nil || res2.Claimed || !res2.Skipped || !res2.AlreadyClaimed {
+		t.Fatalf("expected skipped alreadyClaimed result, got %+v err=%v", res2, err)
+	}
+	mu.Lock()
+	if receiveCalls != 1 {
+		t.Fatalf("receive_photon must not be called when already claimed, got receiveCalls=%d", receiveCalls)
+	}
+	// 3. Out of period MUST NOT call receive_photon even when firstLogin=true.
+	withinPeriod = false
+	firstLogin = true
+	hasOldActivityLogin = false
+	mu.Unlock()
+	res3, err := cli.ClaimClientLoginPhotons(ctx, "manual")
+	if err != nil || res3.Claimed || !res3.Skipped {
+		t.Fatalf("expected out-of-period skip, got %+v err=%v", res3, err)
+	}
+	mu.Lock()
+	if receiveCalls != 1 {
+		t.Fatalf("receive_photon must not be called out of period, got receiveCalls=%d", receiveCalls)
+	}
+	// 4. Org/team account ("teamVersion") MUST NOT call receive_photon even if server flags are all eligible.
+	withinPeriod = true
+	firstLogin = true
+	hasOldActivityLogin = false
+	mu.Unlock()
+	teamTok := makeTypedTestJWT(802, 902, "teamVersion", time.Now().Add(24*time.Hour))
+	teamAcc, _, err := st.UpsertAccountFromAuth(store.AuthState{Token: teamTok, UserID: 802, OrgID: 902}, "TeamAccount")
+	if err != nil {
+		t.Fatalf("UpsertAccountFromAuth(team): %v", err)
+	}
+	mgr := NewManager(httpCli, cfgMgr, st)
+	mgr.SetEndpoints(Endpoints{
+		ClubBase:     srv.URL,
+		PlatformBase: srv.URL,
+		WWWBase:      srv.URL,
+	})
+	teamCli := mgr.ForAccount(teamAcc.ID)
+	res4, err := teamCli.ClaimClientLoginPhotons(ctx, "manual")
+	if err != nil || res4.Claimed || !res4.Skipped || res4.Status == nil || res4.Status.PersonalAccount {
+		t.Fatalf("expected team account skip with PersonalAccount=false, got %+v err=%v", res4, err)
+	}
+	mu.Lock()
+	if receiveCalls != 1 {
+		t.Fatalf("receive_photon must not be called for non-personal account, got receiveCalls=%d", receiveCalls)
+	}
+	mu.Unlock()
+
+	// 5. CompleteLogin automatically checks client-activity and claims receive_photon when personal + eligible.
+	if _, err := cli.CompleteLogin(ctx, personalTok, "test"); err != nil {
+		t.Fatalf("CompleteLogin: %v", err)
+	}
+	mu.Lock()
+	gotReceiveAfterLogin := receiveCalls
+	mu.Unlock()
+	if gotReceiveAfterLogin != 2 {
+		t.Fatalf("expected CompleteLogin to auto-claim eligible client login benefit, got receiveCalls=%d", gotReceiveAfterLogin)
+	}
+}
+
+func TestTaskPreExecutionStatusGateStrictSchema(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("BOHRIUM_DATA_DIR", tmp)
+	cfgMgr, _ := config.Load()
+	_, _ = cfgMgr.Update(func(c *config.Config) error {
+		c.TaskDelaySec = 0
+		return nil
+	})
+	st, _ := store.Open(tmp)
+	t.Cleanup(func() { _ = st.Close() })
+
+	tok := makeTypedTestJWT(950, 951, "bohrVersion", time.Now().Add(24*time.Hour))
+	if err := st.SetAuth(store.AuthState{Token: tok, UserID: 950, OrgID: 951}); err != nil {
+		t.Fatalf("SetAuth: %v", err)
+	}
+
+	var (
+		mu              sync.Mutex
+		taskStatus      = 1
+		claimAdvances   = false
+		listCalls       int
+		claimCalls      int
+		chatCalls       int
+		lastClaimBody   map[string]any
+		lastChatQuery   url.Values
+		lastChatBody    map[string]any
+		lastCancelQuery url.Values
+		lastCancelBody  map[string]any
+		lastTaskQuery   url.Values
+		lastEventBody   map[string]any
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/plaza/tasks":
+			listCalls++
+			lastTaskQuery = r.URL.Query()
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 0,
+				"data": map[string]any{
+					"taskDate": "2026-11-27",
+					"list": []map[string]any{
+						{"id": 1, "taskKey": "bohrium_science_space_web", "titleZh": "体验玻尔科学空间「Web端」", "rewardAmount": 1000, "status": taskStatus},
+					},
+				},
+			})
+		case r.URL.Path == "/api/plaza/tasks/claim":
+			claimCalls++
+			raw, _ := io.ReadAll(r.Body)
+			var b map[string]any
+			_ = json.Unmarshal(raw, &b)
+			lastClaimBody = b
+			if claimAdvances {
+				taskStatus = 0
+			}
+			_, _ = w.Write([]byte(`{"code":0,"data":{"claimedCount":1}}`))
+		case r.URL.Path == "/api/v1/chat":
+			chatCalls++
+			lastChatQuery = r.URL.Query()
+			raw, _ := io.ReadAll(r.Body)
+			var b map[string]any
+			_ = json.Unmarshal(raw, &b)
+			lastChatBody = b
+			_, _ = w.Write([]byte(`{"workflowId":"wf-gate-1","sessionId":"sess-gate-1","queryId":"q-gate-1"}`))
+		case r.URL.Path == "/api/v1/query-events":
+			raw, _ := io.ReadAll(r.Body)
+			var b map[string]any
+			_ = json.Unmarshal(raw, &b)
+			lastEventBody = b
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case strings.HasPrefix(r.URL.Path, "/api/v1/chat/") && strings.HasSuffix(r.URL.Path, "/cancel"):
+			lastCancelQuery = r.URL.Query()
+			raw, _ := io.ReadAll(r.Body)
+			var b map[string]any
+			_ = json.Unmarshal(raw, &b)
+			lastCancelBody = b
+			_, _ = w.Write([]byte(`{"durationMs":25}`))
+		case r.URL.Path == "/bohrapi/v1/sigma-search/api/v1/scix/membership/client-activity":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"newUserBenefitWithinPeriod":false,"newUserBenefitFirstLogin":false,"hasOldActivityLogin":true}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	httpCli, _ := chromehttp.New(chromehttp.Options{})
+	cli := NewClient(httpCli, cfgMgr, st)
+	cli.SetEndpoints(Endpoints{
+		ClubBase:     srv.URL,
+		PlatformBase: srv.URL,
+		WWWBase:      srv.URL,
+		SBCloudBase:  srv.URL,
+		AgentBase:    srv.URL,
+		SigmaLLMBase: srv.URL,
+	})
+	ctx := context.Background()
+
+	// 1. Unknown taskKey NOT in live ListDailyTasks MUST be rejected without calling /api/v1/chat.
+	resMissing, err := cli.ExecuteSingleTask(ctx, "non_existent_task", "manual")
+	if err != nil || !resMissing.Skipped || resMissing.Success || chatCalls != 0 {
+		t.Fatalf("expected missing task rejection without chat call, got res=%+v err=%v chatCalls=%d", resMissing, err, chatCalls)
+	}
+
+	// 2. Completed task (status == 1) MUST NOT claim or execute.
+	resDone, err := cli.ExecuteSingleTask(ctx, TaskKeyScienceSpaceWeb, "manual")
+	if err != nil || !resDone.Skipped || !resDone.Success || claimCalls != 0 || chatCalls != 0 {
+		t.Fatalf("expected completed task skip without claim/chat, got res=%+v err=%v claim=%d chat=%d", resDone, err, claimCalls, chatCalls)
+	}
+
+	// 3. Unclaimed task (status == -1): autoClaim=false in RunAllWebTasks skips without claim/chat.
+	mu.Lock()
+	taskStatus = -1
+	claimAdvances = false
+	mu.Unlock()
+	runNoClaim, err := cli.RunAllWebTasks(ctx, "manual", false)
+	if err != nil || len(runNoClaim.Results) != 1 || !runNoClaim.Results[0].Skipped || runNoClaim.Results[0].Success || claimCalls != 0 || chatCalls != 0 {
+		t.Fatalf("expected autoClaim=false to skip status=-1 task, got %+v err=%v claim=%d chat=%d", runNoClaim, err, claimCalls, chatCalls)
+	}
+
+	// 4. Unclaimed task where claim returns OK but refreshed ListDailyTasks still stays status=-1 MUST refuse chat execution.
+	resSticky, err := cli.ExecuteSingleTask(ctx, TaskKeyScienceSpaceWeb, "manual")
+	if err != nil || !resSticky.Skipped || resSticky.Success || chatCalls != 0 || claimCalls == 0 {
+		t.Fatalf("expected sticky status=-1 after claim to abort execution, got res=%+v err=%v claim=%d chat=%d", resSticky, err, claimCalls, chatCalls)
+	}
+
+	// 5. Unclaimed task -> claim transitions status -1 -> 0 -> re-query confirms 0 -> executes with exact API schemas.
+	mu.Lock()
+	taskStatus = -1
+	claimAdvances = true
+	mu.Unlock()
+	resOK, err := cli.ExecuteSingleTask(ctx, TaskKeyScienceSpaceWeb, "manual")
+	if err != nil || !resOK.Success || resOK.Skipped || chatCalls != 1 {
+		t.Fatalf("expected claimed & confirmed status=0 task to execute cleanly, got res=%+v err=%v chat=%d", resOK, err, chatCalls)
+	}
+	mu.Lock()
+	assertExactQueryKeys(t, "ListDailyTasks", lastTaskQuery, nil)
+	assertExactJSONKeys(t, "ClaimTask", lastClaimBody, []string{"publisher", "taskKey"})
+	if asString(lastClaimBody["taskKey"]) != TaskKeyScienceSpaceWeb || asString(lastClaimBody["publisher"]) != PublisherCommunity {
+		t.Fatalf("unexpected ClaimTask body: %+v", lastClaimBody)
+	}
+	assertExactQueryKeys(t, "RunScienceSpaceWeb chat query", lastChatQuery, []string{"historyCapabilities"})
+	if lastChatQuery.Get("historyCapabilities") != HistoryCapabilitiesValue {
+		t.Fatalf("unexpected chat query: %v", lastChatQuery)
+	}
+	assertExactJSONKeys(t, "RunScienceSpaceWeb chat body", lastChatBody, []string{
+		"clientTimeZone", "invocationRequestId", "queryId", "target", "text",
+	})
+	assertExactJSONKeys(t, "RunScienceSpaceWeb chat target", asMap(lastChatBody["target"]), []string{
+		"kind", "teamId",
+	})
+	assertExactQueryKeys(t, "Cancel chat query", lastCancelQuery, nil)
+	assertExactJSONKeys(t, "Cancel chat body", lastCancelBody, []string{"source"})
+	if asString(lastCancelBody["source"]) != "api_request" {
+		t.Fatalf("unexpected cancel body: %+v", lastCancelBody)
+	}
+	assertExactJSONKeys(t, "QueryEvents", lastEventBody, []string{
+		"eventKey", "orgId", "queryId", "queryTime", "task_key", "userId",
+	})
+	if asString(lastEventBody["task_key"]) != TaskKeyScienceSpaceWeb || asInt64(lastEventBody["userId"]) != 950 || asInt64(lastEventBody["orgId"]) != 951 || asString(lastEventBody["queryId"]) != "q-gate-1" || asString(lastEventBody["eventKey"]) != "950:951:q-gate-1" {
+		t.Fatalf("unexpected query-events payload: %+v", lastEventBody)
+	}
+	mu.Unlock()
+
+	// 6. ClaimAllTasks exact JSON schema: ["publisher"] == PublisherCommunity
+	if _, err := cli.ClaimAllTasks(ctx, "manual"); err != nil {
+		t.Fatalf("ClaimAllTasks: %v", err)
+	}
+	mu.Lock()
+	assertExactJSONKeys(t, "ClaimAllTasks", lastClaimBody, []string{"publisher"})
+	if asString(lastClaimBody["publisher"]) != PublisherCommunity {
+		t.Fatalf("unexpected ClaimAllTasks body: %+v", lastClaimBody)
+	}
+	mu.Unlock()
 }

@@ -67,6 +67,30 @@ export interface AccountOverviewSummary {
   activeBindings: number
 }
 
+export interface ClientLoginBenefitStatus {
+  eligible: boolean
+  personalAccount: boolean
+  withinPeriod: boolean
+  firstLogin: boolean
+  hasOldActivityLogin: boolean
+  claimed: boolean
+  rewardPhotons: number
+  validDays: number
+  reason?: string
+  checkedAt?: string
+}
+
+export interface ClientLoginBenefitClaimResult {
+  success: boolean
+  claimed: boolean
+  alreadyClaimed?: boolean
+  skipped?: boolean
+  rewardPhotons: number
+  validDays: number
+  message: string
+  status?: ClientLoginBenefitStatus | null
+}
+
 export interface DailyTaskItem {
   taskKey: string
   actionKey?: string
@@ -217,6 +241,8 @@ export interface OverviewResponse {
   tasksError?: string
   assets?: PointsAndCapacity | null
   assetsError?: string
+  clientBenefit?: ClientLoginBenefitStatus | null
+  clientBenefitError?: string
   scheduler: SchedulerStatus
   activeJobs?: TaskJob[] | null
   promptStats: PromptStats

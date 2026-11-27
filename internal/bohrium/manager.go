@@ -64,6 +64,11 @@ func (m *Manager) SetEndpoints(ep Endpoints) {
 	if ep.SigmaLLMBase != "" {
 		m.endpoints.SigmaLLMBase = strings.TrimRight(ep.SigmaLLMBase, "/")
 	}
+	if ep.PlatformGatewayBase != "" {
+		m.endpoints.PlatformGatewayBase = strings.TrimRight(ep.PlatformGatewayBase, "/")
+	} else if ep.WWWBase != "" && m.endpoints.PlatformGatewayBase == DefaultPlatformGatewayBaseURL {
+		m.endpoints.PlatformGatewayBase = strings.TrimRight(ep.WWWBase, "/")
+	}
 	for _, cli := range m.clients {
 		cli.SetEndpoints(m.endpoints)
 	}

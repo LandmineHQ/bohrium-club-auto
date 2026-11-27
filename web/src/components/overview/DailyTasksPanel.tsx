@@ -9,7 +9,13 @@ import { Button } from "@/components/ui/button"
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { NativeSelect } from "@/components/ui/input"
 import { AlertBox } from "@/components/ui/table"
-import type { AccountSummaryView, DailyTasksResponse, TaskJob } from "@/types/console"
+import type {
+  AccountSummaryView,
+  ClientLoginBenefitClaimResult,
+  ClientLoginBenefitStatus,
+  DailyTasksResponse,
+  TaskJob,
+} from "@/types/console"
 
 interface DailyTasksPanelProps {
   accounts: AccountSummaryView[]
@@ -17,6 +23,8 @@ interface DailyTasksPanelProps {
   onSelectAccount: (id: string) => void
   tasks?: DailyTasksResponse | null
   tasksError?: string
+  clientBenefit?: ClientLoginBenefitStatus | null
+  clientBenefitError?: string
   activeJobs?: TaskJob[] | null
   onRefresh: () => Promise<void>
 }
@@ -27,6 +35,8 @@ export function DailyTasksPanel({
   onSelectAccount,
   tasks,
   tasksError,
+  clientBenefit,
+  clientBenefitError,
   activeJobs = [],
   onRefresh,
 }: DailyTasksPanelProps) {
@@ -143,6 +153,28 @@ export function DailyTasksPanel({
     }
   }
 
+  async function claimClientBenefit() {
+    if (!selectedAccountId) return toast.warning("请先添加账号")
+    setBusyKey("claim:client-benefit")
+    try {
+      const res = await apiRequest<{ data?: ClientLoginBenefitClaimResult }>(
+        `/api/accounts/${encodeURIComponent(selectedAccountId)}/benefits/client-login/claim`,
+        { method: "POST" }
+      )
+      const data = res.data
+      if (data?.claimed) {
+        toast.success(data.message || "已领取 10,000 光子客户端首登礼包")
+      } else {
+        toast.info(data?.message || "当前账号暂不可领取客户端首登礼包")
+      }
+      await onRefresh()
+    } catch (err) {
+      toast.error("领取客户端礼包失败: " + (err instanceof Error ? err.message : ""))
+    } finally {
+      setBusyKey("")
+    }
+  }
+
   return (
     <Card>
       <CardHeader>
@@ -195,6 +227,69 @@ export function DailyTasksPanel({
       {tasksError && (
         <div className="px-5 pt-4">
           <AlertBox variant="err">{tasksError}</AlertBox>
+        </div>
+      )}
+
+      {selectedAccountId && (clientBenefit || clientBenefitError) && (
+        <div className="border-b border-border bg-muted/20 px-5 py-3">
+          {clientBenefitError ? (
+            <AlertBox variant="warn">客户端首登礼包状态查询失败: {clientBenefitError}</AlertBox>
+          ) : clientBenefit ? (
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-[1fr_110px_90px_160px] sm:items-center">
+              <div className="flex items-start gap-3">
+                <span className="mt-0.5 rounded bg-amber-500/15 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-amber-700 dark:text-amber-300">
+                  一次性
+                </span>
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-xs font-semibold text-foreground">
+                      首次登录 Bohrium 客户端领光子（{clientBenefit.validDays || 90} 天有效）
+                    </span>
+                    <code className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                      bohrium_client_first_login
+                    </code>
+                  </div>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">
+                    {clientBenefit.reason ||
+                      "已完成 scix/membership/client-activity 前置校验，可触发客户端首登礼包领取"}
+                  </p>
+                </div>
+              </div>
+
+              <div className="text-xs font-semibold tabular-nums text-emerald-700 dark:text-emerald-400">
+                +{formatNum(clientBenefit.rewardPhotons || 10000)} 光子
+              </div>
+
+              <div>
+                {clientBenefit.eligible ? (
+                  <Badge variant="warn">可领取</Badge>
+                ) : clientBenefit.claimed ? (
+                  <Badge variant="ok">已领取</Badge>
+                ) : !clientBenefit.personalAccount ? (
+                  <Badge variant="muted">仅个人版</Badge>
+                ) : (
+                  <Badge variant="muted">不可领取</Badge>
+                )}
+              </div>
+
+              <div className="flex flex-wrap justify-start gap-1.5 sm:justify-end">
+                <Button
+                  variant={clientBenefit.eligible ? "default" : "outline"}
+                  size="xs"
+                  disabled={!clientBenefit.eligible || busyKey === "claim:client-benefit"}
+                  onClick={claimClientBenefit}
+                >
+                  {busyKey === "claim:client-benefit"
+                    ? "校验领取中..."
+                    : clientBenefit.eligible
+                      ? "领取首登礼包"
+                      : clientBenefit.claimed
+                        ? "已领取"
+                        : "不满足条件"}
+                </Button>
+              </div>
+            </div>
+          ) : null}
         </div>
       )}
 
@@ -276,10 +371,10 @@ export function DailyTasksPanel({
                       <Button
                         variant={t.status === 1 ? "outline" : "default"}
                         size="xs"
-                        disabled={running}
+                        disabled={running || t.status === 1}
                         onClick={() => runOne(t.taskKey)}
                       >
-                        {running ? "后台执行中..." : t.status === 1 ? "重新执行" : "手动执行"}
+                        {running ? "后台执行中..." : t.status === 1 ? "今日已完成" : "手动执行"}
                       </Button>
                     </>
                   )}

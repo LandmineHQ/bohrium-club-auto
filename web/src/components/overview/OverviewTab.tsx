@@ -111,6 +111,8 @@ export function OverviewTab({
         onSelectAccount={onSelectAccount}
         tasks={data?.tasks}
         tasksError={data?.tasksError}
+        clientBenefit={data?.clientBenefit}
+        clientBenefitError={data?.clientBenefitError}
         activeJobs={activeJobs}
         onRefresh={onRefreshAll}
       />
