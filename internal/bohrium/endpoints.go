@@ -88,6 +88,7 @@ type Client struct {
 	catalogCache     *SciXModelCatalog
 	catalogFetchedAt time.Time
 	catalogUserID    int64
+	sharedCatalog    *sharedCatalogCache
 
 	// Optional override for reader document status polling interval (tests only; defaults to 2s/3s).
 	readerPollInterval time.Duration

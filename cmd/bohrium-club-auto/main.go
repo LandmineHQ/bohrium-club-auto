@@ -103,6 +103,13 @@ func runServer() {
 			log.Printf("[boot] synced Bohrium profile/nickname for %d existing account(s)", n)
 		}
 	}()
+	go func() {
+		warmCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+		if err := acctMgr.WarmSciXCatalog(warmCtx); err != nil {
+			log.Printf("[boot] SciX model catalog warm-up skipped: %v", err)
+		}
+	}()
 	sched := scheduler.New(acctMgr, cfgMgr, st)
 	sched.Start()
 

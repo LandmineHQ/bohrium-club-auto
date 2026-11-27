@@ -317,6 +317,10 @@ func pipeChatSSE(ctx context.Context, w http.ResponseWriter, body io.Reader, kee
 			_ = sw.writeString("data: [DONE]\n\n")
 			break
 		}
+		if c, isErr := parseInlineChatError(data); isErr {
+			_ = sw.writeString("data: " + string(marshalErrorEnvelopeBytes(c.Type, c.Code, c.PublicMessage)) + "\n\ndata: [DONE]\n\n")
+			return usage, fmt.Errorf("upstream stream error: %s", c.RawDetail)
+		}
 		// Extract token usage if present on chunk
 		var chunk ChatCompletionChunk
 		if json.Unmarshal([]byte(data), &chunk) == nil && chunk.Usage != nil {
@@ -366,9 +370,26 @@ func pipeResponsesSSE(ctx context.Context, w http.ResponseWriter, body io.Reader
 			if curEvent == "" {
 				curEvent = typ
 			}
-			// Patch client-facing previous_response_id & store flags onto response snapshots if present
-			if respObj, ok := ev["response"].(map[string]any); ok {
+			if curEvent == "error" || typ == "error" {
+				c := classifyUpstreamError(http.StatusBadGateway, []byte(payload))
+				if patched, err := json.Marshal(map[string]any{
+					"type": "error",
+					"error": map[string]any{
+						"type":    c.Type,
+						"code":    c.Code,
+						"message": c.PublicMessage,
+						"param":   nil,
+					},
+				}); err == nil {
+					payload = string(patched)
+				}
+			} else if respObj, ok := ev["response"].(map[string]any); ok {
+				// Patch client-facing previous_response_id & store flags onto response snapshots if present
 				patchClientResponseMeta(respObj, req)
+				if typ == "response.failed" && respObj["error"] != nil {
+					sanitizedErr, _ := sanitizeStreamErrorDetailMap(respObj["error"])
+					respObj["error"] = sanitizedErr
+				}
 				if typ == "response.completed" || typ == "response.incomplete" {
 					terminalResp = respObj
 					usage = usageFromResponseMap(respObj)
@@ -737,7 +758,7 @@ func streamChatToResponsesSSE(ctx context.Context, w http.ResponseWriter, body i
 	if err := sc.Err(); err != nil {
 		failedAt := time.Now().UTC().Unix()
 		failedResp := buildResponseEnvelope(respID, modelID, now, &failedAt, "failed", nil, completedOutputs, respUsage, req)
-		failedResp.Error = &ErrorDetail{Message: err.Error(), Type: "server_error", Code: "stream_error"}
+		failedResp.Error = &ErrorDetail{Message: publicMsgStreamInterrupted, Type: "server_error", Code: "stream_error"}
 		sendEv("response.failed", map[string]any{"response": failedResp})
 		return failedResp, usage, err
 	}
@@ -817,8 +838,9 @@ func streamResponsesToChatSSE(ctx context.Context, w http.ResponseWriter, body i
 	}
 
 	var dataLines []string
+	var streamErr error
 	processFrame := func() {
-		if len(dataLines) == 0 {
+		if len(dataLines) == 0 || streamErr != nil {
 			return
 		}
 		payload := strings.Join(dataLines, "\n")
@@ -829,6 +851,21 @@ func streamResponsesToChatSSE(ctx context.Context, w http.ResponseWriter, body i
 		}
 		evType, _ := ev["type"].(string)
 		switch evType {
+		case "error":
+			c := classifyUpstreamError(http.StatusBadGateway, []byte(payload))
+			_ = sw.writeString("data: " + string(marshalErrorEnvelopeBytes(c.Type, c.Code, c.PublicMessage)) + "\n\ndata: [DONE]\n\n")
+			streamErr = fmt.Errorf("upstream stream error: %s", c.RawDetail)
+			return
+		case "response.failed":
+			errType, errCode, pubMsg, rawDetail := "upstream_error", "upstream_error", publicMsgStreamInterrupted, "upstream response.failed"
+			if r, ok := ev["response"].(map[string]any); ok && r["error"] != nil {
+				rawB, _ := json.Marshal(map[string]any{"error": r["error"]})
+				c := classifyUpstreamError(http.StatusBadGateway, rawB)
+				errType, errCode, pubMsg, rawDetail = c.Type, c.Code, c.PublicMessage, c.RawDetail
+			}
+			_ = sw.writeString("data: " + string(marshalErrorEnvelopeBytes(errType, errCode, pubMsg)) + "\n\ndata: [DONE]\n\n")
+			streamErr = fmt.Errorf("upstream stream error: %s", rawDetail)
+			return
 		case "response.created":
 			if r, ok := ev["response"].(map[string]any); ok {
 				if id, _ := r["id"].(string); id != "" {
@@ -899,6 +936,9 @@ func streamResponsesToChatSSE(ctx context.Context, w http.ResponseWriter, body i
 		line := sc.Text()
 		if line == "" {
 			processFrame()
+			if streamErr != nil {
+				return usage, streamErr
+			}
 			continue
 		}
 		if strings.HasPrefix(line, ":") {
@@ -909,6 +949,9 @@ func streamResponsesToChatSSE(ctx context.Context, w http.ResponseWriter, body i
 		}
 	}
 	processFrame()
+	if streamErr != nil {
+		return usage, streamErr
+	}
 	if err := sc.Err(); err != nil {
 		return usage, err
 	}
@@ -1148,6 +1191,10 @@ func AggregateResponsesSSE(body io.Reader, req *ResponsesRequest, fallbackModel 
 
 	if terminalResp != nil {
 		patchClientResponseMeta(terminalResp, req)
+		if errObj, hasErr := terminalResp["error"]; hasErr && errObj != nil {
+			sanitizedErr, _ := sanitizeStreamErrorDetailMap(errObj)
+			terminalResp["error"] = sanitizedErr
+		}
 		return terminalResp, nil
 	}
 	// Fallback if upstream ended without a terminal snapshot event
@@ -1299,85 +1346,4 @@ func extractOutputItems(respMap map[string]any) []map[string]any {
 		}
 	}
 	return out
-}
-
-func classifyUpstreamError(status int, body []byte) (errType, code, msg string, parsedEnvelope bool, insufficientBalance bool) {
-	trimmed := strings.TrimSpace(string(body))
-	lower := strings.ToLower(trimmed)
-	insufficientBalance = status == http.StatusPaymentRequired ||
-		strings.Contains(lower, "insufficient_balance") ||
-		strings.Contains(trimmed, "BILLING_PHOTON_NOT_ENOUGH")
-
-	var parsed ErrorEnvelope
-	if json.Unmarshal(body, &parsed) == nil && parsed.Error.Message != "" {
-		if insufficientBalance {
-			return "insufficient_quota", "insufficient_balance", parsed.Error.Message, true, true
-		}
-		et := strings.TrimSpace(parsed.Error.Type)
-		if et == "" {
-			et = "upstream_error"
-		}
-		ec := ""
-		if parsed.Error.Code != nil {
-			ec = strings.TrimSpace(fmt.Sprint(parsed.Error.Code))
-		}
-		return et, ec, parsed.Error.Message, true, false
-	}
-	if insufficientBalance {
-		msg = "[insufficient_balance] Insufficient balance"
-		if trimmed != "" {
-			if len(trimmed) > 300 {
-				trimmed = trimmed[:300] + "..."
-			}
-			msg = trimmed
-		}
-		return "insufficient_quota", "insufficient_balance", msg, false, true
-	}
-	msg = fmt.Sprintf("Bohrium upstream returned HTTP %d", status)
-	if trimmed != "" {
-		if len(trimmed) > 300 {
-			trimmed = trimmed[:300] + "..."
-		}
-		msg += ": " + trimmed
-	}
-	errType = "upstream_error"
-	switch status {
-	case http.StatusBadRequest:
-		errType = "invalid_request_error"
-	case http.StatusUnauthorized, http.StatusForbidden:
-		errType = "authentication_error"
-	case http.StatusTooManyRequests:
-		errType = "rate_limit_error"
-	}
-	return errType, fmt.Sprintf("http_%d", status), msg, false, false
-}
-
-func extractCommittedErrorParts(status int, body []byte) (errType, code, msg string) {
-	errType, code, msg, _, _ = classifyUpstreamError(status, body)
-	return errType, code, msg
-}
-
-func forwardUpstreamError(w http.ResponseWriter, status int, body []byte) string {
-	errType, code, msg, parsedEnvelope, insufficientBalance := classifyUpstreamError(status, body)
-	if parsedEnvelope {
-		if insufficientBalance {
-			outStatus := status
-			if outStatus == http.StatusBadRequest || outStatus == http.StatusForbidden {
-				outStatus = http.StatusPaymentRequired
-			}
-			WriteError(w, outStatus, errType, code, msg)
-			return msg
-		}
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-		w.WriteHeader(status)
-		_, _ = w.Write(body)
-		return msg
-	}
-	if insufficientBalance {
-		WriteError(w, http.StatusPaymentRequired, errType, code, msg)
-		return msg
-	}
-	WriteError(w, status, errType, code, msg)
-	return msg
 }

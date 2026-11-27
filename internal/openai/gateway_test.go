@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1832,7 +1833,7 @@ func TestPreHeaderDelayedKeepaliveAndFastErrorPreservation(t *testing.T) {
 		}
 	}
 
-	// Case B: Fast upstream 400 (0ms < 40ms delay) preserves real HTTP 400 status code.
+	// Case B: Fast upstream 400 (0ms < 40ms delay) preserves HTTP 400 status code while sanitizing raw upstream text.
 	headerDelayNanos.Store(0)
 	upstreamStatus.Store(http.StatusBadRequest)
 	reqFastErr, _ := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/responses", strings.NewReader(`{"model":"dsflash-high","stream":true,"input":"fast err"}`))
@@ -1844,11 +1845,11 @@ func TestPreHeaderDelayedKeepaliveAndFastErrorPreservation(t *testing.T) {
 	}
 	rawFastErr, _ := io.ReadAll(respFastErr.Body)
 	respFastErr.Body.Close()
-	if respFastErr.StatusCode != http.StatusBadRequest || !strings.Contains(string(rawFastErr), "upstream error 400") {
-		t.Fatalf("Case B expected HTTP 400 preserved, got %d %q", respFastErr.StatusCode, string(rawFastErr))
+	if respFastErr.StatusCode != http.StatusBadRequest || !strings.Contains(string(rawFastErr), "upstream_invalid_request") || strings.Contains(string(rawFastErr), "upstream error 400") {
+		t.Fatalf("Case B expected sanitized HTTP 400 without raw upstream message, got %d %q", respFastErr.StatusCode, string(rawFastErr))
 	}
 
-	// Case C: Slow upstream 502 (90ms > 40ms delay) after headers committed emits committed SSE/JSON error AND logs status 502.
+	// Case C: Slow upstream 502 (90ms > 40ms delay) after headers committed emits sanitized committed SSE/JSON error AND logs raw status 502.
 	headerDelayNanos.Store(int64(90 * time.Millisecond))
 	upstreamStatus.Store(http.StatusBadGateway)
 
@@ -1861,8 +1862,8 @@ func TestPreHeaderDelayedKeepaliveAndFastErrorPreservation(t *testing.T) {
 	}
 	rawSlowSSE, _ := io.ReadAll(respSlowSSE.Body)
 	respSlowSSE.Body.Close()
-	if respSlowSSE.StatusCode != http.StatusOK || !strings.Contains(string(rawSlowSSE), ": keepalive\n\n") || !strings.Contains(string(rawSlowSSE), "event: response.failed") || !strings.Contains(string(rawSlowSSE), "upstream error 502") {
-		t.Fatalf("Case C stream expected 200 keepalive + response.failed, got %d %q", respSlowSSE.StatusCode, string(rawSlowSSE))
+	if respSlowSSE.StatusCode != http.StatusOK || !strings.Contains(string(rawSlowSSE), ": keepalive\n\n") || !strings.Contains(string(rawSlowSSE), "event: response.failed") || !strings.Contains(string(rawSlowSSE), `"upstream_error"`) || strings.Contains(string(rawSlowSSE), "upstream error 502") {
+		t.Fatalf("Case C stream expected 200 keepalive + sanitized response.failed, got %d %q", respSlowSSE.StatusCode, string(rawSlowSSE))
 	}
 
 	reqSlowJSON, _ := http.NewRequest(http.MethodPost, gwSrv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"dsflash-high","stream":false,"messages":[{"role":"user","content":"slow err json"}]}`))
@@ -1875,8 +1876,8 @@ func TestPreHeaderDelayedKeepaliveAndFastErrorPreservation(t *testing.T) {
 	rawSlowJSON, _ := io.ReadAll(respSlowJSON.Body)
 	respSlowJSON.Body.Close()
 	var errObj map[string]any
-	if respSlowJSON.StatusCode != http.StatusOK || !bytes.HasPrefix(rawSlowJSON, []byte(" ")) || json.Unmarshal(rawSlowJSON, &errObj) != nil || !strings.Contains(string(rawSlowJSON), "upstream error 502") {
-		t.Fatalf("Case C non-stream expected 200 leading-space JSON error, got %d %q", respSlowJSON.StatusCode, string(rawSlowJSON))
+	if respSlowJSON.StatusCode != http.StatusOK || !bytes.HasPrefix(rawSlowJSON, []byte(" ")) || json.Unmarshal(rawSlowJSON, &errObj) != nil || !strings.Contains(string(rawSlowJSON), `"upstream_error"`) || strings.Contains(string(rawSlowJSON), "upstream error 502") {
+		t.Fatalf("Case C non-stream expected 200 leading-space sanitized JSON error, got %d %q", respSlowJSON.StatusCode, string(rawSlowJSON))
 	}
 
 	var count502 int
@@ -1885,7 +1886,7 @@ func TestPreHeaderDelayedKeepaliveAndFastErrorPreservation(t *testing.T) {
 		if err == nil {
 			count502 = 0
 			for _, it := range page.Items {
-				if it.Status == http.StatusBadGateway {
+				if it.Status == http.StatusBadGateway && strings.Contains(it.Error, "upstream error 502") {
 					count502++
 				}
 			}
@@ -1896,6 +1897,370 @@ func TestPreHeaderDelayedKeepaliveAndFastErrorPreservation(t *testing.T) {
 		time.Sleep(25 * time.Millisecond)
 	}
 	if count502 < 2 {
-		t.Fatalf("expected >=2 logged 502 records for Case C, got %d", count502)
+		t.Fatalf("expected >=2 logged 502 records with raw upstream detail for Case C, got %d", count502)
+	}
+}
+
+func TestCatalogFetchFailureReturns502Not400(t *testing.T) {
+	var dropModels atomic.Bool
+	dropModels.Store(true)
+
+	upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			if dropModels.Load() {
+				if hj, ok := w.(http.Hijacker); ok {
+					if conn, _, err := hj.Hijack(); err == nil {
+						if tcpConn, ok := conn.(*net.TCPConn); ok {
+							_ = tcpConn.SetLinger(0)
+						}
+						_ = conn.Close()
+						return
+					}
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{
+				"object": "list",
+				"data": [
+					{"id":"dsflash-high","name":"DeepSeek-V4.1-Flash","api":"chat_completions","context_window":1000000,"max_output_tokens":384000,"input":["text"],"owned_by":"sigma"}
+				]
+			}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(upSrv.Close)
+
+	tmpDir := t.TempDir()
+	t.Setenv("BOHRIUM_DATA_DIR", tmpDir)
+	t.Setenv("BOHRIUM_API_KEYS", "sk-brm-test-key-001")
+	t.Setenv("BOHRIUM_ADMIN_PASSWORD", "testpass123")
+
+	cfgMgr, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	st, err := store.Open(tmpDir)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	acc, _, err := st.UpsertAccountFromAuth(store.AuthState{
+		Token:     "fake-brm-jwt-token",
+		UserID:    100001,
+		OrgID:     200001,
+		Nickname:  "TestScientist",
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+	}, "Primary")
+	if err != nil {
+		t.Fatalf("UpsertAccountFromAuth: %v", err)
+	}
+	_ = st.UpdateAccountBalance(acc.ID, 5000, 500, 10)
+	if err := st.SetPoolMembership([]string{acc.ID}); err != nil {
+		t.Fatalf("SetPoolMembership: %v", err)
+	}
+
+	httpCli, err := chromehttp.New(chromehttp.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("chromehttp.New: %v", err)
+	}
+	mgr := bohrium.NewManager(httpCli, cfgMgr, st)
+	mgr.SetEndpoints(bohrium.Endpoints{SigmaLLMBase: upSrv.URL, WWWBase: upSrv.URL})
+
+	gw := openai.NewGateway(cfgMgr, mgr)
+	mux := http.NewServeMux()
+	gw.RegisterRoutes(mux)
+	gwSrv := httptest.NewServer(mux)
+	t.Cleanup(gwSrv.Close)
+
+	const apiKey = "sk-brm-test-key-001"
+	doReq := func(method, path, body string) (int, map[string]any) {
+		t.Helper()
+		req, _ := http.NewRequest(method, gwSrv.URL+path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		var out map[string]any
+		_ = json.Unmarshal(raw, &out)
+		return resp.StatusCode, out
+	}
+
+	assertErrCode := func(status int, payload map[string]any, wantStatus int, wantType, wantCode string) {
+		t.Helper()
+		if status != wantStatus {
+			t.Fatalf("expected HTTP %d, got %d payload=%+v", wantStatus, status, payload)
+		}
+		errObj, _ := payload["error"].(map[string]any)
+		if errObj["type"] != wantType || errObj["code"] != wantCode {
+			t.Fatalf("expected error type=%q code=%q, got %+v", wantType, wantCode, errObj)
+		}
+	}
+
+	assertNoUpstreamLeak := func(payload map[string]any) {
+		t.Helper()
+		rawBytes, _ := json.Marshal(payload)
+		lower := strings.ToLower(string(rawBytes))
+		for _, forbidden := range []string{"http://", "https://", "127.0.0.1", "bohrium", "scix", "sigma", "read tcp", "connection reset", "eof"} {
+			if strings.Contains(lower, forbidden) {
+				t.Fatalf("downstream error leaked upstream detail %q in %s", forbidden, string(rawBytes))
+			}
+		}
+	}
+
+	// 1. Upstream /models connection reset -> 502 upstream_error / catalog_unavailable (never 400 model_not_found, and never leaks upstream URL/IP).
+	st1, p1 := doReq(http.MethodPost, "/v1/responses", `{"model":"dsflash-high","input":"hello"}`)
+	assertErrCode(st1, p1, http.StatusBadGateway, "upstream_error", "catalog_unavailable")
+	assertNoUpstreamLeak(p1)
+
+	st2, p2 := doReq(http.MethodPost, "/v1/chat/completions", `{"model":"dsflash-high","messages":[{"role":"user","content":"hello"}]}`)
+	assertErrCode(st2, p2, http.StatusBadGateway, "upstream_error", "catalog_unavailable")
+	assertNoUpstreamLeak(p2)
+
+	st3, p3 := doReq(http.MethodGet, "/v1/models/dsflash-high", "")
+	assertErrCode(st3, p3, http.StatusBadGateway, "upstream_error", "catalog_unavailable")
+	assertNoUpstreamLeak(p3)
+
+	// Confirm gateway_usage_logs recorded 502 (not 400) along with raw diagnostic detail.
+	var found502 bool
+	for i := 0; i < 20; i++ {
+		page, err := st.ListGatewayUsageLogs(store.UsageLogsQueryOptions{RangeDays: 1, Page: 1, PageSize: 20})
+		if err == nil {
+			cnt := 0
+			for _, it := range page.Items {
+				if it.Status == http.StatusBadGateway && strings.Contains(it.Error, "fetch SciX model catalog") {
+					cnt++
+				}
+			}
+			if cnt >= 2 {
+				found502 = true
+				break
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !found502 {
+		t.Fatalf("expected >=2 logged 502 catalog_unavailable entries in gateway_usage_logs")
+	}
+
+	// 2. When catalog loads cleanly, an actually nonexistent model still returns 400/404 model_not_found without branding leaks.
+	dropModels.Store(false)
+
+	st4, p4 := doReq(http.MethodPost, "/v1/responses", `{"model":"nonexistent-model-xyz","input":"hello"}`)
+	assertErrCode(st4, p4, http.StatusBadRequest, "invalid_request_error", "model_not_found")
+	assertNoUpstreamLeak(p4)
+
+	st5, p5 := doReq(http.MethodPost, "/v1/chat/completions", `{"model":"nonexistent-model-xyz","messages":[{"role":"user","content":"hello"}]}`)
+	assertErrCode(st5, p5, http.StatusBadRequest, "invalid_request_error", "model_not_found")
+	assertNoUpstreamLeak(p5)
+
+	st6, p6 := doReq(http.MethodGet, "/v1/models/nonexistent-model-xyz", "")
+	assertErrCode(st6, p6, http.StatusNotFound, "invalid_request_error", "model_not_found")
+	assertNoUpstreamLeak(p6)
+}
+
+func TestUpstreamErrorsNeverLeakToDownstream(t *testing.T) {
+	var (
+		llmStatus       atomic.Int32
+		llmBodyMu       sync.Mutex
+		llmBody         string
+		preflightDrop   atomic.Bool
+		inlineSSEError  atomic.Bool
+	)
+	llmStatus.Store(http.StatusInternalServerError)
+
+	upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{
+				"object": "list",
+				"data": [
+					{"id":"dsflash-high","name":"DeepSeek-V4.1-Flash","api":"chat_completions","context_window":1000000,"max_output_tokens":384000,"input":["text"],"owned_by":"sigma"}
+				]
+			}`)
+			return
+		case "/billing/preflight":
+			if preflightDrop.Load() {
+				if hj, ok := w.(http.Hijacker); ok {
+					if conn, _, err := hj.Hijack(); err == nil {
+						_ = conn.Close()
+						return
+					}
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"allowed":true}`)
+			return
+		}
+
+		w.Header().Set("X-Litellm-Call-Id", "litellm-secret-999")
+		if inlineSSEError.Load() {
+			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "data: "+`{"error":{"message":"https://www.bohrium.com/secret backend crash 47.95.53.31:443"}}`+"\n\n")
+			return
+		}
+		code := int(llmStatus.Load())
+		llmBodyMu.Lock()
+		body := llmBody
+		llmBodyMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(upSrv.Close)
+
+	tmpDir := t.TempDir()
+	t.Setenv("BOHRIUM_DATA_DIR", tmpDir)
+	t.Setenv("BOHRIUM_API_KEYS", "sk-brm-test-key-001")
+	t.Setenv("BOHRIUM_ADMIN_PASSWORD", "testpass123")
+
+	cfgMgr, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	st, err := store.Open(tmpDir)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	acc, _, err := st.UpsertAccountFromAuth(store.AuthState{
+		Token:     "fake-brm-jwt-token",
+		UserID:    100001,
+		OrgID:     200001,
+		Nickname:  "TestScientist",
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+	}, "Primary")
+	if err != nil {
+		t.Fatalf("UpsertAccountFromAuth: %v", err)
+	}
+	_ = st.UpdateAccountBalance(acc.ID, 5000, 500, 10)
+	if err := st.SetPoolMembership([]string{acc.ID}); err != nil {
+		t.Fatalf("SetPoolMembership: %v", err)
+	}
+
+	httpCli, err := chromehttp.New(chromehttp.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("chromehttp.New: %v", err)
+	}
+	mgr := bohrium.NewManager(httpCli, cfgMgr, st)
+	mgr.SetEndpoints(bohrium.Endpoints{SigmaLLMBase: upSrv.URL, WWWBase: upSrv.URL})
+
+	gw := openai.NewGateway(cfgMgr, mgr)
+	mux := http.NewServeMux()
+	gw.RegisterRoutes(mux)
+	gwSrv := httptest.NewServer(mux)
+	t.Cleanup(gwSrv.Close)
+
+	const apiKey = "sk-brm-test-key-001"
+	postJSON := func(path, body string) (int, http.Header, string) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPost, gwSrv.URL+path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, resp.Header, string(raw)
+	}
+
+	assertCleanBody := func(raw string) {
+		t.Helper()
+		lower := strings.ToLower(raw)
+		for _, forbidden := range []string{"http://", "https://", "127.0.0.1", "47.95.53.31", "bohrium", "scix", "sigma", "litellm", "billing_photon_not_enough", "secret backend crash"} {
+			if strings.Contains(lower, forbidden) {
+				t.Fatalf("response leaked upstream token %q in body: %s", forbidden, raw)
+			}
+		}
+	}
+
+	// 1. Upstream 500 with raw URL/IP/brand + X-Litellm-Call-Id header -> clean 502 upstream_error, no X-Litellm-Call-Id, raw error logged in DB.
+	llmStatus.Store(http.StatusInternalServerError)
+	llmBodyMu.Lock()
+	llmBody = `{"error":{"type":"sigma_internal","code":"sigma_500","message":"Post https://www.bohrium.com/bohrapi/v1/sigma-search/internal failed via 47.95.53.31:443 on scix"}}`
+	llmBodyMu.Unlock()
+	sc1, hdr1, body1 := postJSON("/v1/chat/completions", `{"model":"dsflash-high","stream":false,"messages":[{"role":"user","content":"hi"}]}`)
+	if sc1 != http.StatusBadGateway || !strings.Contains(body1, `"upstream_error"`) {
+		t.Fatalf("expected 502 upstream_error, got %d %s", sc1, body1)
+	}
+	if hdr1.Get("X-Litellm-Call-Id") != "" {
+		t.Fatalf("expected X-Litellm-Call-Id to be stripped from downstream response, got %q", hdr1.Get("X-Litellm-Call-Id"))
+	}
+	assertCleanBody(body1)
+
+	// 2. Upstream 402 with BILLING_PHOTON_NOT_ENOUGH -> 402 insufficient_quota / insufficient_balance without raw upstream token.
+	llmStatus.Store(http.StatusPaymentRequired)
+	llmBodyMu.Lock()
+	llmBody = `{"error":{"code":"insufficient_balance","message":"BILLING_PHOTON_NOT_ENOUGH on https://www.bohrium.com/sigma-search","type":"insufficient_quota"}}`
+	llmBodyMu.Unlock()
+	sc2, _, body2 := postJSON("/v1/responses", `{"model":"dsflash-high","stream":false,"input":"hi"}`)
+	if sc2 != http.StatusPaymentRequired || !strings.Contains(body2, `"insufficient_balance"`) {
+		t.Fatalf("expected 402 insufficient_balance, got %d %s", sc2, body2)
+	}
+	assertCleanBody(body2)
+	_ = st.UpdateAccountHealth(acc.ID, "active", "", time.Time{})
+
+	// 3. Upstream 400 context length error -> 400 invalid_request_error / context_length_exceeded without upstream identifiers.
+	llmStatus.Store(http.StatusBadRequest)
+	llmBodyMu.Lock()
+	llmBody = `{"error":{"message":"maximum context length exceeded on sigma-search scix node"}}`
+	llmBodyMu.Unlock()
+	sc3, _, body3 := postJSON("/v1/chat/completions", `{"model":"dsflash-high","stream":false,"messages":[{"role":"user","content":"hi"}]}`)
+	if sc3 != http.StatusBadRequest || !strings.Contains(body3, `"context_length_exceeded"`) {
+		t.Fatalf("expected 400 context_length_exceeded, got %d %s", sc3, body3)
+	}
+	assertCleanBody(body3)
+
+	// 4. Upstream preflight transport drop -> 502 billing_unavailable without upstream URL/IP.
+	preflightDrop.Store(true)
+	sc4, _, body4 := postJSON("/v1/responses", `{"model":"dsflash-high","stream":false,"input":"hi"}`)
+	preflightDrop.Store(false)
+	if sc4 != http.StatusBadGateway || !strings.Contains(body4, `"billing_unavailable"`) {
+		t.Fatalf("expected 502 billing_unavailable, got %d %s", sc4, body4)
+	}
+	assertCleanBody(body4)
+
+	// 5. Inline SSE stream error chunk -> sanitized SSE error without upstream URL/brand/message.
+	inlineSSEError.Store(true)
+	sc5, _, body5 := postJSON("/v1/chat/completions", `{"model":"dsflash-high","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	inlineSSEError.Store(false)
+	if sc5 != http.StatusOK || !strings.Contains(body5, `"upstream_error"`) || !strings.Contains(body5, "data: [DONE]") {
+		t.Fatalf("expected sanitized SSE error + [DONE], got %d %q", sc5, body5)
+	}
+	assertCleanBody(body5)
+
+	// Confirm raw upstream diagnostics ARE still retained internally in gateway_usage_logs.
+	var sawRaw500, sawRawSSE bool
+	for i := 0; i < 20; i++ {
+		page, err := st.ListGatewayUsageLogs(store.UsageLogsQueryOptions{RangeDays: 1, Page: 1, PageSize: 20})
+		if err == nil {
+			for _, it := range page.Items {
+				if strings.Contains(it.Error, "sigma-search/internal") {
+					sawRaw500 = true
+				}
+				if strings.Contains(it.Error, "secret backend crash") {
+					sawRawSSE = true
+				}
+			}
+			if sawRaw500 && sawRawSSE {
+				break
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !sawRaw500 || !sawRawSSE {
+		t.Fatalf("expected internal gateway_usage_logs to preserve raw upstream error details (sawRaw500=%v sawRawSSE=%v)", sawRaw500, sawRawSSE)
 	}
 }

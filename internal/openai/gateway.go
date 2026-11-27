@@ -288,6 +288,57 @@ func (e *modelDisabledError) Error() string {
 	return e.msg
 }
 
+type modelNotFoundError struct {
+	modelID string
+	msg     string
+}
+
+func (e *modelNotFoundError) Error() string {
+	return e.msg
+}
+
+func (g *Gateway) handleResolveModelError(
+	ctx context.Context,
+	w http.ResponseWriter,
+	endpoint string,
+	requestedModel string,
+	decision *RouteDecision,
+	stream bool,
+	start time.Time,
+	tel reqTelemetry,
+	explicitAcc string,
+	mErr error,
+) (retryAccount bool, status int, errType, errCode, publicMsg, rawErrMsg string) {
+	if ctx.Err() != nil {
+		g.recordFailure(ctx, endpoint, "", requestedModel, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, stream, statusClientClosedRequest, start, ctx.Err().Error(), tel)
+		return false, statusClientClosedRequest, "", "", "", ctx.Err().Error()
+	}
+	var disErr *modelDisabledError
+	if errors.As(mErr, &disErr) {
+		WriteError(w, http.StatusForbidden, "invalid_request_error", "model_disabled", disErr.Error())
+		g.recordFailure(ctx, endpoint, "", requestedModel, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, stream, http.StatusForbidden, start, disErr.Error(), tel)
+		return false, http.StatusForbidden, "invalid_request_error", "model_disabled", disErr.Error(), disErr.Error()
+	}
+	var notFoundErr *modelNotFoundError
+	if errors.As(mErr, &notFoundErr) {
+		WriteError(w, http.StatusBadRequest, "invalid_request_error", "model_not_found", notFoundErr.Error())
+		g.recordFailure(ctx, endpoint, "", requestedModel, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, stream, http.StatusBadRequest, start, notFoundErr.Error(), tel)
+		return false, http.StatusBadRequest, "invalid_request_error", "model_not_found", notFoundErr.Error(), notFoundErr.Error()
+	}
+	if isAuthErrorText(mErr.Error()) {
+		if explicitAcc == "" {
+			g.markAccountExpired(decision.Account.ID, mErr.Error())
+			return true, http.StatusServiceUnavailable, "authentication_error", "account_expired", publicMsgAccountExpired, mErr.Error()
+		}
+		WriteError(w, http.StatusServiceUnavailable, "authentication_error", "account_expired", publicMsgAccountExpired)
+		g.recordFailure(ctx, endpoint, "", requestedModel, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, stream, http.StatusServiceUnavailable, start, mErr.Error(), tel)
+		return false, http.StatusServiceUnavailable, "authentication_error", "account_expired", publicMsgAccountExpired, mErr.Error()
+	}
+	WriteError(w, http.StatusBadGateway, "upstream_error", "catalog_unavailable", publicMsgCatalogUnavailable)
+	g.recordFailure(ctx, endpoint, "", requestedModel, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, stream, http.StatusBadGateway, start, mErr.Error(), tel)
+	return false, http.StatusBadGateway, "upstream_error", "catalog_unavailable", publicMsgCatalogUnavailable, mErr.Error()
+}
+
 // IsModelEnabled reports whether m is active on the OpenAI-compatible gateway.
 func (g *Gateway) IsModelEnabled(m bohrium.SciXModel) bool {
 	if g.cfg == nil {
@@ -489,7 +540,10 @@ func (g *Gateway) resolveEnabledModel(ctx context.Context, cli *bohrium.Client, 
 		}
 	}
 	if !ok {
-		return bohrium.SciXModel{}, cat, fmt.Errorf("model %q not found in Bohrium SciX catalog", requested)
+		return bohrium.SciXModel{}, cat, &modelNotFoundError{
+			modelID: requested,
+			msg:     fmt.Sprintf("Model %q not found.", requested),
+		}
 	}
 	if !g.IsModelEnabled(m) {
 		return bohrium.SciXModel{}, cat, &modelDisabledError{
@@ -512,7 +566,7 @@ func (g *Gateway) handleListModels(w http.ResponseWriter, r *http.Request) {
 	}
 	cat, err := cli.GetSciXModelCatalog(ctx, force)
 	if err != nil {
-		WriteError(w, http.StatusBadGateway, "upstream_error", "catalog_unavailable", err.Error())
+		WriteError(w, http.StatusBadGateway, "upstream_error", "catalog_unavailable", publicMsgCatalogUnavailable)
 		return
 	}
 	WriteJSON(w, http.StatusOK, g.BuildOpenAIModelList(cat))
@@ -535,7 +589,12 @@ func (g *Gateway) handleGetModel(w http.ResponseWriter, r *http.Request) {
 			WriteError(w, http.StatusNotFound, "invalid_request_error", "model_disabled", disErr.Error())
 			return
 		}
-		WriteError(w, http.StatusNotFound, "invalid_request_error", "model_not_found", err.Error())
+		var notFoundErr *modelNotFoundError
+		if errors.As(err, &notFoundErr) {
+			WriteError(w, http.StatusNotFound, "invalid_request_error", "model_not_found", notFoundErr.Error())
+			return
+		}
+		WriteError(w, http.StatusBadGateway, "upstream_error", "catalog_unavailable", publicMsgCatalogUnavailable)
 		return
 	}
 	WriteJSON(w, http.StatusOK, toOpenAIModel(m))
@@ -604,11 +663,11 @@ func (g *Gateway) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 
 	poolAccounts, err := g.mgr.Store().ListPoolAccounts()
 	if err != nil {
-		WriteError(w, http.StatusInternalServerError, "server_error", "store_error", err.Error())
+		WriteError(w, http.StatusInternalServerError, "server_error", "store_error", publicMsgStoreError)
 		return
 	}
 	if len(poolAccounts) == 0 {
-		WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "empty_pool", ErrEmptyPool.Error())
+		WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "empty_pool", publicMsgEmptyPool)
 		return
 	}
 
@@ -627,7 +686,7 @@ func (g *Gateway) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 	for _, acc := range poolAccounts {
 		assets, aErr := g.mgr.RefreshAccountBalance(ctx, acc.ID)
 		if aErr != nil {
-			warnings = append(warnings, fmt.Sprintf("%s: %v", acc.DisplayName(), aErr))
+			warnings = append(warnings, fmt.Sprintf("%s: %s", acc.DisplayName(), publicMsgLiveBalanceWarning))
 			totalPhotons += acc.PhotonBalance
 			totalOrg += acc.OrgBalance
 			totalWalletCNY += acc.WalletBalanceCNY
@@ -746,10 +805,11 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	}
 
 	var (
-		lastStatus  int
-		lastErrType string
-		lastErrCode string
-		lastErrMsg  string
+		lastStatus    int
+		lastErrType   string
+		lastErrCode   string
+		lastErrMsg    string
+		lastRawErrMsg string
 	)
 
 	attempts := maxFailoverAttempts
@@ -769,7 +829,11 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		if rErr != nil {
 			if attempt > 0 && lastStatus > 0 {
 				WriteError(w, lastStatus, lastErrType, lastErrCode, lastErrMsg)
-				g.recordFailure(ctx, "/v1/chat/completions", "", req.Model, "", "", "", req.Stream, lastStatus, start, lastErrMsg, tel)
+				logMsg := lastRawErrMsg
+				if logMsg == "" {
+					logMsg = lastErrMsg
+				}
+				g.recordFailure(ctx, "/v1/chat/completions", "", req.Model, "", "", "", req.Stream, lastStatus, start, logMsg, tel)
 				return
 			}
 			status := writePoolRouteError(w, rErr)
@@ -779,24 +843,12 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 		model, _, mErr := g.resolveEnabledModel(ctx, decision.Client, req.Model)
 		if mErr != nil {
-			if ctx.Err() != nil {
-				g.recordFailure(ctx, "/v1/chat/completions", "", req.Model, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, statusClientClosedRequest, start, ctx.Err().Error(), tel)
-				return
-			}
-			var disErr *modelDisabledError
-			if errors.As(mErr, &disErr) {
-				WriteError(w, http.StatusForbidden, "invalid_request_error", "model_disabled", disErr.Error())
-				g.recordFailure(ctx, "/v1/chat/completions", "", req.Model, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, http.StatusForbidden, start, disErr.Error(), tel)
-				return
-			}
-			if isAuthErrorText(mErr.Error()) && explicitAcc == "" {
-				g.markAccountExpired(decision.Account.ID, mErr.Error())
+			retry, stCode, errType, errCode, pubMsg, rawMsg := g.handleResolveModelError(ctx, w, "/v1/chat/completions", req.Model, decision, req.Stream, start, tel, explicitAcc, mErr)
+			if retry {
 				excluded[decision.Account.ID] = true
-				lastStatus, lastErrType, lastErrCode, lastErrMsg = http.StatusServiceUnavailable, "authentication_error", "account_expired", mErr.Error()
+				lastStatus, lastErrType, lastErrCode, lastErrMsg, lastRawErrMsg = stCode, errType, errCode, pubMsg, rawMsg
 				continue
 			}
-			WriteError(w, http.StatusBadRequest, "invalid_request_error", "model_not_found", mErr.Error())
-			g.recordFailure(ctx, "/v1/chat/completions", "", req.Model, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, http.StatusBadRequest, start, mErr.Error(), tel)
 			return
 		}
 
@@ -815,19 +867,19 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		}
 
 		if !isToolCont {
-			if status, errType, code, reason, ok := g.runPreflightIfEnabled(ctx, decision.Client, model.ID, traceparent); !ok {
+			if status, errType, code, pubMsg, rawReason, ok := g.runPreflightIfEnabled(ctx, decision.Client, model.ID, traceparent); !ok {
 				if ctx.Err() != nil {
 					g.recordFailure(ctx, "/v1/chat/completions", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, statusClientClosedRequest, start, ctx.Err().Error(), tel)
 					return
 				}
 				if status == http.StatusPaymentRequired && explicitAcc == "" {
-					g.markAccountInsufficient(decision.Account.ID, reason)
+					g.markAccountInsufficient(decision.Account.ID, rawReason)
 					excluded[decision.Account.ID] = true
-					lastStatus, lastErrType, lastErrCode, lastErrMsg = status, errType, code, reason
+					lastStatus, lastErrType, lastErrCode, lastErrMsg, lastRawErrMsg = status, errType, code, pubMsg, rawReason
 					continue
 				}
-				WriteError(w, status, errType, code, reason)
-				g.recordFailure(ctx, "/v1/chat/completions", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, status, start, reason, tel)
+				WriteError(w, status, errType, code, pubMsg)
+				g.recordFailure(ctx, "/v1/chat/completions", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, status, start, rawReason, tel)
 				return
 			}
 		}
@@ -858,7 +910,8 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		tel.ReasoningEffort = resolveRecordedReasoningEffort(req.ReasoningEffort, model, payloadMap)
 		payloadBytes, err := json.Marshal(payloadMap)
 		if err != nil {
-			WriteError(w, http.StatusInternalServerError, "server_error", "marshal_error", err.Error())
+			WriteError(w, http.StatusInternalServerError, "server_error", "marshal_error", publicMsgMarshalError)
+			g.recordFailure(ctx, "/v1/chat/completions", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, http.StatusInternalServerError, start, err.Error(), tel)
 			return
 		}
 
@@ -882,12 +935,12 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 			if ctx.Err() == nil {
 				if headersCommitted {
 					if req.Stream {
-						writeCommittedChatSSEError(w, "upstream_error", "upstream_transport_error", err.Error())
+						writeCommittedChatSSEError(w, "upstream_error", "upstream_transport_error", publicMsgUpstreamTransport)
 					} else {
-						writeCommittedJSONError(w, "upstream_error", "upstream_transport_error", err.Error())
+						writeCommittedJSONError(w, "upstream_error", "upstream_transport_error", publicMsgUpstreamTransport)
 					}
 				} else {
-					WriteError(w, http.StatusBadGateway, "upstream_error", "upstream_transport_error", err.Error())
+					WriteError(w, http.StatusBadGateway, "upstream_error", "upstream_transport_error", publicMsgUpstreamTransport)
 				}
 			}
 			g.recordFailure(ctx, "/v1/chat/completions", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, status, start, err.Error(), tel)
@@ -904,10 +957,10 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 				errTxt := extractUpstreamErrorText(errBody, upResp.StatusCode)
 				if upResp.StatusCode == http.StatusUnauthorized {
 					g.markAccountExpired(decision.Account.ID, errTxt)
-					lastStatus, lastErrType, lastErrCode, lastErrMsg = http.StatusUnauthorized, "authentication_error", "account_expired", errTxt
+					lastStatus, lastErrType, lastErrCode, lastErrMsg, lastRawErrMsg = http.StatusUnauthorized, "authentication_error", "account_expired", publicMsgAccountExpired, errTxt
 				} else {
 					g.markAccountInsufficient(decision.Account.ID, errTxt)
-					lastStatus, lastErrType, lastErrCode, lastErrMsg = http.StatusPaymentRequired, "insufficient_quota", "insufficient_balance", errTxt
+					lastStatus, lastErrType, lastErrCode, lastErrMsg, lastRawErrMsg = http.StatusPaymentRequired, "insufficient_quota", "insufficient_balance", publicMsgInsufficientBalance, errTxt
 				}
 				if !headersCommitted {
 					excluded[decision.Account.ID] = true
@@ -916,19 +969,19 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 			}
 
 			if headersCommitted {
-				errType, code, errMsg := extractCommittedErrorParts(upResp.StatusCode, errBody)
+				errType, code, pubMsg, rawDetail := extractCommittedErrorParts(upResp.StatusCode, errBody)
 				if req.Stream {
-					writeCommittedChatSSEError(w, errType, code, errMsg)
+					writeCommittedChatSSEError(w, errType, code, pubMsg)
 				} else {
-					writeCommittedJSONError(w, errType, code, errMsg)
+					writeCommittedJSONError(w, errType, code, pubMsg)
 				}
-				g.recordFailure(ctx, "/v1/chat/completions", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, upResp.StatusCode, start, errMsg, tel)
+				g.recordFailure(ctx, "/v1/chat/completions", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, upResp.StatusCode, start, rawDetail, tel)
 				return
 			}
 
 			copyUpstreamRequestID(w, upResp)
-			errMsg := forwardUpstreamError(w, upResp.StatusCode, errBody)
-			g.recordFailure(ctx, "/v1/chat/completions", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, upResp.StatusCode, start, errMsg, tel)
+			rawDetail := forwardUpstreamError(w, upResp.StatusCode, errBody)
+			g.recordFailure(ctx, "/v1/chat/completions", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, upResp.StatusCode, start, rawDetail, tel)
 			return
 		}
 
@@ -948,7 +1001,11 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	}
 
 	WriteError(w, lastStatus, lastErrType, lastErrCode, lastErrMsg)
-	g.recordFailure(ctx, "/v1/chat/completions", "", req.Model, "", "", "", req.Stream, lastStatus, start, lastErrMsg, baseTel)
+	logMsg := lastRawErrMsg
+	if logMsg == "" {
+		logMsg = lastErrMsg
+	}
+	g.recordFailure(ctx, "/v1/chat/completions", "", req.Model, "", "", "", req.Stream, lastStatus, start, logMsg, baseTel)
 }
 
 func (g *Gateway) finishChatFromChatUpstream(ctx context.Context, w http.ResponseWriter, req *ChatCompletionRequest, model bohrium.SciXModel, decision *RouteDecision, upResp *http.Response, start time.Time, tel reqTelemetry, headersCommitted bool) {
@@ -977,7 +1034,7 @@ func (g *Gateway) finishChatFromChatUpstream(ctx context.Context, w http.Respons
 		if err != nil {
 			status := classifyStreamErrorStatus(ctx)
 			if ctx.Err() == nil {
-				writeCommittedJSONError(w, "upstream_error", "stream_aggregate_error", err.Error())
+				writeCommittedJSONError(w, "upstream_error", "stream_aggregate_error", publicMsgStreamInterrupted)
 			}
 			g.recordFailure(ctx, "/v1/chat/completions", "chat_completions", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, status, start, err.Error(), tel)
 			return
@@ -997,23 +1054,22 @@ func (g *Gateway) finishChatFromChatUpstream(ctx context.Context, w http.Respons
 		status := classifyStreamErrorStatus(ctx)
 		if ctx.Err() == nil {
 			if headersCommitted {
-				writeCommittedJSONError(w, "upstream_error", "read_error", rErr.Error())
+				writeCommittedJSONError(w, "upstream_error", "read_error", publicMsgStreamInterrupted)
 			} else {
-				WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", rErr.Error())
+				WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", publicMsgStreamInterrupted)
 			}
 		}
 		g.recordFailure(ctx, "/v1/chat/completions", "chat_completions", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, status, start, rErr.Error(), tel)
 		return
 	}
 	var direct ChatCompletionResponse
-	if json.Unmarshal(rawResp, &direct) != nil {
-		if !headersCommitted {
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			w.Header().Set("Cache-Control", "no-store")
-			w.WriteHeader(http.StatusOK)
+	if uErr := json.Unmarshal(rawResp, &direct); uErr != nil {
+		if headersCommitted {
+			writeCommittedJSONError(w, "upstream_error", "invalid_upstream_json", publicMsgInvalidUpstreamResp)
+		} else {
+			WriteError(w, http.StatusBadGateway, "upstream_error", "invalid_upstream_json", publicMsgInvalidUpstreamResp)
 		}
-		_, _ = w.Write(rawResp)
-		flushWriter(w)
+		g.recordFailure(ctx, "/v1/chat/completions", "chat_completions", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, http.StatusBadGateway, start, uErr.Error(), tel)
 		return
 	}
 	parsed = &direct
@@ -1059,7 +1115,7 @@ func (g *Gateway) finishChatFromResponsesUpstream(ctx context.Context, w http.Re
 		if err != nil {
 			status := classifyStreamErrorStatus(ctx)
 			if ctx.Err() == nil {
-				writeCommittedJSONError(w, "upstream_error", "stream_aggregate_error", err.Error())
+				writeCommittedJSONError(w, "upstream_error", "stream_aggregate_error", publicMsgStreamInterrupted)
 			}
 			g.recordFailure(ctx, "/v1/chat/completions", "responses", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, status, start, err.Error(), tel)
 			return
@@ -1077,9 +1133,9 @@ func (g *Gateway) finishChatFromResponsesUpstream(ctx context.Context, w http.Re
 		status := classifyStreamErrorStatus(ctx)
 		if ctx.Err() == nil {
 			if headersCommitted {
-				writeCommittedJSONError(w, "upstream_error", "read_error", rErr.Error())
+				writeCommittedJSONError(w, "upstream_error", "read_error", publicMsgStreamInterrupted)
 			} else {
-				WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", rErr.Error())
+				WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", publicMsgStreamInterrupted)
 			}
 		}
 		g.recordFailure(ctx, "/v1/chat/completions", "responses", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, status, start, rErr.Error(), tel)
@@ -1087,10 +1143,11 @@ func (g *Gateway) finishChatFromResponsesUpstream(ctx context.Context, w http.Re
 	}
 	if err := json.Unmarshal(rawResp, &respMap); err != nil {
 		if headersCommitted {
-			writeCommittedJSONError(w, "upstream_error", "invalid_upstream_json", err.Error())
+			writeCommittedJSONError(w, "upstream_error", "invalid_upstream_json", publicMsgInvalidUpstreamResp)
 		} else {
-			WriteError(w, http.StatusBadGateway, "upstream_error", "invalid_upstream_json", err.Error())
+			WriteError(w, http.StatusBadGateway, "upstream_error", "invalid_upstream_json", publicMsgInvalidUpstreamResp)
 		}
+		g.recordFailure(ctx, "/v1/chat/completions", "responses", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, http.StatusBadGateway, start, err.Error(), tel)
 		return
 	}
 	chatResp := OpenAIResponseToChatResponse(respMap, model.ID)
@@ -1186,10 +1243,11 @@ func (g *Gateway) handleCreateResponse(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var (
-		lastStatus  int
-		lastErrType string
-		lastErrCode string
-		lastErrMsg  string
+		lastStatus    int
+		lastErrType   string
+		lastErrCode   string
+		lastErrMsg    string
+		lastRawErrMsg string
 	)
 
 	attempts := maxFailoverAttempts
@@ -1211,7 +1269,11 @@ func (g *Gateway) handleCreateResponse(w http.ResponseWriter, r *http.Request) {
 		if rErr != nil {
 			if attempt > 0 && lastStatus > 0 {
 				WriteError(w, lastStatus, lastErrType, lastErrCode, lastErrMsg)
-				g.recordFailure(ctx, "/v1/responses", "", req.Model, "", "", "", req.Stream, lastStatus, start, lastErrMsg, tel)
+				logMsg := lastRawErrMsg
+				if logMsg == "" {
+					logMsg = lastErrMsg
+				}
+				g.recordFailure(ctx, "/v1/responses", "", req.Model, "", "", "", req.Stream, lastStatus, start, logMsg, tel)
 				return
 			}
 			status := writePoolRouteError(w, rErr)
@@ -1221,24 +1283,12 @@ func (g *Gateway) handleCreateResponse(w http.ResponseWriter, r *http.Request) {
 
 		model, _, mErr := g.resolveEnabledModel(ctx, decision.Client, req.Model)
 		if mErr != nil {
-			if ctx.Err() != nil {
-				g.recordFailure(ctx, "/v1/responses", "", req.Model, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, statusClientClosedRequest, start, ctx.Err().Error(), tel)
-				return
-			}
-			var disErr *modelDisabledError
-			if errors.As(mErr, &disErr) {
-				WriteError(w, http.StatusForbidden, "invalid_request_error", "model_disabled", disErr.Error())
-				g.recordFailure(ctx, "/v1/responses", "", req.Model, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, http.StatusForbidden, start, disErr.Error(), tel)
-				return
-			}
-			if isAuthErrorText(mErr.Error()) && explicitAcc == "" {
-				g.markAccountExpired(decision.Account.ID, mErr.Error())
+			retry, stCode, errType, errCode, pubMsg, rawMsg := g.handleResolveModelError(ctx, w, "/v1/responses", req.Model, decision, req.Stream, start, tel, explicitAcc, mErr)
+			if retry {
 				excluded[decision.Account.ID] = true
-				lastStatus, lastErrType, lastErrCode, lastErrMsg = http.StatusServiceUnavailable, "authentication_error", "account_expired", mErr.Error()
+				lastStatus, lastErrType, lastErrCode, lastErrMsg, lastRawErrMsg = stCode, errType, errCode, pubMsg, rawMsg
 				continue
 			}
-			WriteError(w, http.StatusBadRequest, "invalid_request_error", "model_not_found", mErr.Error())
-			g.recordFailure(ctx, "/v1/responses", "", req.Model, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, http.StatusBadRequest, start, mErr.Error(), tel)
 			return
 		}
 
@@ -1257,19 +1307,19 @@ func (g *Gateway) handleCreateResponse(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if !isToolCont {
-			if status, errType, code, reason, ok := g.runPreflightIfEnabled(ctx, decision.Client, model.ID, traceparent); !ok {
+			if status, errType, code, pubMsg, rawReason, ok := g.runPreflightIfEnabled(ctx, decision.Client, model.ID, traceparent); !ok {
 				if ctx.Err() != nil {
 					g.recordFailure(ctx, "/v1/responses", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, statusClientClosedRequest, start, ctx.Err().Error(), tel)
 					return
 				}
 				if status == http.StatusPaymentRequired && explicitAcc == "" {
-					g.markAccountInsufficient(decision.Account.ID, reason)
+					g.markAccountInsufficient(decision.Account.ID, rawReason)
 					excluded[decision.Account.ID] = true
-					lastStatus, lastErrType, lastErrCode, lastErrMsg = status, errType, code, reason
+					lastStatus, lastErrType, lastErrCode, lastErrMsg, lastRawErrMsg = status, errType, code, pubMsg, rawReason
 					continue
 				}
-				WriteError(w, status, errType, code, reason)
-				g.recordFailure(ctx, "/v1/responses", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, status, start, reason, tel)
+				WriteError(w, status, errType, code, pubMsg)
+				g.recordFailure(ctx, "/v1/responses", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, status, start, rawReason, tel)
 				return
 			}
 		}
@@ -1300,7 +1350,8 @@ func (g *Gateway) handleCreateResponse(w http.ResponseWriter, r *http.Request) {
 		tel.ReasoningEffort = resolveRecordedReasoningEffort(reqEffort, model, payloadMap)
 		payloadBytes, err := json.Marshal(payloadMap)
 		if err != nil {
-			WriteError(w, http.StatusInternalServerError, "server_error", "marshal_error", err.Error())
+			WriteError(w, http.StatusInternalServerError, "server_error", "marshal_error", publicMsgMarshalError)
+			g.recordFailure(ctx, "/v1/responses", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, http.StatusInternalServerError, start, err.Error(), tel)
 			return
 		}
 
@@ -1324,12 +1375,12 @@ func (g *Gateway) handleCreateResponse(w http.ResponseWriter, r *http.Request) {
 			if ctx.Err() == nil {
 				if headersCommitted {
 					if req.Stream {
-						writeCommittedResponsesSSEError(w, &req, model.ID, "upstream_error", "upstream_transport_error", err.Error())
+						writeCommittedResponsesSSEError(w, &req, model.ID, "upstream_error", "upstream_transport_error", publicMsgUpstreamTransport)
 					} else {
-						writeCommittedJSONError(w, "upstream_error", "upstream_transport_error", err.Error())
+						writeCommittedJSONError(w, "upstream_error", "upstream_transport_error", publicMsgUpstreamTransport)
 					}
 				} else {
-					WriteError(w, http.StatusBadGateway, "upstream_error", "upstream_transport_error", err.Error())
+					WriteError(w, http.StatusBadGateway, "upstream_error", "upstream_transport_error", publicMsgUpstreamTransport)
 				}
 			}
 			g.recordFailure(ctx, "/v1/responses", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, status, start, err.Error(), tel)
@@ -1345,10 +1396,10 @@ func (g *Gateway) handleCreateResponse(w http.ResponseWriter, r *http.Request) {
 				errTxt := extractUpstreamErrorText(errBody, upResp.StatusCode)
 				if upResp.StatusCode == http.StatusUnauthorized {
 					g.markAccountExpired(decision.Account.ID, errTxt)
-					lastStatus, lastErrType, lastErrCode, lastErrMsg = http.StatusUnauthorized, "authentication_error", "account_expired", errTxt
+					lastStatus, lastErrType, lastErrCode, lastErrMsg, lastRawErrMsg = http.StatusUnauthorized, "authentication_error", "account_expired", publicMsgAccountExpired, errTxt
 				} else {
 					g.markAccountInsufficient(decision.Account.ID, errTxt)
-					lastStatus, lastErrType, lastErrCode, lastErrMsg = http.StatusPaymentRequired, "insufficient_quota", "insufficient_balance", errTxt
+					lastStatus, lastErrType, lastErrCode, lastErrMsg, lastRawErrMsg = http.StatusPaymentRequired, "insufficient_quota", "insufficient_balance", publicMsgInsufficientBalance, errTxt
 				}
 				if !headersCommitted {
 					excluded[decision.Account.ID] = true
@@ -1357,19 +1408,19 @@ func (g *Gateway) handleCreateResponse(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if headersCommitted {
-				errType, code, errMsg := extractCommittedErrorParts(upResp.StatusCode, errBody)
+				errType, code, pubMsg, rawDetail := extractCommittedErrorParts(upResp.StatusCode, errBody)
 				if req.Stream {
-					writeCommittedResponsesSSEError(w, &req, model.ID, errType, code, errMsg)
+					writeCommittedResponsesSSEError(w, &req, model.ID, errType, code, pubMsg)
 				} else {
-					writeCommittedJSONError(w, errType, code, errMsg)
+					writeCommittedJSONError(w, errType, code, pubMsg)
 				}
-				g.recordFailure(ctx, "/v1/responses", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, upResp.StatusCode, start, errMsg, tel)
+				g.recordFailure(ctx, "/v1/responses", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, upResp.StatusCode, start, rawDetail, tel)
 				return
 			}
 
 			copyUpstreamRequestID(w, upResp)
-			errMsg := forwardUpstreamError(w, upResp.StatusCode, errBody)
-			g.recordFailure(ctx, "/v1/responses", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, upResp.StatusCode, start, errMsg, tel)
+			rawDetail := forwardUpstreamError(w, upResp.StatusCode, errBody)
+			g.recordFailure(ctx, "/v1/responses", upstreamAPI, model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, req.Stream, upResp.StatusCode, start, rawDetail, tel)
 			return
 		}
 
@@ -1388,7 +1439,11 @@ func (g *Gateway) handleCreateResponse(w http.ResponseWriter, r *http.Request) {
 	}
 
 	WriteError(w, lastStatus, lastErrType, lastErrCode, lastErrMsg)
-	g.recordFailure(ctx, "/v1/responses", "", req.Model, "", "", "", req.Stream, lastStatus, start, lastErrMsg, baseTel)
+	logMsg := lastRawErrMsg
+	if logMsg == "" {
+		logMsg = lastErrMsg
+	}
+	g.recordFailure(ctx, "/v1/responses", "", req.Model, "", "", "", req.Stream, lastStatus, start, logMsg, baseTel)
 }
 
 func (g *Gateway) finishResponsesFromResponsesUpstream(ctx context.Context, w http.ResponseWriter, req *ResponsesRequest, model bohrium.SciXModel, decision *RouteDecision, turnItems []map[string]any, effectiveInstr *string, shouldStore bool, upResp *http.Response, start time.Time, tel reqTelemetry, headersCommitted bool) {
@@ -1432,7 +1487,7 @@ func (g *Gateway) finishResponsesFromResponsesUpstream(ctx context.Context, w ht
 		if err != nil {
 			status := classifyStreamErrorStatus(ctx)
 			if ctx.Err() == nil {
-				writeCommittedJSONError(w, "upstream_error", "stream_aggregate_error", err.Error())
+				writeCommittedJSONError(w, "upstream_error", "stream_aggregate_error", publicMsgStreamInterrupted)
 			}
 			g.recordFailure(ctx, "/v1/responses", "responses", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, status, start, err.Error(), tel)
 			return
@@ -1464,9 +1519,9 @@ func (g *Gateway) finishResponsesFromResponsesUpstream(ctx context.Context, w ht
 		status := classifyStreamErrorStatus(ctx)
 		if ctx.Err() == nil {
 			if headersCommitted {
-				writeCommittedJSONError(w, "upstream_error", "read_error", rErr.Error())
+				writeCommittedJSONError(w, "upstream_error", "read_error", publicMsgStreamInterrupted)
 			} else {
-				WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", rErr.Error())
+				WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", publicMsgStreamInterrupted)
 			}
 		}
 		g.recordFailure(ctx, "/v1/responses", "responses", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, status, start, rErr.Error(), tel)
@@ -1474,10 +1529,11 @@ func (g *Gateway) finishResponsesFromResponsesUpstream(ctx context.Context, w ht
 	}
 	if err := json.Unmarshal(rawResp, &respMap); err != nil {
 		if headersCommitted {
-			writeCommittedJSONError(w, "upstream_error", "invalid_upstream_json", err.Error())
+			writeCommittedJSONError(w, "upstream_error", "invalid_upstream_json", publicMsgInvalidUpstreamResp)
 		} else {
-			WriteError(w, http.StatusBadGateway, "upstream_error", "invalid_upstream_json", err.Error())
+			WriteError(w, http.StatusBadGateway, "upstream_error", "invalid_upstream_json", publicMsgInvalidUpstreamResp)
 		}
+		g.recordFailure(ctx, "/v1/responses", "responses", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, http.StatusBadGateway, start, err.Error(), tel)
 		return
 	}
 	patchClientResponseMeta(respMap, req)
@@ -1549,7 +1605,7 @@ func (g *Gateway) finishResponsesFromChatUpstream(ctx context.Context, w http.Re
 		if err != nil {
 			status := classifyStreamErrorStatus(ctx)
 			if ctx.Err() == nil {
-				writeCommittedJSONError(w, "upstream_error", "stream_aggregate_error", err.Error())
+				writeCommittedJSONError(w, "upstream_error", "stream_aggregate_error", publicMsgStreamInterrupted)
 			}
 			g.recordFailure(ctx, "/v1/responses", "chat_completions", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, status, start, err.Error(), tel)
 			return
@@ -1583,9 +1639,9 @@ func (g *Gateway) finishResponsesFromChatUpstream(ctx context.Context, w http.Re
 		status := classifyStreamErrorStatus(ctx)
 		if ctx.Err() == nil {
 			if headersCommitted {
-				writeCommittedJSONError(w, "upstream_error", "read_error", rErr.Error())
+				writeCommittedJSONError(w, "upstream_error", "read_error", publicMsgStreamInterrupted)
 			} else {
-				WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", rErr.Error())
+				WriteError(w, http.StatusBadGateway, "upstream_error", "read_error", publicMsgStreamInterrupted)
 			}
 		}
 		g.recordFailure(ctx, "/v1/responses", "chat_completions", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, status, start, rErr.Error(), tel)
@@ -1594,10 +1650,11 @@ func (g *Gateway) finishResponsesFromChatUpstream(ctx context.Context, w http.Re
 	var direct ChatCompletionResponse
 	if err := json.Unmarshal(rawResp, &direct); err != nil {
 		if headersCommitted {
-			writeCommittedJSONError(w, "upstream_error", "invalid_upstream_json", err.Error())
+			writeCommittedJSONError(w, "upstream_error", "invalid_upstream_json", publicMsgInvalidUpstreamResp)
 		} else {
-			WriteError(w, http.StatusBadGateway, "upstream_error", "invalid_upstream_json", err.Error())
+			WriteError(w, http.StatusBadGateway, "upstream_error", "invalid_upstream_json", publicMsgInvalidUpstreamResp)
 		}
+		g.recordFailure(ctx, "/v1/responses", "chat_completions", model.ID, decision.Account.ID, decision.Account.DisplayName(), decision.Mode, false, http.StatusBadGateway, start, err.Error(), tel)
 		return
 	}
 	chatResp = &direct
@@ -1679,21 +1736,21 @@ func (g *Gateway) handleGetResponseInputItems(w http.ResponseWriter, r *http.Req
 	})
 }
 
-func (g *Gateway) runPreflightIfEnabled(ctx context.Context, cli *bohrium.Client, modelID, traceparent string) (status int, errType, code, msg string, ok bool) {
+func (g *Gateway) runPreflightIfEnabled(ctx context.Context, cli *bohrium.Client, modelID, traceparent string) (status int, errType, code, publicMsg, rawDetail string, ok bool) {
 	if g.cfg == nil || !g.cfg.Get().Gateway.PreflightMode {
-		return 0, "", "", "", true
+		return 0, "", "", "", "", true
 	}
 	allowed, reason, err := cli.SciXBillingPreflight(ctx, modelID, traceparent)
 	if err != nil {
-		return http.StatusBadGateway, "upstream_error", "billing_unavailable", "Billing admission unavailable: " + err.Error(), false
+		return http.StatusBadGateway, "upstream_error", "billing_unavailable", publicMsgBillingUnavailable, "Billing admission unavailable: " + err.Error(), false
 	}
 	if !allowed {
 		if reason == "" {
 			reason = "[insufficient_balance] Insufficient balance"
 		}
-		return http.StatusPaymentRequired, "insufficient_quota", "insufficient_balance", reason, false
+		return http.StatusPaymentRequired, "insufficient_quota", "insufficient_balance", publicMsgInsufficientBalance, reason, false
 	}
-	return 0, "", "", "", true
+	return 0, "", "", "", "", true
 }
 
 func (g *Gateway) markAccountInsufficient(accountID, reason string) {
@@ -1712,18 +1769,18 @@ func (g *Gateway) markAccountExpired(accountID, reason string) {
 
 func writePoolRouteError(w http.ResponseWriter, err error) int {
 	if errors.Is(err, ErrEmptyPool) {
-		WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "empty_pool", err.Error())
+		WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "empty_pool", publicMsgEmptyPool)
 		return http.StatusServiceUnavailable
 	}
 	if errors.Is(err, ErrNoHealthyPoolAccount) {
-		WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "no_healthy_pool_accounts", err.Error())
+		WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "no_healthy_pool_accounts", publicMsgNoHealthyPool)
 		return http.StatusServiceUnavailable
 	}
 	if errors.Is(err, bohrium.ErrBohriumNotLoggedIn) {
-		WriteError(w, http.StatusServiceUnavailable, "authentication_error", "bohrium_not_logged_in", err.Error())
+		WriteError(w, http.StatusServiceUnavailable, "authentication_error", "account_unavailable", publicMsgAccountUnavailable)
 		return http.StatusServiceUnavailable
 	}
-	WriteError(w, http.StatusBadGateway, "upstream_error", "routing_error", err.Error())
+	WriteError(w, http.StatusBadGateway, "upstream_error", "routing_error", publicMsgRoutingError)
 	return http.StatusBadGateway
 }
 
@@ -2046,7 +2103,7 @@ func (t *ttftTrackingReader) FirstTokenMs(start time.Time) int64 {
 }
 
 func copyUpstreamRequestID(w http.ResponseWriter, resp *http.Response) {
-	for _, h := range []string{"X-Request-Id", "Openai-Request-Id", "X-Litellm-Call-Id"} {
+	for _, h := range []string{"X-Request-Id", "Openai-Request-Id"} {
 		if v := strings.TrimSpace(resp.Header.Get(h)); v != "" {
 			w.Header().Set(h, v)
 		}

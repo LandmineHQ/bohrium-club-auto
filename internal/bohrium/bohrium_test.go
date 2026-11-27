@@ -6,12 +6,14 @@ import (
 	"crypto/cipher"
 	"encoding/base64"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1007,5 +1009,193 @@ func TestAcquireRandomPaperPDFCacheReuseAndContextCancel(t *testing.T) {
 	}
 	if cacheHits != 15 {
 		t.Fatalf("expected loadCachedPaperPDF to return valid cached PDFs consistently, got %d/15", cacheHits)
+	}
+}
+
+func TestGetSciXModelCatalogRetryAndSharedFallback(t *testing.T) {
+	origDelay := scixCatalogRetryBaseDelay
+	origTimeout := scixCatalogAttemptTimeout
+	scixCatalogRetryBaseDelay = 10 * time.Millisecond
+	scixCatalogAttemptTimeout = 2 * time.Second
+	t.Cleanup(func() {
+		scixCatalogRetryBaseDelay = origDelay
+		scixCatalogAttemptTimeout = origTimeout
+	})
+
+	const sampleCatalog = `{
+		"object": "list",
+		"data": [
+			{"id":"dsflash-high","name":"DeepSeek-V4.1-Flash","api":"chat_completions","context_window":1000000,"max_output_tokens":384000,"input":["text"],"owned_by":"sigma"}
+		]
+	}`
+
+	var (
+		mode     atomic.Int32 // 0 = ok, 1 = drop twice then ok, 2 = 503 once then ok, 3 = always drop, 4 = always 401
+		attempts atomic.Int32
+		mu       sync.Mutex
+		lastHdrs http.Header
+	)
+
+	resetConn := func(w http.ResponseWriter) {
+		if hj, ok := w.(http.Hijacker); ok {
+			if conn, _, err := hj.Hijack(); err == nil {
+				if tcpConn, ok := conn.(*net.TCPConn); ok {
+					_ = tcpConn.SetLinger(0)
+				}
+				_ = conn.Close()
+				return
+			}
+		}
+		http.Error(w, "hijack unavailable", http.StatusInternalServerError)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			http.NotFound(w, r)
+			return
+		}
+		n := attempts.Add(1)
+		mu.Lock()
+		lastHdrs = r.Header.Clone()
+		mu.Unlock()
+
+		switch mode.Load() {
+		case 1:
+			if n <= 2 {
+				resetConn(w)
+				return
+			}
+		case 2:
+			if n == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(`{"error":"temporary overload"}`))
+				return
+			}
+		case 3:
+			resetConn(w)
+			return
+		case 4:
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"code":"unauthorized","message":"token expired"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(sampleCatalog))
+	}))
+	defer srv.Close()
+
+	tmp := t.TempDir()
+	t.Setenv("BOHRIUM_DATA_DIR", tmp)
+	t.Setenv("BOHRIUM_ADMIN_PASSWORD", "test-pw-1234")
+	cfgMgr, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	st, err := store.Open(tmp)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	accA, _, err := st.UpsertAccountFromAuth(store.AuthState{
+		Token:     makeTestJWT(101, 201, time.Now().Add(24*time.Hour)),
+		UserID:    101,
+		OrgID:     201,
+		Nickname:  "AccA",
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+	}, "AccA")
+	if err != nil {
+		t.Fatalf("upsert A: %v", err)
+	}
+	accB, _, err := st.UpsertAccountFromAuth(store.AuthState{
+		Token:     makeTestJWT(102, 202, time.Now().Add(24*time.Hour)),
+		UserID:    102,
+		OrgID:     202,
+		Nickname:  "AccB",
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+	}, "AccB")
+	if err != nil {
+		t.Fatalf("upsert B: %v", err)
+	}
+	accC, _, err := st.UpsertAccountFromAuth(store.AuthState{
+		Token:     makeTestJWT(103, 203, time.Now().Add(24*time.Hour)),
+		UserID:    103,
+		OrgID:     203,
+		Nickname:  "AccC",
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+	}, "AccC")
+	if err != nil {
+		t.Fatalf("upsert C: %v", err)
+	}
+	_ = st.SetPoolMembership([]string{accA.ID})
+
+	httpCli, err := chromehttp.New(chromehttp.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("chromehttp.New: %v", err)
+	}
+	mgr := NewManager(httpCli, cfgMgr, st)
+	mgr.SetEndpoints(Endpoints{SigmaLLMBase: srv.URL, PlatformBase: srv.URL, WWWBase: srv.URL})
+
+	ctx := context.Background()
+
+	// 1. Two TCP connection resets followed by 200 on attempt 3 succeeds cleanly, then uses TTL cache.
+	mode.Store(1)
+	attempts.Store(0)
+	cat, err := mgr.ForAccount(accA.ID).GetSciXModelCatalog(ctx, true)
+	if err != nil {
+		t.Fatalf("expected catalog retry on connection reset to succeed, got %v", err)
+	}
+	if attempts.Load() != 3 || len(cat.Data) != 1 || cat.Data[0].ID != "dsflash-high" {
+		t.Fatalf("unexpected attempts/catalog: attempts=%d data=%+v", attempts.Load(), cat.Data)
+	}
+	mu.Lock()
+	gotHdrs := lastHdrs
+	mu.Unlock()
+	if gotHdrs.Get(SciXRuntimeHeader) != SciXRuntimeValue || gotHdrs.Get("traceparent") == "" || gotHdrs.Get("Sec-CH-UA") != "" {
+		t.Fatalf("unexpected native headers on /models: %+v", gotHdrs)
+	}
+	if _, err := mgr.ForAccount(accA.ID).GetSciXModelCatalog(ctx, false); err != nil {
+		t.Fatalf("cached GetSciXModelCatalog: %v", err)
+	}
+	if attempts.Load() != 3 {
+		t.Fatalf("expected TTL cache hit without extra upstream calls, got attempts=%d", attempts.Load())
+	}
+
+	// 2. HTTP 503 once followed by 200 succeeds on retry.
+	mode.Store(2)
+	attempts.Store(0)
+	if _, err := mgr.ForAccount(accA.ID).GetSciXModelCatalog(ctx, true); err != nil {
+		t.Fatalf("expected catalog retry on 503 to succeed, got %v", err)
+	}
+	if attempts.Load() != 2 {
+		t.Fatalf("expected 2 attempts on single 503, got %d", attempts.Load())
+	}
+
+	// 3. Cold Account B falls back to Manager's sharedCatalog when upstream always resets connections.
+	mode.Store(3)
+	catB, err := mgr.ForAccount(accB.ID).GetSciXModelCatalog(ctx, false)
+	if err != nil {
+		t.Fatalf("expected cold Account B to use sharedCatalog fallback, got %v", err)
+	}
+	if catB == nil || len(catB.Data) != 1 || catB.SciXCatalog == nil || catB.SciXCatalog.ScopeGeneration != "u102-o202" {
+		t.Fatalf("unexpected fallback catalog for Account B: %+v", catB)
+	}
+
+	// 4. HTTP 401 MUST NOT silently serve sharedCatalog fallback so pool failover still works.
+	mode.Store(4)
+	if _, err := mgr.ForAccount(accC.ID).GetSciXModelCatalog(ctx, false); err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("expected 401 error without shared fallback, got %v", err)
+	}
+
+	// 5. Fresh Manager WarmSciXCatalog populates sharedCatalog so a cold account survives upstream drop.
+	mgr2 := NewManager(httpCli, cfgMgr, st)
+	mgr2.SetEndpoints(Endpoints{SigmaLLMBase: srv.URL, PlatformBase: srv.URL, WWWBase: srv.URL})
+	mode.Store(0)
+	if err := mgr2.WarmSciXCatalog(ctx); err != nil {
+		t.Fatalf("WarmSciXCatalog: %v", err)
+	}
+	mode.Store(3)
+	if catWarmed, err := mgr2.ForAccount(accC.ID).GetSciXModelCatalog(ctx, false); err != nil || len(catWarmed.Data) != 1 {
+		t.Fatalf("expected cold account to survive via warmed sharedCatalog, got err=%v cat=%+v", err, catWarmed)
 	}
 }

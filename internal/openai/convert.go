@@ -320,7 +320,7 @@ func ParseResponsesInputItems(raw json.RawMessage, rs *ResponseStore) ([]map[str
 // matching brain.mjs (system/developer instruction placed as input[0], store=false, prompt_cache_key, stream=true).
 func NormalizeResponsesRequestForSciX(req *ResponsesRequest, model bohrium.SciXModel, allInputItems []map[string]any, effectiveInstructions *string, opts SciXRequestOptions) (map[string]any, string, error) {
 	if req.Background != nil && *req.Background {
-		return nil, "", fmt.Errorf("background mode is not supported by Bohrium SciX Responses")
+		return nil, "", fmt.Errorf("background mode is not supported")
 	}
 
 	instructionRole := "system"

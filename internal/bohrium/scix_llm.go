@@ -15,10 +15,19 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
+
+	"bohrium-club-auto/internal/store"
 )
 
-const scixCatalogTTL = 60 * time.Second
+const scixCatalogTTL = 5 * time.Minute
+
+var (
+	scixCatalogMaxAttempts    = 3
+	scixCatalogAttemptTimeout = 10 * time.Second
+	scixCatalogRetryBaseDelay = 250 * time.Millisecond
+)
 
 var canonicalUUIDRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
@@ -273,7 +282,50 @@ func normalizeModelAlias(s string) string {
 	return s
 }
 
-// GetSciXModelCatalog fetches (with 60s TTL cache) Bohrium desktop client's live model catalog.
+type sharedCatalogCache struct {
+	mu  sync.RWMutex
+	cat *SciXModelCatalog
+}
+
+func (s *sharedCatalogCache) Get() *SciXModelCatalog {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	cat := s.cat
+	s.mu.RUnlock()
+	if cat == nil {
+		return nil
+	}
+	return cat.Clone()
+}
+
+func (s *sharedCatalogCache) Set(cat *SciXModelCatalog) {
+	if s == nil || cat == nil {
+		return
+	}
+	cp := cat.Clone()
+	s.mu.Lock()
+	s.cat = cp
+	s.mu.Unlock()
+}
+
+func (c *Client) fallbackCatalog(cached *SciXModelCatalog, cachedUID int64, auth store.AuthState) *SciXModelCatalog {
+	if cached != nil && cachedUID == auth.UserID {
+		return cached.Clone()
+	}
+	if c.sharedCatalog != nil {
+		if shared := c.sharedCatalog.Get(); shared != nil {
+			if shared.SciXCatalog != nil {
+				shared.SciXCatalog.ScopeGeneration = fmt.Sprintf("u%d-o%d", auth.UserID, auth.OrgID)
+			}
+			return shared
+		}
+	}
+	return nil
+}
+
+// GetSciXModelCatalog fetches (with 5m TTL cache, retries, and shared fallback) Bohrium desktop client's live model catalog.
 func (c *Client) GetSciXModelCatalog(ctx context.Context, forceRefresh bool) (*SciXModelCatalog, error) {
 	auth := c.store.GetAuth()
 	if strings.TrimSpace(auth.Token) == "" {
@@ -291,11 +343,14 @@ func (c *Client) GetSciXModelCatalog(ctx context.Context, forceRefresh bool) (*S
 	}
 
 	rawURL := c.endpoints.SigmaLLMBase + "/models?tag=" + url.QueryEscape(SciXModelCatalogTag)
-	doCatalog := func(tok string) ([]byte, int, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	doCatalog := func(tok string, closeConn bool) ([]byte, int, error) {
+		attemptCtx, cancel := context.WithTimeout(ctx, scixCatalogAttemptTimeout)
+		defer cancel()
+		req, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, rawURL, nil)
 		if err != nil {
 			return nil, 0, err
 		}
+		req.Close = closeConn
 		req.Header.Set("Authorization", "Bearer "+tok)
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("traceparent", NewTraceparent())
@@ -309,21 +364,67 @@ func (c *Client) GetSciXModelCatalog(ctx context.Context, forceRefresh bool) (*S
 		return body, resp.StatusCode, err
 	}
 
-	body, statusCode, err := doCatalog(auth.Token)
-	if err == nil && statusCode == http.StatusUnauthorized {
-		if refreshed, rErr := c.RefreshToken(ctx, "system"); rErr == nil && refreshed.Token != "" {
-			body, statusCode, err = doCatalog(refreshed.Token)
+	var (
+		body          []byte
+		statusCode    int
+		err           error
+		tok           = auth.Token
+		refreshedOnce bool
+	)
+	maxAttempts := scixCatalogMaxAttempts
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			err = ctx.Err()
+			break
+		}
+		body, statusCode, err = doCatalog(tok, attempt > 0)
+		if err == nil && statusCode == http.StatusUnauthorized && !refreshedOnce {
+			refreshedOnce = true
+			if refreshed, rErr := c.RefreshToken(ctx, "system"); rErr == nil && refreshed.Token != "" && refreshed.Token != tok {
+				tok = refreshed.Token
+				body, statusCode, err = doCatalog(tok, true)
+			}
+		}
+		if err == nil && statusCode >= 200 && statusCode < 300 {
+			break
+		}
+		retryable := (err != nil && ctx.Err() == nil) || (err == nil && (statusCode == http.StatusTooManyRequests || statusCode >= 500))
+		if !retryable || attempt == maxAttempts-1 {
+			break
+		}
+		delay := scixCatalogRetryBaseDelay * time.Duration(1<<attempt)
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				err = ctx.Err()
+				retryable = false
+			case <-timer.C:
+			}
+			if !retryable {
+				break
+			}
 		}
 	}
+
+	if ctx.Err() != nil {
+		return nil, fmt.Errorf("fetch SciX model catalog: %w", ctx.Err())
+	}
 	if err != nil {
-		if cached != nil && cachedUID == auth.UserID {
-			return cached.Clone(), nil
+		if fb := c.fallbackCatalog(cached, cachedUID, auth); fb != nil {
+			return fb, nil
 		}
 		return nil, fmt.Errorf("fetch SciX model catalog: %w", err)
 	}
 	if statusCode < 200 || statusCode >= 300 {
-		if cached != nil && cachedUID == auth.UserID && statusCode >= 500 {
-			return cached.Clone(), nil
+		if statusCode >= 500 {
+			if fb := c.fallbackCatalog(cached, cachedUID, auth); fb != nil {
+				return fb, nil
+			}
 		}
 		return nil, fmt.Errorf("SciX model catalog returned HTTP %d: %s", statusCode, truncateText(string(body), 240))
 	}
@@ -359,6 +460,7 @@ func (c *Client) GetSciXModelCatalog(ctx context.Context, forceRefresh bool) (*S
 	c.catalogFetchedAt = cat.FetchedAt
 	c.catalogUserID = auth.UserID
 	c.catalogMu.Unlock()
+	c.sharedCatalog.Set(&cat)
 
 	return cat.Clone(), nil
 }

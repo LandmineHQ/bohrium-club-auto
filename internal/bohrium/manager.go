@@ -15,9 +15,10 @@ import (
 // Each account gets its own Client instance with isolated credentials, persistent UUIDv4 StoreID,
 // and live SciX model catalog cache.
 type Manager struct {
-	http  *chromehttp.Client
-	cfg   *config.Manager
-	store *store.Store
+	http          *chromehttp.Client
+	cfg           *config.Manager
+	store         *store.Store
+	sharedCatalog *sharedCatalogCache
 
 	mu        sync.RWMutex
 	endpoints Endpoints
@@ -27,11 +28,12 @@ type Manager struct {
 // NewManager creates a multi-account Bohrium client manager.
 func NewManager(httpClient *chromehttp.Client, cfg *config.Manager, st *store.Store) *Manager {
 	return &Manager{
-		http:      httpClient,
-		cfg:       cfg,
-		store:     st,
-		endpoints: defaultEndpoints(),
-		clients:   make(map[string]*Client),
+		http:          httpClient,
+		cfg:           cfg,
+		store:         st,
+		sharedCatalog: &sharedCatalogCache{},
+		endpoints:     defaultEndpoints(),
+		clients:       make(map[string]*Client),
 	}
 }
 
@@ -84,6 +86,7 @@ func (m *Manager) ForAccount(accountID string) *Client {
 		return cli
 	}
 	cli := NewClient(m.http, m.cfg, m.store.ForAccount(id))
+	cli.sharedCatalog = m.sharedCatalog
 	cli.SetEndpoints(ep)
 	m.clients[id] = cli
 	return cli
@@ -184,4 +187,38 @@ func (m *Manager) RefreshStaleBalances(ctx context.Context, maxAge time.Duration
 		_, _ = m.RefreshAccountBalance(subCtx, acc.ID)
 		cancel()
 	}
+}
+
+// WarmSciXCatalog eagerly populates the per-account and shared SciX model catalog cache
+// using the first healthy authenticated account (preferring pooled accounts).
+func (m *Manager) WarmSciXCatalog(ctx context.Context) error {
+	accounts, err := m.store.ListPoolAccounts()
+	if err != nil {
+		return err
+	}
+	if len(accounts) == 0 {
+		accounts, err = m.store.ListAccounts()
+		if err != nil {
+			return err
+		}
+	}
+	now := time.Now().UTC()
+	var lastErr error
+	for _, acc := range accounts {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if strings.TrimSpace(acc.Token) == "" {
+			continue
+		}
+		if !acc.ExpiresAt.IsZero() && !acc.ExpiresAt.After(now) {
+			continue
+		}
+		if _, cErr := m.ForAccount(acc.ID).GetSciXModelCatalog(ctx, false); cErr == nil {
+			return nil
+		} else {
+			lastErr = cErr
+		}
+	}
+	return lastErr
 }
